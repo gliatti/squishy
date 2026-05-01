@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>squishy — database migration wizard</title>
+    <style>
+      body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #fafafa; color: #222; }
+      a { color: #0a6; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .app { max-width: 960px; margin: 2rem auto; padding: 1rem; }
+      h1,h2,h3 { font-weight: 600; }
+      label { display: block; font-size: 0.85rem; color: #555; margin-top: 0.8rem; }
+      input, select, textarea { width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; font-size: 0.95rem; box-sizing: border-box; }
+      /* Checkboxes / radios shouldn't inherit the form-control 100% width
+         from the rule above — that pushes flex layouts (e.g. the
+         prerequisites checklist) sideways and makes the receptacle look
+         centered instead of left-anchored. Reset them to native sizing. */
+      input[type="checkbox"], input[type="radio"] { width: auto; padding: 0; border: 0; }
+      button { padding: 0.5rem 1rem; background: #0a6; color: white; border: 0; border-radius: 4px; cursor: pointer; }
+      button:hover { background: #084; }
+      button.secondary { background: #888; }
+      .card { background: white; border: 1px solid #eee; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+      pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; border-radius: 4px; font-size: 0.85rem; }
+      .nav { display: flex; gap: 1rem; border-bottom: 1px solid #ddd; padding-bottom: 0.5rem; margin-bottom: 1rem; }
+      .warn { color: #a60; }
+      .err { color: #c00; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; background: #eee; }
+      .pill.ok { background: #def; color: #06c; }
+      .pill.fail { background: #fdd; color: #c00; }
+      .pill.run { background: #fd8; color: #840; }
+      .log { font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; line-height: 1.4; }
+
+      /* --- Run monitor: tabs --- */
+      .tabs { display: flex; gap: 4px; border-bottom: 1px solid #eee; margin-bottom: 12px; }
+      .tabs > button { background: none; border: 0; padding: 8px 14px; cursor: pointer;
+                       border-bottom: 2px solid transparent; color: #666; border-radius: 0;
+                       font-size: 0.9rem; }
+      .tabs > button:hover { background: #f4f4f4; color: #222; }
+      .tabs > button.active { color: #084; border-bottom-color: #0a6; font-weight: 600; background: transparent; }
+
+      /* --- Run monitor: levels view --- */
+      .levels-grid { display: flex; gap: 16px; overflow-x: auto; padding: 8px 0 4px; }
+      .level-lane { min-width: 280px; max-width: 340px; background: #fafafa; border-radius: 8px;
+                    padding: 12px; flex: 0 0 auto; }
+      .level-lane > header { display: flex; justify-content: space-between; align-items: baseline;
+                             font-size: 0.7rem; text-transform: uppercase; color: #888;
+                             margin-bottom: 10px; letter-spacing: 0.04em; }
+      .level-lane > header .level-num { font-weight: 600; color: #555; }
+      .level-lane > header .level-stats { font-family: ui-monospace, Consolas, monospace;
+                                          text-transform: none; color: #666; }
+      .level-actions { display: flex; gap: 4px; margin-bottom: 8px; }
+      .lane-btn { padding: 4px 10px; border: 0; border-radius: 4px; font-size: 0.75rem;
+                  cursor: pointer; font-weight: 600; }
+      .lane-btn.play { background: #0a6; color: white; }
+      .lane-btn.play:hover { background: #084; }
+      .lane-btn.replay { background: #888; color: white; }
+      .lane-btn.replay:hover { background: #555; }
+
+      /* --- Run monitor: retry indicator on pending card --- */
+      .step-retry { color: #a60; }
+
+      /* --- Wizard: mode selector --- */
+      fieldset.mode-select { border: 1px solid #eee; border-radius: 6px; padding: 10px 14px;
+                             margin: 12px 0; }
+      fieldset.mode-select legend { font-size: 0.85rem; color: #555; padding: 0 6px; }
+      fieldset.mode-select label { display: block; margin: 6px 0; font-size: 0.9rem; color: #333; }
+      fieldset.mode-select input[type=radio] { width: auto; margin-right: 8px; }
+
+      /* --- Run monitor: step card --- */
+      .step-card { background: white; border: 1px solid #eee; border-radius: 6px;
+                   padding: 8px 10px; margin-bottom: 8px; border-left: 3px solid #ddd; }
+      .step-card.running { border-left-color: #a60; }
+      .step-card.succeeded { border-left-color: #0a6; }
+      .step-card.failed, .step-card.cancelled { border-left-color: #c00; }
+      .step-card.compact { padding: 6px 8px; margin-bottom: 4px; }
+      .step-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      .step-head .chevron { background: none; border: 0; padding: 0 4px; color: #888;
+                            cursor: pointer; font-size: 0.85rem; }
+      .step-head .chevron:hover { color: #222; background: transparent; }
+      .step-head .kind-tag { font-family: ui-monospace, Consolas, monospace;
+                             font-size: 0.7rem; background: #eef; color: #335; padding: 1px 6px;
+                             border-radius: 3px; letter-spacing: 0.03em; }
+      .step-head .target { font-size: 0.85rem; flex: 1; min-width: 0; overflow: hidden;
+                           text-overflow: ellipsis; white-space: nowrap; background: transparent;
+                           padding: 0; }
+      .step-head .step-replay-btn,
+      .step-head .step-play-btn { background: transparent; border: 1px solid #ddd; color: #555;
+                                   padding: 2px 6px; border-radius: 4px; cursor: pointer;
+                                   font-size: 0.75rem; line-height: 1; }
+      .step-head .step-replay-btn:hover { background: #f4f4f4; color: #222; border-color: #888; }
+      .step-head .step-play-btn { color: #0a6; border-color: #0a6; font-weight: 600; }
+      .step-head .step-play-btn:hover { background: #0a6; color: white; }
+      .step-meta { font-size: 0.75rem; color: #777; margin-top: 4px; display: flex; gap: 8px;
+                   font-family: ui-monospace, Consolas, monospace; }
+      .step-meta .attempts { color: #666; }
+      .step-meta .attempts.retrying { color: #a60; font-weight: 600; }
+      .step-error { font-size: 0.75rem; color: #c00; margin-top: 4px; white-space: nowrap;
+                    overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, Consolas, monospace; }
+
+      /* --- Run monitor: progress bar --- */
+      .progress { height: 4px; background: #eee; border-radius: 2px; margin-top: 6px; overflow: hidden; }
+      .progress > span { display: block; height: 100%; background: #0a6; border-radius: 2px;
+                         transition: width 0.4s ease; }
+
+      /* --- Run monitor: batches --- */
+      .batch-list { margin-top: 8px; padding-left: 10px; border-left: 1px dashed #ddd; }
+      .batch-card { background: #fafafa; border-radius: 4px; padding: 6px 8px; margin-bottom: 4px;
+                    border-left: 2px solid #ddd; font-size: 0.8rem; }
+      .batch-card.running { border-left-color: #a60; }
+      .batch-card.succeeded { border-left-color: #0a6; }
+      .batch-card.failed, .batch-card.cancelled { border-left-color: #c00; }
+      .batch-row { display: flex; align-items: center; gap: 6px; }
+      .batch-seq { font-family: ui-monospace, Consolas, monospace; color: #888; }
+      .batch-rows { margin-left: auto; font-family: ui-monospace, Consolas, monospace; color: #555; }
+      .batch-range { font-size: 0.7rem; color: #777; margin-top: 2px; white-space: nowrap;
+                     overflow: hidden; text-overflow: ellipsis; }
+      .batch-range code { background: transparent; padding: 0; }
+      .batch-error { font-size: 0.7rem; color: #c00; margin-top: 2px; white-space: nowrap;
+                     overflow: hidden; text-overflow: ellipsis; }
+      .muted { color: #999; font-size: 0.8rem; font-style: italic; margin: 4px 0; }
+
+      /* --- Run monitor: tree view --- */
+      .tree-toolbar { display: flex; gap: 6px; margin-bottom: 10px; }
+      .tree-root { padding: 4px 0; }
+      .tree-node { margin: 2px 0; }
+      .tree-row { display: flex; align-items: flex-start; gap: 4px; }
+      .tree-row > .chevron { background: none; border: 0; padding: 6px 2px 0; color: #888;
+                             cursor: pointer; font-size: 0.85rem; min-width: 16px; }
+      .tree-row > .chevron:hover { color: #222; background: transparent; }
+      .tree-row > .chevron.placeholder { cursor: default; }
+      .tree-step { flex: 1; min-width: 0; }
+      .tree-node > .children { margin-left: 16px; padding-left: 10px; border-left: 1px dashed #ddd; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

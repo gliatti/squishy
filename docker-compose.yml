@@ -1,0 +1,285 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: squishy
+      POSTGRES_PASSWORD: squishy
+      POSTGRES_DB: squishy
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U squishy -d squishy"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  mysql-sample:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: sakila
+      MYSQL_USER: sakila
+      MYSQL_PASSWORD: sakila
+    ports: ["3306:3306"]
+    # innodb-flush-log-at-trx-commit=0 + sync-binlog=0 : no fsync per commit.
+    # The seed runs 31k single-row INSERTs via stored procedures with WHILE
+    # loops (1k customers + 5k orders + 25k items); on Docker Desktop /
+    # WSL2 each fsync costs several ms, so default durability turns init
+    # into a 5+ minute wait. Safe here: this container has no volume mount
+    # on /var/lib/mysql — a crash just means re-seeding from scratch.
+    command: --event-scheduler=ON --log-bin-trust-function-creators=1 --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --innodb-flush-log-at-trx-commit=0 --sync-binlog=0
+    volumes:
+      - ./test/fixtures/mysql_sample.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./test/fixtures/mysql_seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    # Healthcheck via TCP on 3306: during MySQL's init phase the temporary
+    # server listens only on the unix socket, so a socket-based `mysqladmin
+    # ping` would report healthy too early and dependents (api) would see
+    # "connection refused" on 3306. Going through TCP keeps the gate honest.
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -P 3306 --protocol=TCP -uroot -proot"]
+      interval: 3s
+      timeout: 3s
+      retries: 120
+
+  # MariaDB 11 sample source. Separate from mysql-sample so the mariadb
+  # dialect parser can be exercised against genuine MariaDB features
+  # (SEQUENCE, system-versioned tables, JSON CHECK, INVISIBLE columns). Port
+  # 3307 to avoid clashing with mysql-sample on 3306. Dumps are mounted
+  # read-only from dumps/mariadb/ and loaded on first boot.
+  mariadb-sample:
+    profiles: ["mariadb", "e2e"]
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: sakila
+      MARIADB_USER: sakila
+      MARIADB_PASSWORD: sakila
+    ports: ["3307:3306"]
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --log-bin-trust-function-creators=1
+    volumes:
+      - ./dumps/mariadb:/docker-entrypoint-initdb.d:ro
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -P 3306 --protocol=TCP -uroot -proot"]
+      interval: 3s
+      timeout: 3s
+      retries: 120
+
+  # Oracle 23ai Free. gvenzl/oracle-free is the de-facto community image —
+  # ~2 GB, ~30s first boot, auto-runs /container-entrypoint-initdb.d/*.sql as
+  # APP_USER inside the FREEPDB1 PDB. Exposed on the non-default port 1522 so
+  # it does not collide with any locally-installed Oracle client.
+  oracle-sample:
+    profiles: ["oracle", "e2e"]
+    image: gvenzl/oracle-free:23-slim-faststart
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: squishy
+      APP_USER_PASSWORD: squishy
+    ports: ["1522:1521"]
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      - ./test/fixtures/oracle_sample.sql:/container-entrypoint-initdb.d/01-schema.sql:ro
+      - ./test/fixtures/oracle_seed.sql:/container-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  # Oracle Database 19c (19.3.0.0 base, patché 19.25 côté squishy = identique
+  # pour le parser et les vues ALL_*). L'image doit être CONSTRUITE LOCALEMENT
+  # via le repo officiel Oracle oracle/docker-images (l'image publiée sur
+  # container-registry.oracle.com requiert un docker login SSO qui échoue
+  # régulièrement sur les comptes avec MFA).
+  # Procédure de build (à faire UNE FOIS) :
+  #   1. Télécharger LINUX.X64_193000_db_home.zip depuis
+  #      https://www.oracle.com/database/technologies/oracle19c-linux-downloads.html
+  #      (SSO Oracle via navigateur, ~3 Go, accepter la licence).
+  #   2. Déposer le zip dans
+  #      C:\Users\robin\Documents\git\oracle-docker-images\OracleDatabase\SingleInstance\dockerfiles\19.3.0\
+  #   3. docker build -t oracle/database:19.3.0-ee \
+  #        -f C:\Users\robin\Documents\git\oracle-docker-images\OracleDatabase\SingleInstance\dockerfiles\19.3.0\Dockerfile \
+  #        --target=builder \
+  #        C:\Users\robin\Documents\git\oracle-docker-images\OracleDatabase\SingleInstance\dockerfiles\19.3.0
+  #      (ou via le script buildContainerImage.sh fourni par Oracle)
+  # Premier boot : ~10 min, ~6 Go sur disque. Port exposé 1523 pour cohabiter
+  # avec oracle-sample (23ai, port 1522).
+  # IBM DB2 11.5 Community Edition. Image officielle ICR (~3 GB),
+  # acceptation EULA via LICENSE=accept. Boot ~3-5 min : DB2 crée le fileset,
+  # lance le moteur, puis exécute /var/custom/*.sql en tant que db2inst1.
+  # Privileged requis (DB2 manipule des shm SysV et des sémaphores au boot —
+  # sans privileged, le container échoue avec "ipcget(): Permission denied").
+  #
+  # Port exposé : 50000 (TCPIP par défaut LUW). Le user db2inst1/password est
+  # créé par l'image, le user app SQUISHY/squishy est créé par 01-schema.sql.
+  db2-sample:
+    profiles: ["db2", "e2e"]
+    image: icr.io/db2_community/db2:11.5.9.0
+    privileged: true
+    environment:
+      LICENSE: accept
+      DB2INST1_PASSWORD: password
+      DBNAME: SAMPLE
+      SAMPLEDB: "false"
+      PERSISTENT_HOME: "false"
+      BLU: "false"
+      ENABLE_ORACLE_COMPATIBILITY: "false"
+    ports: ["50000:50000"]
+    volumes:
+      - db2-data:/database
+      - ./test/fixtures/db2_sample.sql:/var/custom/01-schema.sql:ro
+      - ./test/fixtures/db2_seed.sql:/var/custom/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL",
+             "su - db2inst1 -c 'db2 connect to SAMPLE && db2 terminate' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 80
+      start_period: 240s
+
+  oracle19-sample:
+    profiles: ["oracle19"]
+    image: oracle/database:19.3.0-ee
+    environment:
+      ORACLE_PWD: oracle
+      ORACLE_SID: ORCLCDB
+      ORACLE_PDB: ORCLPDB1
+      ORACLE_CHARACTERSET: AL32UTF8
+    ports: ["1523:1521"]
+    volumes:
+      - oracle19-data:/opt/oracle/oradata
+      - ./test/fixtures/oracle19_init.sql:/opt/oracle/scripts/setup/01-user.sql:ro
+      - ./test/fixtures/oracle19_sample.sql:/opt/oracle/scripts/setup/02-schema.sql:ro
+      - ./test/fixtures/oracle19_seed.sql:/opt/oracle/scripts/setup/03-seed.sql:ro
+    healthcheck:
+      test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 600s
+
+  api:
+    build:
+      context: .
+      target: dev-db2
+    environment:
+      SQUISHY_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
+      SQUISHY_HTTP_ADDR: :8080
+      SQUISHY_WORKERS: "4"
+      SQUISHY_WORKER_ID: api-1
+      SQUISHY_BATCH_SIZE: "1000"
+      SQUISHY_LOG_LEVEL: debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql-sample:
+        condition: service_healthy
+    ports: ["8080:8080"]
+    volumes:
+      - .:/app
+      - gocache-debian:/root/.cache/go-build
+      - gomod-debian:/go/pkg/mod
+
+  squishy-mcp:
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      SQUISHY_API_URL: http://api:8080
+      PORT: "8000"
+    depends_on:
+      api:
+        condition: service_started
+    ports: ["127.0.0.1:8002:8000"]
+    volumes:
+      - ./mcp-server:/app
+      - mcp-gocache:/root/.cache/go-build
+      - mcp-gomod:/go/pkg/mod
+      # Mount the host docker socket + project root so the dev-loop MCP
+      # tools (restart_api, run_unit_tests, get_step_payload) can drive
+      # `docker compose` against this stack from inside the container.
+      # The Go source uses cmd.Dir = /workspace explicitly so the WORKDIR
+      # stays at /app for `go run .` to find mcp-server's go.mod.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/workspace
+    restart: unless-stopped
+
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install --prefer-offline --no-audit && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_BASE: http://api:8080
+    volumes:
+      - ./web:/app
+      - nodemods:/app/node_modules
+    ports: ["5173:5173"]
+
+  # --- Profile: test ---
+  unit-tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: dev
+    command: go test ./... -race -count=1 -v
+    environment:
+      CGO_ENABLED: "1"   # required by go test -race
+    volumes:
+      - .:/app
+      - gocache:/root/.cache/go-build
+      - gomod:/go/pkg/mod
+
+  # --- Profile: e2e ---
+  migrate:
+    profiles: ["e2e"]
+    image: migrate/migrate:v4.18.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./internal/storage/migrations:/migrations:ro
+    command: >-
+      -path=/migrations
+      -database=postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
+      up
+
+  e2e:
+    profiles: ["e2e"]
+    build:
+      context: .
+      target: dev
+    command: go test ./test/integration/... -tags=e2e -count=1 -v -timeout=10m
+    environment:
+      SQUISHY_API_URL: http://api:8080
+      SQUISHY_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
+      SQUISHY_MYSQL_DSN: sakila:sakila@tcp(mysql-sample:3306)/sakila?parseTime=true&multiStatements=true
+      TARGET_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
+    depends_on:
+      api:
+        condition: service_started
+      mysql-sample:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - .:/app
+      - gocache:/root/.cache/go-build
+      - gomod:/go/pkg/mod
+
+volumes:
+  pgdata:
+  gocache:
+  gomod:
+  gocache-debian:
+  gomod-debian:
+  nodemods:
+  oracle-data:
+  oracle19-data:
+  mariadb-data:
+  db2-data:
+  mcp-gocache:
+  mcp-gomod:

@@ -1,0 +1,22 @@
+# squishy — local override that swaps Postgres for an image with PostGIS and
+# pg_cron. Auto-loaded by `docker compose up` when present. Delete this file
+# to run with the stock postgres:17-alpine image (tests / CI).
+#
+# Usage:
+#   make up          # uses this override (PostGIS + pg_cron)
+#   rm docker-compose.override.yml && make up   # stock image, no extensions
+
+services:
+  postgres:
+    image: squishy-postgres-extensions:local
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_cron
+      - -c
+      - cron.database_name=squishy
+      - -c
+      - cron.timezone=UTC
