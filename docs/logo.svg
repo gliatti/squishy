@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 120" role="img" aria-label="squishy">
+  <title>squishy</title>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a6"/>
+      <stop offset="100%" stop-color="#084"/>
+    </linearGradient>
+  </defs>
+
+  <!-- "Squish" pictogram: a rounded blob being compressed by a downward arrow,
+       echoing the project's job: squishing one DB shape into another. -->
+  <g transform="translate(20,20)">
+    <!-- top plate -->
+    <rect x="6" y="0" width="68" height="6" rx="3" fill="url(#g)"/>
+    <!-- arrow shaft + head pressing down -->
+    <path d="M40 8 v22 M30 24 l10 10 l10 -10" fill="none" stroke="url(#g)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- squished blob -->
+    <path d="M10 60 q-6 -16 12 -22 q18 -6 36 0 q18 6 12 22 q-6 16 -30 16 q-24 0 -30 -16 z" fill="url(#g)"/>
+    <!-- bottom plate -->
+    <rect x="6" y="78" width="68" height="6" rx="3" fill="url(#g)"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="115" y="78" font-family="ui-rounded, 'SF Pro Rounded', 'Segoe UI', system-ui, sans-serif"
+        font-size="64" font-weight="700" fill="#222" letter-spacing="-1">
+    squishy
+  </text>
+</svg>

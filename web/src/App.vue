@@ -4,7 +4,7 @@ import { RouterLink, RouterView } from 'vue-router'
 
 <template>
   <div class="app">
-    <h1>🦑 squishy</h1>
+    <h1 class="brand"><img src="/logo.svg" alt="squishy" height="44" /></h1>
     <nav class="nav">
       <RouterLink to="/">Projects</RouterLink>
     </nav>
