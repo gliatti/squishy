@@ -1,9 +1,25 @@
-# squishy
+<p align="center">
+  <img src="docs/logo.svg" alt="squishy" width="320"/>
+</p>
 
-> Web UI + Go API for piloting **MySQL / MariaDB / Oracle / IBM DB2 →
-> PostgreSQL** migrations, with a Postgres-backed job queue, real-time
-> monitoring via SSE, per-batch error recovery, and an MCP server for
-> agentic clients.
+<p align="center">
+  <em>Web UI + Go API for piloting <strong>MySQL / MariaDB / Oracle / IBM DB2 → PostgreSQL</strong> migrations,
+  with a Postgres-backed job queue, real-time SSE monitoring, per-batch error recovery,
+  and an MCP server for agentic clients.</em>
+</p>
+
+<p align="center">
+  <a href="https://go.dev/"><img alt="Go 1.23" src="https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white"/></a>
+  <a href="https://vuejs.org/"><img alt="Vue 3" src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white"/></a>
+  <a href="https://vitejs.dev/"><img alt="Vite" src="https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white"/></a>
+  <a href="https://www.postgresql.org/"><img alt="PostgreSQL 17" src="https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white"/></a>
+  <img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"/>
+  <img alt="MariaDB" src="https://img.shields.io/badge/MariaDB-11-003545?logo=mariadb&logoColor=white"/>
+  <img alt="Oracle" src="https://img.shields.io/badge/Oracle-19c%20%2F%2023ai-F80000?logo=oracle&logoColor=white"/>
+  <img alt="IBM DB2" src="https://img.shields.io/badge/IBM%20DB2-11.5%20LUW-052FAD?logo=ibm&logoColor=white"/>
+  <a href="https://www.docker.com/"><img alt="Docker" src="https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white"/></a>
+  <a href="LICENSE"><img alt="License: PostgreSQL" src="https://img.shields.io/badge/license-PostgreSQL-336791"/></a>
+</p>
 
 Part of the [Dalibo](https://dalibo.com) PostgreSQL tool family.
 
