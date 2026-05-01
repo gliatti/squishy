@@ -1,0 +1,6 @@
+DROP SCHEMA IF EXISTS squishy CASCADE;
+DROP TYPE IF EXISTS job_status;
+DROP TYPE IF EXISTS step_status;
+DROP TYPE IF EXISTS run_status;
+DROP TYPE IF EXISTS connection_kind;
+DROP FUNCTION IF EXISTS set_updated_at();

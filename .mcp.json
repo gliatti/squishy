@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "squishy": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://localhost:8002/mcp"
+      ]
+    }
+  }
+}

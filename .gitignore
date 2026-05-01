@@ -1,0 +1,35 @@
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+.env
+.env.local
+
+# Built binary at the repo root.
+/squishy
+
+# Claude Code local state (per-developer).
+/.claude/
+
+web/node_modules/
+web/dist/
+web/.vite/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+vendor/
+.cache/
+
+# SQL dumps — never committed (may contain client/proprietary data).
+# Covers raw source dumps under /dumps/ and any dialect-specific testdata
+# subtree (e.g. Oracle DBA_SOURCE captures used as parser fixtures).
+/dumps/
+**/testdata/*.sql
+**/testdata/*.sql.gz
+test.log

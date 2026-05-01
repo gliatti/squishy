@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.6
+#
+# Custom Postgres image for squishy dev: PostgreSQL 17 + PostGIS 3.5 +
+# pg_cron + pgvector. Used by docker-compose.override.yml. Delete the
+# override to fall back to the stock postgres:17-alpine image from
+# docker-compose.yml.
+
+FROM postgis/postgis:17-3.5
+
+# pg_cron, pgvector, and orafce packages from the PGDG apt repo (already
+# configured in the postgis base image). orafce ships Oracle-compat shims
+# (UTL_FILE / DBMS_LOB / DBMS_RANDOM / DBMS_UTILITY ...) that the squishy
+# Oracle translator emits in lowercase form so the migrated routines
+# resolve onto these implementations.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        postgresql-17-cron \
+        postgresql-17-pgvector \
+        postgresql-17-orafce \
+ && rm -rf /var/lib/apt/lists/*
+
+# Init scripts run only on a fresh data volume (first-time cluster bootstrap).
+COPY postgres-init/ /docker-entrypoint-initdb.d/
