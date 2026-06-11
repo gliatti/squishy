@@ -21,8 +21,6 @@
   <a href="LICENSE"><img alt="License: PostgreSQL" src="https://img.shields.io/badge/license-PostgreSQL-336791"/></a>
 </p>
 
-Part of the [Dalibo](https://dalibo.com) PostgreSQL tool family.
-
 ## Highlights
 
 - **Vue 3 frontend** (Pinia + Vite) organized around the resource hierarchy
