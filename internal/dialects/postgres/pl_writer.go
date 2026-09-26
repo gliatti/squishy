@@ -173,6 +173,12 @@ func writePL(b *strings.Builder, s ast.PLStmt, depth int) {
 	case *ast.NullStmt:
 		fmt.Fprintf(b, "%sNULL;\n", pfx)
 
+	case *ast.InsertStmt, *ast.UpdateStmt, *ast.DeleteStmt:
+		// Embedded DML runs verbatim in PL/pgSQL — render it with the
+		// statement writer (a bare SELECT is not accepted in plpgsql,
+		// so SelectStmt stays on the default branch).
+		fmt.Fprintf(b, "%s%s;\n", pfx, WriteStmt(s.(ast.Stmt)))
+
 	case *ast.ExecuteImmediateStmt:
 		// PG: EXECUTE <sql expr> [INTO target [, target …]] [USING e [, e …]];
 		fmt.Fprintf(b, "%sEXECUTE %s", pfx, WriteExpr(x.SQL))
@@ -254,6 +260,8 @@ func writeDeclLine(d ast.PLDecl) string {
 		typ := "text"
 		if udt, ok := x.Type.(*ast.UserDefinedType); ok && udt.Name != "" {
 			typ = udt.Name
+		} else if pt, ok := x.Type.(*ast.PGType); ok && pt.Name != "" {
+			typ = pt.Name
 		}
 		out := fmt.Sprintf("%s %s", x.Name, typ)
 		if x.Default != nil {

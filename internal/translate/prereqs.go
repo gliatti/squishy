@@ -95,7 +95,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 				Category:    CatManualReview,
 				Object:      w.Object,
 				Title:       "Review views that use MySQL-specific functions",
-				Description: "One or more views use MySQL-specific functions (JSON_EXTRACT, GROUP_CONCAT, …). squishy applies a token-level rewrite (backticks → quotes, function renames, GROUP_CONCAT → string_agg) but some calls may still be incorrect — especially JSON path syntax which differs between MySQL and PG.",
+				Description: "One or more views use MySQL-specific constructs squishy could not rewrite:\n\n  • " + w.Message + "\n\nThe view body is parsed and rewritten on the AST (backticks → quotes, function renames, GROUP_CONCAT → string_agg, simple JSON paths, INTERVAL arithmetic), but the flagged calls reach PG unchanged — especially JSON path syntax, which differs between MySQL and PG.",
 				Remediation: `Open the generated view DDL in wizard step 3 (the "post-copy" block).
 For each flagged view, verify:
   * JSON_EXTRACT(col, '$.a.b')   → col -> 'a' -> 'b'           (JSONB)
@@ -103,6 +103,40 @@ For each flagged view, verify:
                                  → col ->> 'a'
   * GROUP_CONCAT(x SEPARATOR ',') → string_agg(x::text, ',')   (already auto-rewritten)
 Paste the corrected SELECT into the view body if needed, then re-plan.`,
+			})
+		case "view.parse":
+			// Blocking when the dialect parser rejected the body; info
+			// when the source dialect does not type view bodies at all
+			// (DB2): the verbatim copy is then the expected path, but it
+			// is still surfaced rather than passed through silently.
+			sev, title := SeverityBlocking, "Review views copied verbatim (body not parsed)"
+			if w.Severity == string(SeverityInfo) {
+				sev, title = SeverityInfo, "Views copied verbatim (no typed view parser for this source)"
+			}
+			add(Prerequisite{
+				Severity:    sev,
+				Category:    CatManualReview,
+				Object:      w.Object,
+				Title:       title,
+				Description: "squishy could not parse one or more view bodies into a typed query, so no dialect rewrite was applied and the source SELECT is copied verbatim into the PG CREATE VIEW:\n\n  • " + w.Message + "\n\nSource-specific syntax (backticks, MySQL/DB2 built-ins, JSON paths, …) will make the CREATE VIEW fail or behave differently on PG.",
+				Remediation: `Open the generated view DDL in wizard step 3 (the "post-copy" block),
+compare it with the source definition and fix the SELECT by hand:
+  * identifiers   → "double quotes" instead of backticks
+  * functions     → PG equivalents (IFNULL → COALESCE, NOW() → now(), …)
+  * GROUP_CONCAT  → string_agg(x::text, ',')
+Then re-plan. If the body is valid SQL the parser should accept, file a
+parser extension ticket against internal/dialects/<kind>/.`,
+			})
+		case "event.at":
+			add(Prerequisite{
+				Severity:    SeverityBlocking,
+				Category:    CatManualSQL,
+				Object:      w.Object,
+				Title:       "Review one-shot event fire time copied verbatim",
+				Description: "The `ON SCHEDULE AT <expr>` expression of a MySQL EVENT could not be parsed, so it was copied verbatim into the self-scheduling pg_cron DO block. MySQL date arithmetic (INTERVAL n UNIT, DATE_ADD, …) is not valid PG as written.",
+				Remediation: `Edit the fire_at initialiser of the generated DO block so it is a valid
+PG timestamptz expression, e.g.:
+  fire_at TIMESTAMPTZ := now() + INTERVAL '1 hour';`,
 			})
 		case "routine.untranslated_construct":
 			add(Prerequisite{
@@ -232,6 +266,50 @@ Either:
 If your application doesn't actually rely on the historical rows, ack
 this prerequisite to migrate the current rows only.`,
 			})
+		case "table.generated_concat":
+			// One prerequisite per column (the title names it): add()
+			// deduplicates by title and would otherwise keep only the
+			// first column's expression.
+			add(Prerequisite{
+				Severity: SeverityBlocking,
+				Category: CatManualReview,
+				Object:   w.Object,
+				Title:    "Rewrite generated column " + w.Object + " by hand (MySQL text conversion not translated)",
+				Description: "The MySQL/MariaDB generated column " + w.Object + " converts a value to text — in CONCAT / CONCAT_WS, in a CAST / CONVERT, through a hex / bit literal, or by storing a boolean in a text column — in a way squishy cannot prove PostgreSQL turns into the same text as MySQL (booleans MySQL prints 1 / 0 and PostgreSQL t / f or true / false, DECIMAL / FLOAT / DOUBLE scale and notation, CHAR padding, ENUM, hex / bit literals MySQL reads as binary strings, JSON-promoted columns, charset conversions, TEXT-family targets MariaDB silently truncates, CONCAT inside a comparison or another function, CONCAT_WS, CONCAT_OPERATOR_ORACLE, expressions…). squishy refuses to guess MySQL's text conversion:\n\n  • " + w.Message +
+					"\n\nWith CONCAT, the emitted DDL keeps concat() / concat_ws() / CONCAT_OPERATOR_ORACLE(); PostgreSQL rejects them in a generation expression (they are not immutable), so create_ddl fails loudly if the run is forced. Without CONCAT (hex / bit literal, boolean converted or stored as text), the emitted DDL keeps the expression as translated, which PostgreSQL may accept while storing a different text (41 instead of 'A', t / true instead of 1): do not acknowledge this prerequisite before the column is rewritten.",
+				Remediation: `Open the generated DDL of the flagged column (wizard step 3) and pick one:
+  * rewrite the generation expression by hand in PostgreSQL with || and
+    explicit, immutable conversions that print exactly what MySQL prints
+    (check the result against the source rows);
+  * or drop the generated column on PG and turn it into a plain column
+    filled by the application or by a BEFORE INSERT OR UPDATE trigger;
+  * or change the column on the source so it no longer converts a value
+    to text in a way PostgreSQL prints differently (no hex / bit literal,
+    no boolean — TINYINT(1) / BIT(1) column, comparison, NOT, TRUE /
+    FALSE — cast to CHAR or stored in a text column, and any CONCAT is
+    the whole generation expression into a VARCHAR(n) column, over string
+    literals, integer literals, same-charset VARCHAR / TEXT columns (not
+    JSON) and non-boolean integer columns), and re-plan.`,
+			})
+		case "table.generated_parse_error":
+			// One prerequisite per column, as for table.generated_concat.
+			add(Prerequisite{
+				Severity: SeverityBlocking,
+				Category: CatManualReview,
+				Object:   w.Object,
+				Title:    "Rewrite generated column " + w.Object + " by hand (source DDL has parse errors)",
+				Description: "The source DDL has parse errors. The parser's error recovery can cut a generation expression short or drop a CONCAT from it, so the parsed expression of the MySQL/MariaDB generated column " + w.Object + " is not proven to be the source expression:\n\n  • " + w.Message +
+					"\n\nThe emitted DDL keeps the expression as parsed. It may fail at create_ddl or, if PostgreSQL accepts it, compute something other than MySQL does: check it before forcing the run.",
+				Remediation: `Open the generated DDL of the flagged column (wizard step 3), compare it
+with the source SHOW CREATE TABLE, and pick one:
+  * rewrite the generation expression by hand in PostgreSQL (for a
+    CONCAT: || with explicit, immutable conversions that print exactly
+    what MySQL prints; check the result against the source rows);
+  * or drop the generated column on PG and turn it into a plain column
+    filled by the application or by a BEFORE INSERT OR UPDATE trigger;
+  * or make the source DDL parse cleanly (or report the parser gap) and
+    re-plan.`,
+			})
 		case "package.unsupported":
 			add(Prerequisite{
 				Severity:    SeverityBlocking,
@@ -256,15 +334,16 @@ this prerequisite to migrate the current rows only.`,
 				Severity:    SeverityBlocking,
 				Category:    CatManualReview,
 				Object:      w.Object,
-				Title:       "Application-time PERIOD FOR not replicated",
-				Description: "MariaDB's `PERIOD FOR <name> (start_col, end_col)` (application-time period) lets queries use `FOR PORTION OF <period> FROM ... TO ...` semantics for partial-row updates and DELETEs. PostgreSQL has no equivalent: the two timestamp columns migrate as plain columns, but range-overlap protection and FOR PORTION OF rewriting are NOT generated.",
+				Title:       "Application-time PERIOD key WITHOUT OVERLAPS not replicated",
+				Description: "A MariaDB PRIMARY KEY / UNIQUE declared over an application-time period (`UNIQUE (<key>, <period> WITHOUT OVERLAPS)`) forbids two rows with the same key whose [start_col, end_col) ranges overlap. The period columns and the period's implicit CHECK (start < end) are migrated, but squishy does not generate the range-exclusion constraint: the key was not created on PostgreSQL.",
 				Remediation: `For the flagged tables:
   * Add an EXCLUDE constraint to forbid overlapping rows for the same key:
       ALTER TABLE "mig"."<table>"
         ADD CONSTRAINT no_overlap EXCLUDE USING gist (
           <key> WITH =,
           tstzrange(<start_col>, <end_col>) WITH &&);
-    (requires the btree_gist extension: CREATE EXTENSION btree_gist;)
+    (daterange / tsrange for DATE / TIMESTAMP period columns; requires
+    the btree_gist extension: CREATE EXTENSION btree_gist;)
   * Rewrite any FOR PORTION OF UPDATE/DELETE in application code as
     explicit DELETE + INSERT pairs that reflect the new ranges.`,
 			})

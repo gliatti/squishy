@@ -128,7 +128,11 @@ func writeCreateTable(b *strings.Builder, t *CreateTable) {
 		if i == len(t.Checks)-1 {
 			sep = ""
 		}
-		fmt.Fprintf(b, "  CHECK (%s)%s\n", ck, sep)
+		b.WriteString("  ")
+		if i < len(t.CheckNames) && t.CheckNames[i] != "" {
+			fmt.Fprintf(b, "CONSTRAINT %s ", qIdent(t.CheckNames[i]))
+		}
+		fmt.Fprintf(b, "CHECK (%s)%s\n", ck, sep)
 	}
 	b.WriteString(")")
 	if t.PartitionBy != nil {
@@ -309,9 +313,29 @@ func writeCreateTrigger(b *strings.Builder, t *CreateTrigger) {
 	// writer.
 	fmt.Fprintf(b, "DROP TRIGGER IF EXISTS %s ON %s.%s;\n",
 		qIdent(t.Name), qIdent(t.Schema), qIdent(t.Table))
+	event := strings.ToUpper(t.Event)
+	if len(t.Events) > 0 {
+		var eb strings.Builder
+		for i, ev := range t.Events {
+			if i > 0 {
+				eb.WriteString(" OR ")
+			}
+			eb.WriteString(strings.ToUpper(ev))
+			if strings.EqualFold(ev, "UPDATE") && len(t.UpdateOf) > 0 {
+				eb.WriteString(" OF ")
+				for j, c := range t.UpdateOf {
+					if j > 0 {
+						eb.WriteString(", ")
+					}
+					eb.WriteString(qIdent(c))
+				}
+			}
+		}
+		event = eb.String()
+	}
 	fmt.Fprintf(b,
 		"CREATE TRIGGER %s %s %s ON %s.%s\n  FOR EACH %s",
-		qIdent(t.Name), strings.ToUpper(t.Timing), strings.ToUpper(t.Event),
+		qIdent(t.Name), strings.ToUpper(t.Timing), event,
 		qIdent(t.Schema), qIdent(t.Table),
 		forEach)
 	if t.WhenCond != "" {

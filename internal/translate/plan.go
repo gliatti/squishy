@@ -27,12 +27,54 @@ type PGTable struct {
 	Columns []PGColumn `json:"columns"`
 	PK      []string   `json:"pk,omitempty"`
 	Checks  []string   `json:"checks,omitempty"`
-	Comment string     `json:"comment,omitempty"`
+	// CheckNames runs parallel to Checks: the source constraint name of
+	// each table-level CHECK ("" when the source left it unnamed and PG
+	// should generate one).
+	CheckNames []string `json:"check_names,omitempty"`
+	Comment    string   `json:"comment,omitempty"`
 	// Partitioning carries the declarative partitioning lifted from the
 	// source DDL (Oracle PARTITION BY RANGE/LIST/HASH). When set, buildDDL
 	// emits a partitioned-table parent + one CREATE TABLE … PARTITION OF
 	// … FOR VALUES FROM (…) TO (…) per child.
 	Partitioning *PGPartitioning `json:"partitioning,omitempty"`
+	// SystemVersioning is set on a MariaDB `WITH SYSTEM VERSIONING` table
+	// whose history is emulated (explicit ROW START / ROW END columns):
+	// the planner adds a copy of the source history rows into
+	// HistoryTable, and the translator's post-copy actions install the
+	// versioning triggers. See mariadb_temporal.go.
+	SystemVersioning *PGSystemVersioning `json:"system_versioning,omitempty"`
+}
+
+// PGSystemVersioning describes the emulation of one MariaDB
+// system-versioned table.
+type PGSystemVersioning struct {
+	RowStart     string `json:"row_start"`     // ROW START column
+	RowEnd       string `json:"row_end"`       // ROW END column
+	HistoryTable string `json:"history_table"` // PG table holding the closed versions
+	// RowEndMax is the ROW END value the source server stores on current
+	// rows (UTC, probed at inspection: '2106-02-07 06:28:15.999999' on
+	// 64-bit MariaDB 11.5+, '2038-01-19 03:14:07.999999' before).
+	RowEndMax string `json:"row_end_max"`
+	// Unversioned lists the columns declared WITHOUT SYSTEM VERSIONING;
+	// an UPDATE assigning only them does not create a version.
+	Unversioned []string `json:"unversioned,omitempty"`
+	// Implicit is true for a table versioned in MariaDB's implicit form:
+	// RowStart / RowEnd are the hidden row_start / row_end columns, which
+	// become regular (visible) columns of the PG table.
+	Implicit bool `json:"implicit,omitempty"`
+	// CopyColumns are the columns the current-table copy transfers: the
+	// translated table's non-generated columns, ROW START / ROW END
+	// included (PG recomputes its generated columns). The planner passes
+	// them in the copy_table payload, so the copied column set follows
+	// the translated table rather than the source catalog (whose default
+	// column list skips every GENERATED column, period columns included).
+	CopyColumns []string `json:"copy_columns,omitempty"`
+	// HistoryCopyColumns are the columns the history copy transfers:
+	// every column of the history table, generated ones included — the
+	// history table stores them as plain columns, so their values (as
+	// the source computed them for each archived version) must be read
+	// from the source, not left NULL.
+	HistoryCopyColumns []string `json:"history_copy_columns,omitempty"`
 }
 
 // PGPartitioning is the squishy-side description of a PG declarative
@@ -139,6 +181,14 @@ type PGRoutine struct {
 	Security  string `json:"security,omitempty"` // DEFINER|INVOKER
 	RawBody   string `json:"raw_body"`           // MySQL body, preserved in comment
 	DDL       string `json:"ddl"`                // PG skeleton DDL
+	// Table and FnName are set on an emitted trigger (Kind "trigger"):
+	// the table it is created on and the PG trigger function its DDL
+	// creates. PostgreSQL scopes trigger names per table and puts the
+	// function in the schema's function namespace; the translator reads
+	// both when it derives names of its own (system-versioning triggers)
+	// so it never reuses one of them.
+	Table  string `json:"table,omitempty"`
+	FnName string `json:"fn_name,omitempty"`
 }
 
 type PGView struct {
@@ -148,6 +198,12 @@ type PGView struct {
 	CheckOption string `json:"check_option,omitempty"`
 	Security    string `json:"security,omitempty"`
 	DDL         string `json:"ddl"`
+	// References lists the base tables / views the typed view body
+	// reads (collected from the AST, CTE names excluded, bare names).
+	// nil when the body was not translated from a typed SELECT (Oracle,
+	// DB2, parse failure) — the planner then falls back to a token walk
+	// over DDL + SelectBody to derive view→view dependencies.
+	References []string `json:"references,omitempty"`
 }
 
 type PGEvent struct {
@@ -162,7 +218,7 @@ type Explanation struct {
 	Source string `json:"source"` // "ENUM('pending',...)"
 	Target string `json:"target"` // "TEXT + CHECK (status IN (...))"
 	Reason string `json:"reason"` // narrative
-	Level  string `json:"level"`  // info|warn
+	Level  string `json:"level"`  // info|warn|error (error: squishy refused to translate; blocking)
 }
 
 // Warning flags something that needs attention (body to translate, spatial types…).

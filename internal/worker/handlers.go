@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.com/dalibo/squishy/internal/dataxfer"
+	oracle "gitlab.com/dalibo/squishy/internal/dialects/oracle"
 	"gitlab.com/dalibo/squishy/internal/events"
 	"gitlab.com/dalibo/squishy/internal/queue"
 )
@@ -119,21 +119,90 @@ func (d *Deps) hCreateDDL(ctx context.Context, j *queue.Job) error {
 	return err
 }
 
+// copyTablePayload is the payload of a copy_table step (planner.Build).
+type copyTablePayload struct {
+	Schema       string `json:"schema"`
+	Table        string `json:"table"`
+	TargetSchema string `json:"target_schema"`
+	// TargetTable overrides the PG table the rows land in (default:
+	// the source table name).
+	TargetTable string `json:"target_table"`
+	// SourceVariant selects a non-default row source; RowEndCol is
+	// its parameter. See copySourceDialect.
+	SourceVariant string `json:"source_variant"`
+	RowEndCol     string `json:"row_end_col"`
+	// Columns, when set, is the exact column list to copy (source
+	// names, which are also the PG names for MySQL/MariaDB). The
+	// planner sets it from the translated table when the default —
+	// the source catalog's copyable columns — would not match it
+	// (MariaDB system-versioning emulation). Empty: catalog default.
+	Columns []string `json:"columns,omitempty"`
+}
+
+// validate rejects a payload the copy cannot honour faithfully.
+func (p copyTablePayload) validate() error {
+	if p.SourceVariant == copySourceVariantSystemTimeHistory && len(p.Columns) == 0 {
+		// The catalog default skips generated columns, which the
+		// history table stores as plain columns: they would be copied
+		// as NULL without a word.
+		return fmt.Errorf("copy source variant %q needs an explicit column list", p.SourceVariant)
+	}
+	return nil
+}
+
+// copyBatchPayload is the payload of a copy_batch job (hCopyTable).
+type copyBatchPayload struct {
+	SrcSchema string         `json:"src_schema"`
+	SrcTable  string         `json:"src_table"`
+	DstSchema string         `json:"dst_schema"`
+	DstTable  string         `json:"dst_table"`
+	RangeKind string         `json:"range_kind"`
+	Low       map[string]any `json:"low"`
+	High      map[string]any `json:"high"`
+
+	SourceVariant string   `json:"source_variant"`
+	RowEndCol     string   `json:"row_end_col"`
+	Columns       []string `json:"columns,omitempty"`
+}
+
+// newCopyBatchPayload builds the copy_batch payload of one range of a
+// copy_table step. dstTable is the PG table the rows land in.
+func newCopyBatchPayload(p copyTablePayload, dstTable, rangeKind string, r dataxfer.Range) copyBatchPayload {
+	return copyBatchPayload{
+		SrcSchema: p.Schema, SrcTable: p.Table,
+		DstSchema: p.TargetSchema, DstTable: dstTable,
+		RangeKind: rangeKind, Low: r.Low, High: r.High,
+		SourceVariant: p.SourceVariant, RowEndCol: p.RowEndCol,
+		Columns: p.Columns,
+	}
+}
+
 // hCopyTable expands a copy_table step into N step_batches + N copy_batch jobs.
 // Idempotent on re-run: existing batches are kept; missing ones are created.
 func (d *Deps) hCopyTable(ctx context.Context, j *queue.Job) error {
-	var p struct {
-		Schema       string `json:"schema"`
-		Table        string `json:"table"`
-		TargetSchema string `json:"target_schema"`
-	}
+	var p copyTablePayload
 	if err := json.Unmarshal(j.Payload, &p); err != nil {
+		return err
+	}
+	if err := p.validate(); err != nil {
 		return err
 	}
 	if p.TargetSchema == "" {
 		p.TargetSchema = "public"
 	}
-	plan, err := dataxfer.BuildPartitionPlan(ctx, d.SourceDB, d.sourceDialect(), p.Schema, p.Table, d.BatchSize)
+	dial, err := d.copySourceDialect(p.SourceVariant, p.RowEndCol)
+	if err != nil {
+		return err
+	}
+	// Translator applies pgNormalize() to Oracle identifiers (all-caps
+	// → lowercase) so the PG side ends up with `customers` rather than
+	// `"CUSTOMERS"`. Mirror that normalization here so the copy targets
+	// the table PG actually created.
+	dstTable := pgNormalizeIdent(d.sourceDialect().Kind(), p.Table)
+	if p.TargetTable != "" {
+		dstTable = p.TargetTable
+	}
+	plan, err := dataxfer.BuildPartitionPlan(ctx, d.SourceDB, dial, p.Schema, p.Table, d.BatchSize)
 	if err != nil {
 		return fmt.Errorf("partition %s: %w", p.Table, err)
 	}
@@ -165,19 +234,7 @@ func (d *Deps) hCopyTable(ctx context.Context, j *queue.Job) error {
 			batchID, j.StepID, r.Seq, pkCols, low, high, plan.RangeKind, r.RowCount); err != nil {
 			return err
 		}
-		// Translator applies pgNormalize() to Oracle identifiers (all-caps
-		// → lowercase) so the PG side ends up with `customers` rather than
-		// `"CUSTOMERS"`. Mirror that normalization here so the copy targets
-		// the table PG actually created.
-		payload, _ := json.Marshal(map[string]any{
-			"src_schema": p.Schema,
-			"src_table":  p.Table,
-			"dst_schema": p.TargetSchema,
-			"dst_table":  pgNormalizeIdent(d.sourceDialect().Kind(), p.Table),
-			"range_kind": plan.RangeKind,
-			"low":        r.Low,
-			"high":       r.High,
-		})
+		payload, _ := json.Marshal(newCopyBatchPayload(p, dstTable, plan.RangeKind, r))
 		if _, err := q.Enqueue(ctx, tx, queue.Job{
 			RunID: j.RunID, StepID: j.StepID, BatchID: &batchID,
 			Kind: "copy_batch", Payload: payload, Priority: 100,
@@ -189,16 +246,12 @@ func (d *Deps) hCopyTable(ctx context.Context, j *queue.Job) error {
 }
 
 func (d *Deps) hCopyBatch(ctx context.Context, j *queue.Job) error {
-	var p struct {
-		SrcSchema string         `json:"src_schema"`
-		SrcTable  string         `json:"src_table"`
-		DstSchema string         `json:"dst_schema"`
-		DstTable  string         `json:"dst_table"`
-		RangeKind string         `json:"range_kind"`
-		Low       map[string]any `json:"low"`
-		High      map[string]any `json:"high"`
-	}
+	var p copyBatchPayload
 	if err := json.Unmarshal(j.Payload, &p); err != nil {
+		return err
+	}
+	dial, err := d.copySourceDialect(p.SourceVariant, p.RowEndCol)
+	if err != nil {
 		return err
 	}
 	// JSON unmarshals all numbers as float64; coerce back to int64 so the
@@ -214,10 +267,11 @@ func (d *Deps) hCopyBatch(ctx context.Context, j *queue.Job) error {
 		}
 	}
 	n, err := dataxfer.CopyBatch(ctx, dataxfer.CopyOpts{
-		SourceDB: d.SourceDB, SourceDialect: d.sourceDialect(), TargetPool: d.TargetPool,
+		SourceDB: d.SourceDB, SourceDialect: dial, TargetPool: d.TargetPool,
 		SrcSchema: p.SrcSchema, SrcTable: p.SrcTable,
 		DstSchema: p.DstSchema, DstTable: p.DstTable,
 		RangeKind: p.RangeKind, Low: p.Low, High: p.High,
+		Columns: p.Columns,
 	})
 	if err != nil {
 		return err
@@ -376,49 +430,246 @@ func retryWithTypeFallback(ddl string, execErr error) (string, bool) {
 	if relName == "" {
 		return ddl, false
 	}
-	// Substitute `<rel>.<col>%TYPE` (case-insensitive on the relation
-	// name; leave the column name and rest of the DDL untouched). Use
-	// a regex anchored on identifier boundaries.
-	re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(relName) + `\.[A-Za-z_][A-Za-z0-9_]*%TYPE`)
-	out := re.ReplaceAllString(ddl, "text")
-	if out == ddl {
+	// Substitute `[<schema>.]<rel>.<col>%TYPE` (case-insensitive on the
+	// relation name; leave the rest of the DDL untouched) via a token
+	// walk — no text matching on SQL.
+	return replaceAnchoredTypeRefs(ddl, relName)
+}
+
+// replaceAnchoredTypeRefs lexes ddl with the Oracle lexer (its lexical
+// rules — "quoted idents", 'strings', comments — match PG-emitted DDL)
+// and replaces every token sequence
+//
+//	[<schema> .] <rel> . <col> % TYPE
+//
+// whose <rel> matches relName (case-insensitively; relName itself may be
+// schema-qualified, e.g. `mig.emp`) with the literal `text`. The optional
+// leading schema qualifier is part of the replaced span so
+// `mig.emp.sal%TYPE` becomes `text`, not `mig.text`. Occurrences inside
+// string literals or comments are separate tokens and never match.
+//
+// Token offsets are RUNE offsets (the lexer scans a []rune), so the
+// splice works on []rune(ddl), never on bytes. Spans are patched from the
+// back so earlier offsets stay valid. Returns (rewritten, true) only when
+// at least one span was replaced.
+func replaceAnchoredTypeRefs(ddl, relName string) (string, bool) {
+	if relName == "" {
 		return ddl, false
 	}
-	return out, true
+	relParts := identParts(relName)
+	if len(relParts) == 0 {
+		// Not an `ident(.ident)*` spelling (e.g. a name PG printed that
+		// needs quoting in SQL): compare it whole against single tokens,
+		// which matches the Lit of a "Quoted Ident".
+		relParts = []string{relName}
+	}
+	toks := significantTokens(ddl)
+
+	type span struct{ start, end int }
+	var spans []span
+	floor := 0 // first token index not yet covered by a recorded span
+	for i := 0; i < len(toks); i++ {
+		end, ok := matchTypeRef(toks, i, relParts)
+		if !ok {
+			continue
+		}
+		// Absorb the `<qualifier> .` chain in front of the relation
+		// (schema, or catalog.schema) so the whole anchored reference
+		// is replaced — never reaching into a previously replaced span.
+		start := i
+		for start-2 >= floor && isPunct(toks[start-1], ".") && isIdentLike(toks[start-2]) {
+			start -= 2
+		}
+		floor = end + 1
+		spans = append(spans, span{
+			start: toks[start].Pos.Offset,
+			end:   toks[end].Pos.Offset + tokenRuneLen(toks[end]),
+		})
+		i = end
+	}
+	if len(spans) == 0 {
+		return ddl, false
+	}
+	src := []rune(ddl)
+	repl := []rune("text")
+	for k := len(spans) - 1; k >= 0; k-- {
+		s := spans[k]
+		if s.start < 0 || s.end > len(src) || s.start > s.end {
+			continue
+		}
+		out := make([]rune, 0, len(src)-(s.end-s.start)+len(repl))
+		out = append(out, src[:s.start]...)
+		out = append(out, repl...)
+		out = append(out, src[s.end:]...)
+		src = out
+	}
+	return string(src), true
+}
+
+// matchTypeRef tries to match `<relParts…> . <col> % TYPE` starting at
+// toks[i] and returns the index of the TYPE token on success.
+func matchTypeRef(toks []oracle.Token, i int, relParts []string) (int, bool) {
+	j := i
+	for k, part := range relParts {
+		if k > 0 {
+			if j >= len(toks) || !isPunct(toks[j], ".") {
+				return 0, false
+			}
+			j++
+		}
+		if j >= len(toks) || !isIdentLike(toks[j]) || !strings.EqualFold(toks[j].Lit, part) {
+			return 0, false
+		}
+		j++
+	}
+	if j+3 >= len(toks) {
+		return 0, false
+	}
+	if !isPunct(toks[j], ".") || !isIdentLike(toks[j+1]) || !isPunct(toks[j+2], "%") {
+		return 0, false
+	}
+	typ := toks[j+3]
+	if (typ.Kind != oracle.TOK_IDENT && typ.Kind != oracle.TOK_KEYWORD) || !strings.EqualFold(typ.Lit, "TYPE") {
+		return 0, false
+	}
+	return j + 3, true
+}
+
+// identParts lexes a (possibly dotted) relation name taken from a PG
+// error message into its identifier parts. Returns nil when the name is
+// not a clean `ident(.ident)*` sequence.
+func identParts(name string) []string {
+	var parts []string
+	wantIdent := true
+	for _, t := range significantTokens(name) {
+		switch {
+		case t.Kind == oracle.TOK_EOF:
+			if wantIdent {
+				return nil
+			}
+			return parts
+		case wantIdent && isIdentLike(t):
+			parts = append(parts, t.Lit)
+			wantIdent = false
+		case !wantIdent && isPunct(t, "."):
+			wantIdent = true
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// significantTokens returns every non-comment token of src, EOF included.
+func significantTokens(src string) []oracle.Token {
+	l := oracle.NewLexer(src)
+	var out []oracle.Token
+	for {
+		t := l.Next()
+		if t.Kind == oracle.TOK_COMMENT {
+			continue
+		}
+		out = append(out, t)
+		if t.Kind == oracle.TOK_EOF {
+			return out
+		}
+	}
+}
+
+func isIdentLike(t oracle.Token) bool {
+	return t.Kind == oracle.TOK_IDENT || t.Kind == oracle.TOK_QUOTED_IDENT || t.Kind == oracle.TOK_KEYWORD
+}
+
+func isPunct(t oracle.Token, lit string) bool {
+	return t.Kind == oracle.TOK_PUNCT && t.Lit == lit
+}
+
+// tokenRuneLen is the token's length in source runes: Raw when the lexer
+// records it (words, quoted idents, strings), else Lit (punctuation).
+func tokenRuneLen(t oracle.Token) int {
+	if t.Raw != "" {
+		return len([]rune(t.Raw))
+	}
+	return len([]rune(t.Lit))
+}
+
+// validatePayload is the validate step payload (planner.Build).
+type validatePayload struct {
+	Tables []string `json:"tables"`
+	// HistoryTables are the emulated MariaDB system-versioned tables'
+	// history copies (planner.ValidateHistoryTable).
+	HistoryTables []struct {
+		SourceTable string `json:"source_table"`
+		TargetTable string `json:"target_table"`
+		RowEndCol   string `json:"row_end_col"`
+	} `json:"history_tables"`
+	SourceSchema string `json:"source_schema"`
+	TargetSchema string `json:"target_schema"`
+}
+
+// countCheck is one row-count comparison of the validate step: the rows
+// src reads from SourceTable against the rows of TargetTable.
+type countCheck struct {
+	src         dataxfer.SourceDialect
+	SourceTable string
+	TargetTable string
+}
+
+// validateChecks lists the row-count comparisons of a validate payload:
+// one per copied base table, read through the connection's dialect, and
+// one per history copy, read through the same MariaDB system-time
+// history source as the copy itself (so a short or empty history copy
+// is caught like a short table copy).
+func (d *Deps) validateChecks(p validatePayload) ([]countCheck, error) {
+	dial := d.sourceDialect()
+	out := make([]countCheck, 0, len(p.Tables)+len(p.HistoryTables))
+	for _, t := range p.Tables {
+		// PG-side: apply the same ident normalization the translator +
+		// copier used (all-caps Oracle names folded to lowercase,
+		// mixed-case verbatim).
+		out = append(out, countCheck{src: dial, SourceTable: t, TargetTable: pgNormalizeIdent(dial.Kind(), t)})
+	}
+	for _, h := range p.HistoryTables {
+		if h.SourceTable == "" || h.TargetTable == "" {
+			return nil, fmt.Errorf("validate: history table entry needs source_table and target_table, got %+v", h)
+		}
+		hist, err := d.copySourceDialect(copySourceVariantSystemTimeHistory, h.RowEndCol)
+		if err != nil {
+			return nil, fmt.Errorf("validate history %s: %w", h.TargetTable, err)
+		}
+		out = append(out, countCheck{src: hist, SourceTable: h.SourceTable, TargetTable: h.TargetTable})
+	}
+	return out, nil
 }
 
 func (d *Deps) hValidate(ctx context.Context, j *queue.Job) error {
-	var p struct {
-		Tables       []string `json:"tables"`
-		SourceSchema string   `json:"source_schema"`
-		TargetSchema string   `json:"target_schema"`
-	}
+	var p validatePayload
 	if err := json.Unmarshal(j.Payload, &p); err != nil {
 		return err
 	}
 	if p.TargetSchema == "" {
 		p.TargetSchema = "public"
 	}
-	dial := d.sourceDialect()
-	for _, t := range p.Tables {
+	checks, err := d.validateChecks(p)
+	if err != nil {
+		return err
+	}
+	for _, c := range checks {
 		var srcN int64
-		if err := d.SourceDB.QueryRowContext(ctx, dial.CountQuery(p.SourceSchema, t)).Scan(&srcN); err != nil {
-			return fmt.Errorf("count source %s: %w", t, err)
+		if err := d.SourceDB.QueryRowContext(ctx, c.src.CountQuery(p.SourceSchema, c.SourceTable)).Scan(&srcN); err != nil {
+			return fmt.Errorf("count source %s (for %s): %w", c.SourceTable, c.TargetTable, err)
 		}
-		// PG-side: apply the same ident normalization the translator + copier
-		// used (all-caps Oracle names folded to lowercase, mixed-case verbatim).
-		dstTable := pgNormalizeIdent(dial.Kind(), t)
 		var dstN int64
-		if err := d.TargetPool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %q.%q`, p.TargetSchema, dstTable)).Scan(&dstN); err != nil {
-			return fmt.Errorf("count pg %s: %w", dstTable, err)
+		if err := d.TargetPool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %q.%q`, p.TargetSchema, c.TargetTable)).Scan(&dstN); err != nil {
+			return fmt.Errorf("count pg %s: %w", c.TargetTable, err)
 		}
 		if srcN != dstN {
-			return fmt.Errorf("row count mismatch on %s: source=%d target=%d", t, srcN, dstN)
+			return fmt.Errorf("row count mismatch on %s: source=%d target=%d", c.TargetTable, srcN, dstN)
 		}
 		d.Bus.Publish(ctx, events.Event{
 			RunID: j.RunID, StepID: &j.StepID,
 			Kind: "log", Level: "info",
-			Message: fmt.Sprintf("%s count OK (%d rows)", t, srcN),
+			Message: fmt.Sprintf("%s count OK (%d rows)", c.TargetTable, srcN),
 		})
 	}
 	return nil
@@ -437,6 +688,30 @@ func (d *Deps) sourceDialect() dataxfer.SourceDialect {
 		return d.SourceDialect
 	}
 	return dataxfer.MySQLSource()
+}
+
+// copySourceVariantSystemTimeHistory is the copy_table source_variant
+// that reads the closed versions of a MariaDB system-versioned table
+// (planner.Build emits it for the emulated history table).
+const copySourceVariantSystemTimeHistory = "system_time_history"
+
+// copySourceDialect returns the source dialect a copy step reads through:
+// the connection's dialect by default, or the MariaDB system-time
+// history variant.
+func (d *Deps) copySourceDialect(variant, rowEndCol string) (dataxfer.SourceDialect, error) {
+	switch variant {
+	case "":
+		return d.sourceDialect(), nil
+	case copySourceVariantSystemTimeHistory:
+		if d.sourceDialect().Kind() != "mysql" {
+			return nil, fmt.Errorf("copy source variant %q needs a MySQL/MariaDB source, got %q", variant, d.sourceDialect().Kind())
+		}
+		if rowEndCol == "" {
+			return nil, fmt.Errorf("copy source variant %q needs row_end_col", variant)
+		}
+		return dataxfer.MySQLSystemTimeHistorySource(rowEndCol), nil
+	}
+	return nil, fmt.Errorf("unknown copy source variant %q", variant)
 }
 
 // pgNormalizeIdent mirrors translate.normalizeOracleIdent: all-caps Oracle

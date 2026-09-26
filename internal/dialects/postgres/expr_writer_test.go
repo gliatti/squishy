@@ -163,3 +163,125 @@ func TestWriteExpr_CursorAttr(t *testing.T) {
 		t.Errorf("CursorAttr fallback: got %q", got)
 	}
 }
+
+// TestWriteExpr_AggregateModifiers — DISTINCT and the in-call ORDER BY
+// render in PG order; AggSeparator is deliberately not rendered.
+func TestWriteExpr_AggregateModifiers(t *testing.T) {
+	cases := []struct {
+		name string
+		in   *ast.FuncCall
+		want string
+	}{
+		{
+			name: "string_agg distinct + order by desc",
+			in: &ast.FuncCall{
+				Name:       "string_agg",
+				Distinct:   true,
+				Args:       []ast.Expr{&ast.CastExpr{Expr: ast.BuildIdent("x"), Type: &ast.UserDefinedType{Name: "text"}}, ast.BuildStringLit(",")},
+				AggOrderBy: []ast.OrderItem{{Expr: ast.BuildIdent("y"), Desc: true}},
+			},
+			want: `string_agg(DISTINCT CAST("x" AS text), ',' ORDER BY "y" DESC)`,
+		},
+		{
+			name: "count distinct",
+			in:   &ast.FuncCall{Name: "COUNT", Distinct: true, Args: []ast.Expr{ast.BuildIdent("id")}},
+			want: `COUNT(DISTINCT "id")`,
+		},
+		{
+			name: "array_agg order by two keys",
+			in: &ast.FuncCall{
+				Name: "array_agg",
+				Args: []ast.Expr{ast.BuildIdent("v")},
+				AggOrderBy: []ast.OrderItem{
+					{Expr: ast.BuildIdent("a")},
+					{Expr: ast.BuildIdent("b"), Desc: true},
+				},
+			},
+			want: `array_agg("v" ORDER BY "a", "b" DESC)`,
+		},
+		{
+			name: "separator is not rendered",
+			in: &ast.FuncCall{
+				Name:         "GROUP_CONCAT",
+				Args:         []ast.Expr{ast.BuildIdent("v")},
+				AggSeparator: ast.BuildStringLit(";"),
+			},
+			want: `GROUP_CONCAT("v")`,
+		},
+		{
+			name: "niladic list unchanged",
+			in:   &ast.FuncCall{Name: "CURRENT_DATE"},
+			want: `CURRENT_DATE`,
+		},
+		{
+			name: "niladic CURRENT_TIME is bare",
+			in:   &ast.FuncCall{Name: "CURRENT_TIME"},
+			want: `CURRENT_TIME`,
+		},
+		{
+			name: "CURRENT_TIME with precision keeps its parens",
+			in:   &ast.FuncCall{Name: "CURRENT_TIME", Args: []ast.Expr{ast.BuildIntLit(3)}},
+			want: `CURRENT_TIME(3)`,
+		},
+		{
+			name: "now keeps its parens",
+			in:   &ast.FuncCall{Name: "now"},
+			want: `now()`,
+		},
+	}
+	for _, c := range cases {
+		if got := WriteExpr(c.in); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestWriteExpr_DefaultKeyword — an unquoted single-part DEFAULT is the
+// SQL keyword; backtick-quoted or qualified forms stay identifiers.
+func TestWriteExpr_DefaultKeyword(t *testing.T) {
+	cases := []struct {
+		in   ast.Expr
+		want string
+	}{
+		{&ast.Ident{Parts: []string{"DEFAULT"}}, `DEFAULT`},
+		{&ast.Ident{Parts: []string{"default"}}, `DEFAULT`},
+		{&ast.Ident{Parts: []string{"DEFAULT"}, Backtick: true}, `"DEFAULT"`},
+		{&ast.Ident{Parts: []string{"t", "default"}}, `"t"."default"`},
+	}
+	for _, c := range cases {
+		if got := WriteExpr(c.in); got != c.want {
+			t.Errorf("WriteExpr(%#v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	ins := &ast.InsertStmt{
+		Table:  ast.TableRef{Name: "t"},
+		Cols:   []string{"id", "v"},
+		Values: [][]ast.Expr{{ast.BuildIntLit(1), ast.BuildIdent("DEFAULT")}},
+	}
+	want := `INSERT INTO "t" ("id", "v") VALUES (1, DEFAULT)`
+	if got := WriteStmt(ins); got != want {
+		t.Errorf("INSERT … DEFAULT:\n  got  %q\n  want %q", got, want)
+	}
+}
+
+// TestWriteExpr_IntervalExpr — the MySQL `INTERVAL <expr> <unit>` shape
+// renders faithfully (and PG-invalid) when no visitor rewrote it; the
+// literal form is unchanged.
+func TestWriteExpr_IntervalExpr(t *testing.T) {
+	cases := []struct {
+		in   *ast.IntervalLit
+		want string
+	}{
+		{&ast.IntervalLit{Value: "1", Unit: "DAY"}, `INTERVAL '1' DAY`},
+		{&ast.IntervalLit{Value: "'2'", Unit: "MONTH"}, `INTERVAL '2' MONTH`},
+		{
+			&ast.IntervalLit{Unit: "DAY", Expr: ast.BuildBinary("+", ast.BuildIdent("n"), ast.BuildIntLit(1))},
+			`INTERVAL ("n" + 1) DAY`,
+		},
+	}
+	for _, c := range cases {
+		if got := WriteExpr(c.in); got != c.want {
+			t.Errorf("WriteExpr(%#v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

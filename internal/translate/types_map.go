@@ -65,6 +65,11 @@ func RegisterTypeMapper(k dialects.Kind, fn TypeMapper) {
 // An empty kind or one without a registered mapper falls back to MySQL,
 // which historically was squishy's only supported source dialect.
 func MapType(kind dialects.Kind, t ast.DataType, colName string, caps Caps) typeResult {
+	if pt, ok := t.(*ast.PGType); ok && pt.Name != "" {
+		// Built by a translation pass: already a PG type, whatever
+		// the source dialect.
+		return typeResult{PG: pt.Name}
+	}
 	fn, ok := typeMappers[kind]
 	if !ok {
 		fn = typeMappers[dialects.KindMySQL]

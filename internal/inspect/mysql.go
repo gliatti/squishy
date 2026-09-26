@@ -22,8 +22,14 @@ const inspectMySQLConcurrency = 16
 // SourceSchema is the JSON payload stored in migrations.source_schema and
 // returned to the wizard.
 type SourceSchema struct {
-	Database   string           `json:"database"`
-	Version    string           `json:"version"`
+	Database string `json:"database"`
+	Version  string `json:"version"`
+	// RowEndMax (MariaDB only) is the ROW END value the server stores on
+	// current rows of a system-versioned table — its TIMESTAMP maximum,
+	// as UTC wall-clock text: "2106-02-07 06:28:15.999999" on 64-bit
+	// MariaDB 11.5+, "2038-01-19 03:14:07.999999" before. Empty when
+	// not probed. See mariadbProbeRowEndMax.
+	RowEndMax  string           `json:"row_end_max,omitempty"`
 	Tables     []ObjectSnapshot `json:"tables"`
 	Views      []ObjectSnapshot `json:"views"`
 	Triggers   []ObjectSnapshot `json:"triggers"`
@@ -59,6 +65,16 @@ func InspectMySQL(ctx context.Context, db *sql.DB, database string, log zerolog.
 	s := &SourceSchema{Database: database}
 	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&s.Version); err != nil {
 		return nil, timings, fmt.Errorf("version: %w", err)
+	}
+	if isMariaDBVersion(s.Version) {
+		// A failed probe only leaves RowEndMax empty: the translator then
+		// does not emulate system versioning and says why (warning +
+		// blocking prerequisite).
+		if max, err := mariadbProbeRowEndMax(ctx, db); err != nil {
+			log.Warn().Err(err).Msg("mariadb ROW END maximum probe failed")
+		} else {
+			s.RowEndMax = max
+		}
 	}
 
 	logSection := func(name string) {
@@ -180,7 +196,94 @@ func InspectMySQL(ctx context.Context, db *sql.DB, database string, log zerolog.
 	}
 	logSection("events")
 
+	// --- MariaDB sequences (TABLE_TYPE='SEQUENCE'; none on MySQL) ---
+	// Stashed in Events like the Oracle / DB2 extras: the planner only
+	// copies Tables, and a sequence has no rows to copy — its CREATE
+	// SEQUENCE plus current position is all that migrates.
+	if err := timings.Section("sequences", func(setCount func(int)) error {
+		out, err := mariadbListSequences(ctx, db, database)
+		if err != nil {
+			return err
+		}
+		s.Events = append(s.Events, out...)
+		setCount(len(out))
+		return nil
+	}); err != nil {
+		return nil, timings, err
+	}
+	logSection("sequences")
+
 	return s, timings, nil
+}
+
+// mariadbListSequences returns one snapshot per MariaDB sequence of the
+// database: the SHOW CREATE SEQUENCE text, followed — when the sequence
+// has already handed out values — by `ALTER SEQUENCE … RESTART WITH n`
+// where n is the sequence's next_not_cached_value, i.e. the first value
+// no session can have obtained yet (with CACHE > 0 the values still in a
+// session cache are skipped, exactly as a MariaDB restart would). SHOW
+// CREATE SEQUENCE only reports the original START, so without the
+// RESTART the PG sequence would hand out already-used values again.
+func mariadbListSequences(ctx context.Context, db *sql.DB, database string) ([]ObjectSnapshot, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT TABLE_NAME FROM information_schema.TABLES
+		 WHERE TABLE_SCHEMA=? AND TABLE_TYPE='SEQUENCE'
+		 ORDER BY TABLE_NAME`, database)
+	if err != nil {
+		return nil, fmt.Errorf("list sequences: %w", err)
+	}
+	var items []ObjectSnapshot
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		items = append(items, ObjectSnapshot{Name: n, Database: database})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range items {
+		name := items[i].Name
+		ddl, err := showCreate(ctx, db, "SEQUENCE", database, name)
+		if err != nil {
+			return nil, fmt.Errorf("SHOW CREATE SEQUENCE %s: %w", name, err)
+		}
+		var next, start int64
+		q := fmt.Sprintf("SELECT next_not_cached_value, start_value FROM %s.%s",
+			mysqlQuoteIdent(database), mysqlQuoteIdent(name))
+		if err := db.QueryRowContext(ctx, q).Scan(&next, &start); err != nil {
+			return nil, fmt.Errorf("read sequence %s state: %w", name, err)
+		}
+		items[i].DDL = mariadbSequenceDDL(ddl, name, next, start)
+	}
+	return items, nil
+}
+
+// mariadbSequenceDDL assembles a sequence snapshot: the SHOW CREATE
+// SEQUENCE text, plus `ALTER SEQUENCE name RESTART WITH next` when the
+// sequence is no longer at its start value.
+func mariadbSequenceDDL(showCreateDDL, name string, next, start int64) string {
+	if next == start {
+		return showCreateDDL
+	}
+	return showCreateDDL + fmt.Sprintf(";\nALTER SEQUENCE %s RESTART WITH %d", mysqlQuoteIdent(name), next)
+}
+
+// mysqlQuoteIdent backtick-quotes one MySQL identifier.
+func mysqlQuoteIdent(id string) string {
+	out := make([]rune, 0, len(id)+2)
+	out = append(out, '`')
+	for _, r := range id {
+		if r == '`' {
+			out = append(out, '`')
+		}
+		out = append(out, r)
+	}
+	out = append(out, '`')
+	return string(out)
 }
 
 func listAndShow(ctx context.Context, db *sql.DB, database, objType, listQuery string) ([]ObjectSnapshot, error) {

@@ -182,6 +182,8 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		TargetSchema:     mig.TargetSchemaName,
 		SourceKind:       dialects.Kind(inst.Kind),
 		TargetExtensions: targetExts,
+		MariaDBRowEndMax: schema.RowEndMax,
+		ParseError:       parseErr,
 	})
 	if parseErr != nil {
 		result.Warnings = append(result.Warnings, translate.Warning{

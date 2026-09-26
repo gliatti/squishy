@@ -73,8 +73,8 @@ onMounted(loadFromMigration)
 
       <h3>Explanations ({{ explanations.length }})</h3>
       <ul v-if="explanations.length">
-        <li v-for="(e, i) in explanations" :key="i" :class="e.level === 'warn' ? 'warn' : ''">
-          <strong>{{ e.object }}</strong>: <code>{{ e.source }}</code> → <code>{{ e.target }}</code> — {{ e.reason }}
+        <li v-for="(e, i) in explanations" :key="i" :class="e.level === 'error' ? 'err' : (e.level === 'warn' ? 'warn' : '')">
+          <strong v-if="e.level === 'error'">[error] </strong><strong>{{ e.object }}</strong>: <code>{{ e.source }}</code> → <code>{{ e.target }}</code> — {{ e.reason }}
         </li>
       </ul>
       <p v-else style="opacity:.7">None.</p>
