@@ -218,6 +218,16 @@ func (l *Lexer) readString(start Position, quote rune) Token {
 					b.WriteRune('\'')
 				case '"':
 					b.WriteRune('"')
+				case 'b':
+					b.WriteRune('\b')
+				case 'Z':
+					b.WriteRune(0x1A) // ASCII 26 (Control+Z)
+				case '%', '_':
+					// MySQL keeps the backslash: '\_' is the two
+					// characters \_ (a literal _ in a LIKE pattern,
+					// where \ is also PG's default escape).
+					b.WriteRune('\\')
+					b.WriteRune(nxt)
 				default:
 					b.WriteRune(nxt)
 				}
@@ -365,9 +375,9 @@ func (l *Lexer) readPunct(start Position) Token {
 	}
 	// fallthrough : single unknown rune. Store the rune itself in Raw so
 	// callers reading Raw to recover the source slice get a 1-rune span,
-	// not the 15-rune diagnostic message. Without Raw set,
-	// tokenSourceLen falls back to len(Lit) and the rewriter would
-	// emit `src[off : off+15]` for each unrecognised char — overlapping
+	// not the 15-rune diagnostic message. Without Raw set, callers
+	// that recover the source slice from Raw fall back to len(Lit) and
+	// would emit `src[off : off+15]` for each unrecognised char — overlapping
 	// the following 14 chars and producing visible duplication
 	// (e.g. Oracle inquiry directive `$$PLSQL_UNIT` re-emerged as
 	// `$$PLSQL_UNIT$PLSQL_UNITPLSQL_UNIT` and broke PG dollar-quoting).

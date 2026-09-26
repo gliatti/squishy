@@ -73,7 +73,17 @@ End-to-end gate (unit tests + Compose stack + migration scenarios):
 ```bash
 make e2e             # MySQL flow by default
 SQUISHY_E2E_DB2=1 make e2e   # also runs the DB2 scenario
+make e2e-down        # tear the e2e stack down
 ```
+
+The e2e run uses its own Compose project (`squishy-e2e`, overlay
+`docker-compose.e2e.yml`) with no host port published, so it neither wipes
+the `make up` stack nor collides with ports held by other local stacks. The
+`make up` host ports can be moved with `SQUISHY_PG_HOST_PORT`,
+`SQUISHY_MYSQL_HOST_PORT`, `SQUISHY_API_HOST_PORT`, `SQUISHY_WEB_HOST_PORT`
+(and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,MCP}_HOST_PORT`). They are bound
+to `127.0.0.1` by default; set `SQUISHY_BIND_ADDR=0.0.0.0` to expose them on
+the network (then also set `SQUISHY_API_TOKEN`).
 
 ## Architecture
 
@@ -121,7 +131,7 @@ mcp-server/           MCP-over-HTTP server wrapping the same API (port 8002)
 internal/
 ├── config/           env parsing
 ├── storage/          pgx pool + embedded migrations runner
-│   └── migrations/   golang-migrate .up/.down SQL files
+│   └── migrations/   NNNNNN_name.up/.down SQL files (one ledger: squishy_meta._migrations)
 ├── project/          domain: projects / instances / migrations
 ├── connection/       source/target pool factories + DB2 cgo build tag
 ├── discover/         source introspection (MySQL / MariaDB / Oracle / DB2)
@@ -165,6 +175,7 @@ All routes are JSON, prefix `/api/v1`. See `internal/httpapi/router.go`.
 | POST   | `/migrations/{migrationID}/plan`                    | build DDL + explanations |
 | GET    | `/migrations/{migrationID}/prerequisites`           | list prereq checks |
 | POST   | `/migrations/{migrationID}/prerequisites/ack`       | acknowledge prereqs |
+| GET / PUT | `/migrations/{migrationID}/generated-overrides` | list / replace MySQL-MariaDB generated-column expression overrides (PUT validates each against the plan and in a rolled-back PostgreSQL probe; re-plan to apply) |
 | GET / POST | `/migrations/{migrationID}/runs`                | list / start a run |
 | GET    | `/runs/{runID}`                                     | progress snapshot |
 | GET    | `/runs/{runID}/steps`                               | steps detail |
@@ -216,7 +227,22 @@ make mcp-build       # build distroless prod image squishy-mcp:prod
 All via env vars (prefix `SQUISHY_`, see `.env.example` and
 `internal/config`): `SQUISHY_PG_DSN`, `SQUISHY_HTTP_ADDR`,
 `SQUISHY_WORKERS`, `SQUISHY_WORKER_ID`, `SQUISHY_BATCH_SIZE`,
-`SQUISHY_LOG_LEVEL`.
+`SQUISHY_LOG_LEVEL`, `SQUISHY_API_TOKEN`, `SQUISHY_ALLOWED_ORIGINS`.
+
+### API access
+
+- `SQUISHY_API_TOKEN`: when set, every `/api/v1` request must carry
+  `Authorization: Bearer <token>`. Compose passes it to the api, the MCP
+  server, the e2e runner and the web dev proxy (which adds the header, so
+  the browser never holds the token). Unset, the API is open and logs a
+  warning at boot: keep its port on localhost.
+- `SQUISHY_ALLOWED_ORIGINS` (comma-separated, default
+  `http://localhost:5173,http://127.0.0.1:5173`): the only browser origins
+  that get CORS headers. A state-changing request (POST/PUT/DELETE) sent by
+  a browser from any other origin is refused with 403, so a web page open
+  in the operator's browser cannot drive the API (CSRF). Requests without
+  an `Origin` header (curl, MCP, tests) are not affected. Add the web UI's
+  origin here when it is served from another host or port.
 
 ## Common make targets
 
@@ -228,7 +254,9 @@ make logs            tail API logs
 make psql            psql shell on the squishy app DB
 make mysql           mysql client on the sample source
 make reset-dest      DROP SCHEMA mig CASCADE (target only, app schema kept)
-make migrate-up      apply embedded SQL migrations
+make migrate-up      apply embedded SQL migrations (cmd/squishy-migrate, same ledger as the api)
+make migrate-down    roll back the latest migration
+make migrate-status  list migrations and whether they are applied
 make migrate-new name=add_foo   scaffold a new up/down migration pair
 make oracle-up | oracle19-up | db2-up | mariadb-sample (via compose profiles)
 make test            unit tests + check-no-regex

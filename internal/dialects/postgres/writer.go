@@ -128,7 +128,11 @@ func writeCreateTable(b *strings.Builder, t *CreateTable) {
 		if i == len(t.Checks)-1 {
 			sep = ""
 		}
-		fmt.Fprintf(b, "  CHECK (%s)%s\n", ck, sep)
+		b.WriteString("  ")
+		if i < len(t.CheckNames) && t.CheckNames[i] != "" {
+			fmt.Fprintf(b, "CONSTRAINT %s ", qIdent(t.CheckNames[i]))
+		}
+		fmt.Fprintf(b, "CHECK (%s)%s\n", ck, sep)
 	}
 	b.WriteString(")")
 	if t.PartitionBy != nil {
@@ -251,11 +255,13 @@ func writeCreateFunction(b *strings.Builder, f *CreateFunction) {
 	if f.Volatile != "" {
 		vol = " " + f.Volatile
 	}
+	body := strings.TrimRight(f.Body, "\n")
+	q := DollarQuote("body", body)
 	fmt.Fprintf(b,
-		"CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s\nLANGUAGE %s%s%s AS $body$\n%s\n$body$;\n",
+		"CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s\nLANGUAGE %s%s%s AS %s\n%s\n%s;\n",
 		qIdent(f.Schema), qIdent(f.Name),
 		f.Params, f.Returns,
-		lang, vol, sec, strings.TrimRight(f.Body, "\n"))
+		lang, vol, sec, q, body, q)
 }
 
 func writeCreateProcedure(b *strings.Builder, p *CreateProcedure) {
@@ -267,10 +273,12 @@ func writeCreateProcedure(b *strings.Builder, p *CreateProcedure) {
 	if strings.EqualFold(p.Security, "DEFINER") {
 		sec = " SECURITY DEFINER"
 	}
+	body := strings.TrimRight(p.Body, "\n")
+	q := DollarQuote("body", body)
 	fmt.Fprintf(b,
-		"CREATE OR REPLACE PROCEDURE %s.%s(%s)\nLANGUAGE %s%s AS $body$\n%s\n$body$;\n",
+		"CREATE OR REPLACE PROCEDURE %s.%s(%s)\nLANGUAGE %s%s AS %s\n%s\n%s;\n",
 		qIdent(p.Schema), qIdent(p.Name),
-		p.Params, lang, sec, strings.TrimRight(p.Body, "\n"))
+		p.Params, lang, sec, q, body, q)
 }
 
 func writeCreateView(b *strings.Builder, v *CreateView) {
@@ -309,9 +317,29 @@ func writeCreateTrigger(b *strings.Builder, t *CreateTrigger) {
 	// writer.
 	fmt.Fprintf(b, "DROP TRIGGER IF EXISTS %s ON %s.%s;\n",
 		qIdent(t.Name), qIdent(t.Schema), qIdent(t.Table))
+	event := strings.ToUpper(t.Event)
+	if len(t.Events) > 0 {
+		var eb strings.Builder
+		for i, ev := range t.Events {
+			if i > 0 {
+				eb.WriteString(" OR ")
+			}
+			eb.WriteString(strings.ToUpper(ev))
+			if strings.EqualFold(ev, "UPDATE") && len(t.UpdateOf) > 0 {
+				eb.WriteString(" OF ")
+				for j, c := range t.UpdateOf {
+					if j > 0 {
+						eb.WriteString(", ")
+					}
+					eb.WriteString(qIdent(c))
+				}
+			}
+		}
+		event = eb.String()
+	}
 	fmt.Fprintf(b,
 		"CREATE TRIGGER %s %s %s ON %s.%s\n  FOR EACH %s",
-		qIdent(t.Name), strings.ToUpper(t.Timing), strings.ToUpper(t.Event),
+		qIdent(t.Name), strings.ToUpper(t.Timing), event,
 		qIdent(t.Schema), qIdent(t.Table),
 		forEach)
 	if t.WhenCond != "" {
@@ -326,6 +354,38 @@ func writeCreateTrigger(b *strings.Builder, t *CreateTrigger) {
 
 func qIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// DollarQuote returns a dollar-quote delimiter ($<tag>$, $<tag>_1$, ...;
+// $$, $_1$, ... for an empty tag) that does not occur in body, so a body
+// (possibly kept verbatim from the source) can never close the quote early
+// and append statements. It only picks a delimiter: it collects every
+// $tag$ marker by a byte scan (tag bytes as in an unquoted identifier,
+// minus '$') and never rewrites the body.
+func DollarQuote(tag, body string) string {
+	used := map[string]bool{}
+	for i := 0; i < len(body); i++ {
+		if body[i] != '$' {
+			continue
+		}
+		j := i + 1
+		for j < len(body) && isDollarTagByte(body[j]) {
+			j++
+		}
+		if j < len(body) && body[j] == '$' {
+			used[body[i+1:j]] = true
+		}
+	}
+	t := tag
+	for n := 1; used[t]; n++ {
+		t = fmt.Sprintf("%s_%d", tag, n)
+	}
+	return "$" + t + "$"
+}
+
+func isDollarTagByte(c byte) bool {
+	return c == '_' || c >= 0x80 ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 // sqlLit renders a safely-escaped SQL string literal.

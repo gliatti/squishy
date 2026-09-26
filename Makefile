@@ -68,12 +68,17 @@ db2-down: ## Stop the DB2 sample container + wipe its volume
 
 # ---- schema migrations ----
 
+# migrate-up / migrate-down / migrate-status run cmd/squishy-migrate, which
+# shares its runner and ledger (squishy_meta._migrations) with the api's
+# boot-time migrator. $(MIGRATE_IMG) only scaffolds files (6-digit -seq names).
 migrate-up: ## Apply all up migrations
 	$(COMPOSE) --profile e2e run --rm migrate
 
 migrate-down: ## Roll back one migration step
-	docker run --rm --network host -v $(PWD)/internal/storage/migrations:/m $(MIGRATE_IMG) \
-	  -path=/m -database=postgres://squishy:squishy@localhost:5432/squishy?sslmode=disable down 1
+	$(COMPOSE) --profile e2e run --rm migrate go run ./cmd/squishy-migrate down 1
+
+migrate-status: ## List app-schema migrations and whether they are applied
+	$(COMPOSE) --profile e2e run --rm migrate go run ./cmd/squishy-migrate status
 
 migrate-new: ## Create a new pair of migration files: make migrate-new name=add_foo
 	@test -n "$(name)" || (echo "usage: make migrate-new name=add_foo" && exit 1)
@@ -106,8 +111,11 @@ check-no-regex: ## Fail when regexp.MustCompile reappears in the SQL translation
 	  exit 1; \
 	fi
 
-e2e: ## Run full end-to-end scenario (dockerized)
+e2e: ## Run full end-to-end scenario (dockerized, isolated compose project squishy-e2e)
 	./scripts/run_e2e.sh
+
+e2e-down: ## Tear down the e2e stack (compose project squishy-e2e) and its volumes
+	$(COMPOSE) -f docker-compose.yml -f docker-compose.e2e.yml --profile test --profile e2e down -v --remove-orphans
 
 # ---- mcp ----
 

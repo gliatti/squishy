@@ -25,6 +25,36 @@ type Parser struct {
 
 	// raw_block tracking
 	src []rune
+
+	// pendingInto collects the variable list of a procedural
+	// `SELECT … INTO v1, v2 …` clause (grammar rule selectIntoExpression,
+	// selectIntoVariables alternative) seen while parsing the current query
+	// specification. The PL statement dispatcher reads and clears it once
+	// the SELECT is parsed. pendingIntoSpan records the rune offsets of the
+	// clause ([INTO keyword start, first token after the variable list]) so
+	// callers can rebuild the INTO-less query text.
+	pendingInto     []string
+	pendingIntoSpan [2]int
+}
+
+// subParser returns a parser over the source slice [start.Offset, endOff)
+// of p's input. Tokens keep the positions they have in the enclosing
+// source, and the slice end reads as EOF, so a typed parse of an already
+// delimited fragment (view body, cursor query, event schedule expression)
+// can never run past the fragment boundary the enclosing parser chose.
+// The fragment is lexed with the default ";" delimiter: its end is the
+// boundary, not a client delimiter.
+func (p *Parser) subParser(start Position, endOff int) *Parser {
+	if endOff < start.Offset {
+		endOff = start.Offset
+	}
+	if endOff > len(p.src) {
+		endOff = len(p.src)
+	}
+	l := &Lexer{src: p.src[:endOff], off: start.Offset, line: start.Line, col: start.Col, delim: ";"}
+	sp := &Parser{l: l, src: p.src}
+	sp.advance()
+	return sp
 }
 
 // Parse parses a MySQL script into a list of statements. It collects as many
@@ -103,6 +133,9 @@ func (p *Parser) parseStatement() ast.Stmt {
 	return nil
 }
 
+// parseTruncate parses `TRUNCATE [TABLE] tbl` (grammar rule
+// truncateTable). The node also implements ast.PLStmt, so the routine-body
+// dispatcher reuses this entry point.
 func (p *Parser) parseTruncate() ast.Stmt {
 	start := p.cur.Pos
 	p.expectKw("TRUNCATE")
@@ -339,6 +372,10 @@ func (p *Parser) parseDropList(start Position, kind string) *ast.DropObject {
 func (p *Parser) parseAlter() ast.Stmt {
 	start := p.cur.Pos
 	p.expectKw("ALTER")
+	if p.isKw("SEQUENCE") {
+		// MariaDB 10.3+ ALTER SEQUENCE.
+		return p.parseAlterSequence(start)
+	}
 	// Non-table ALTER variants — consume to statement end. ALTER USER /
 	// ALTER DATABASE / ALTER SERVER / ALTER LOGFILE GROUP / ALTER EVENT etc.
 	if !p.isKw("TABLE") {

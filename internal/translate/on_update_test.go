@@ -23,13 +23,13 @@ func TestOnUpdateCurrentTimestampEmitsTrigger(t *testing.T) {
 	res := Translate(stmts, Options{TargetSchema: "mig", SourceKind: "mysql"})
 
 	post := strings.Join(res.Plan.PostActions, "\n")
-	require.Contains(t, post, `CREATE OR REPLACE FUNCTION "mig".set_t_stamped()`,
+	require.Contains(t, post, `CREATE OR REPLACE FUNCTION "mig"."set_t_stamped"()`,
 		"trigger function must be emitted")
 	require.Contains(t, post, `NEW."stamped" := now();`,
 		"trigger body must update the timestamp column")
-	require.Contains(t, post, `CREATE TRIGGER trg_t_stamped BEFORE UPDATE ON "mig"."t"`,
+	require.Contains(t, post, `CREATE TRIGGER "trg_t_stamped" BEFORE UPDATE ON "mig"."t"`,
 		"BEFORE UPDATE row trigger must be wired")
-	require.Contains(t, post, `EXECUTE FUNCTION "mig".set_t_stamped()`,
+	require.Contains(t, post, `EXECUTE FUNCTION "mig"."set_t_stamped"()`,
 		"trigger must call its emit function")
 }
 
@@ -46,8 +46,8 @@ func TestOnUpdateCurrentTimestampMultipleColumns(t *testing.T) {
 	res := Translate(stmts, Options{TargetSchema: "mig", SourceKind: "mysql"})
 
 	post := strings.Join(res.Plan.PostActions, "\n")
-	require.Contains(t, post, `set_t_a()`)
-	require.Contains(t, post, `set_t_b()`)
+	require.Contains(t, post, `"set_t_a"()`)
+	require.Contains(t, post, `"set_t_b"()`)
 	require.Contains(t, post, `trg_t_a`)
 	require.Contains(t, post, `trg_t_b`)
 }

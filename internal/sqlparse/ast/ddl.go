@@ -123,16 +123,28 @@ type ColumnDef struct {
 	Collation    string
 	Generated    *Generated
 	Check        Expr // column-level CHECK
+	// CheckNotEnforced is true when the column-level CHECK carries
+	// MySQL's NOT ENFORCED (the source never validated it).
+	CheckNotEnforced bool
 	Invisible    bool
 	// Compressed is true when the source carries `COMPRESSED [=method]` on a
 	// TEXT/BLOB column (MariaDB transparent per-column compression). PostgreSQL
 	// applies TOAST compression automatically, so the flag is informational.
 	Compressed   bool
 	// MariaDB SYSTEM VERSIONING period columns
-	// (`GENERATED ALWAYS AS ROW START|END`). No PG equivalent — these are
-	// dropped by the translator.
+	// (`GENERATED ALWAYS AS ROW START|END`). Kept by the translator when
+	// the table's versioning is emulated, dropped otherwise.
 	SystemVersioning bool
-	P                Position
+	// MariaDB column attributes `WITH SYSTEM VERSIONING` /
+	// `WITHOUT SYSTEM VERSIONING`. A WITHOUT column is excluded from
+	// versioning: an UPDATE assigning only such columns changes the
+	// current row in place without writing a history row. When only
+	// column-level WITH clauses are present (no table-level clause), the
+	// MySQL parser flags every other column (but the ROW START / ROW END
+	// ones) WithoutSystemVersioning, as MariaDB's SHOW CREATE TABLE does.
+	WithSystemVersioning    bool
+	WithoutSystemVersioning bool
+	P                       Position
 }
 
 func (c *ColumnDef) Pos() Position { return c.P }
@@ -228,6 +240,12 @@ type IndexedCol struct {
 	// index `((expr))`.
 	Expr   string
 	IsExpr bool
+
+	// WithoutOverlaps marks a MariaDB 10.5+ application-time key part
+	// `<period> WITHOUT OVERLAPS` (UNIQUE / PRIMARY KEY over an
+	// application-time PERIOD FOR). Name then holds the period name, not
+	// a column name.
+	WithoutOverlaps bool
 }
 
 // Partitioning is the MySQL/MariaDB PARTITION BY clause attached to a
@@ -236,8 +254,21 @@ type IndexedCol struct {
 // and warn on the rest.
 type Partitioning struct {
 	// Method is one of: "HASH", "KEY", "RANGE", "LIST", "RANGE COLUMNS",
-	// "LIST COLUMNS". Always uppercase.
+	// "LIST COLUMNS", or "SYSTEM_TIME" (MariaDB 10.3+ history
+	// partitioning of a system-versioned table). Always uppercase.
 	Method string
+
+	// MariaDB `PARTITION BY SYSTEM_TIME [LIMIT n | INTERVAL n unit
+	// [STARTS ts]] [AUTO]` (Method "SYSTEM_TIME"): the rotation rule of
+	// the HISTORY partitions. SystemTimeLimit is the LIMIT row count (0
+	// when absent), SystemTimeInterval the INTERVAL (nil when absent),
+	// SystemTimeStarts the STARTS timestamp expression (nil when absent)
+	// and SystemTimeAuto the AUTO keyword (history partitions created on
+	// demand).
+	SystemTimeLimit    int64
+	SystemTimeInterval *IntervalLit
+	SystemTimeStarts   Expr
+	SystemTimeAuto     bool
 
 	// Linear is true for `PARTITION BY LINEAR HASH/KEY (...)`. Has no PG
 	// equivalent — informational only.
@@ -280,6 +311,11 @@ type Subpartitioning struct {
 // PartitionDefinition captures one PARTITION clause inside the definition list.
 type PartitionDefinition struct {
 	Name string
+
+	// History / Current mark MariaDB's `PARTITION p HISTORY` /
+	// `PARTITION p CURRENT` of a PARTITION BY SYSTEM_TIME table.
+	History bool
+	Current bool
 
 	// HasLessThan is true for `VALUES LESS THAN (...)`. LessThan stores the
 	// raw atom texts (one per partition column when COLUMNS form is used).
@@ -330,6 +366,7 @@ type TruncateTable struct {
 
 func (s *TruncateTable) Pos() Position { return s.P }
 func (s *TruncateTable) stmtNode()     {}
+func (s *TruncateTable) plStmtNode()   {} // can appear inside a routine body
 
 // RenameTable — `RENAME TABLE a TO b, c TO d, …`. PG supports renaming
 // only one table per statement, so the translator emits N PG `ALTER TABLE
@@ -508,7 +545,17 @@ type CreateView struct {
 	// columns named after the SELECT expression (e.g. `row` for a
 	// `ROW(...)::type` cast).
 	OfType string
-	P      Position
+	// Select is the typed view body, set when the dialect parser could
+	// parse SelectBody as a query; nil otherwise. SelectBody keeps the
+	// raw source text for explanations and for the dialects that still
+	// translate views textually.
+	Select *SelectStmt
+	// SelectParseError is the parser diagnostic recorded when Select is
+	// nil because SelectBody failed to parse ("" when parsing succeeded
+	// or was not attempted). Translators surface it as an explicit
+	// warning instead of passing the raw text through silently.
+	SelectParseError string
+	P                Position
 }
 
 func (s *CreateView) Pos() Position { return s.P }
@@ -518,7 +565,14 @@ type CreateTrigger struct {
 	Definer  string
 	Name     string
 	Time     string // BEFORE|AFTER|INSTEAD OF|COMPOUND
-	Event    string // INSERT|UPDATE|DELETE
+	Event    string // INSERT|UPDATE|DELETE (multi-event: keywords joined by " OR ", display only)
+	// Events is the typed DML event list, one upper-case keyword
+	// (INSERT | UPDATE | DELETE) per event, in source order. Filled by
+	// the MySQL / MariaDB parser (a MySQL trigger has exactly one);
+	// empty for the other dialects, whose consumers fall back to Event.
+	// Consumers that need to reason about the events (e.g. the trigger
+	// function's RETURN) read this list, never a joined Event string.
+	Events   []string
 	Table    TableRef
 	Order    string // FOLLOWS|PRECEDES|""
 	OrderRef string // name of the trigger referenced by FOLLOWS/PRECEDES
@@ -610,7 +664,8 @@ type CreateEvent struct {
 	Name         string
 	IfNotExists  bool
 	ScheduleKind string // AT|EVERY
-	At           string // raw expr
+	At           string // raw expr (kept for explanations)
+	AtExpr       Expr   // typed `ON SCHEDULE AT` expression; nil when not parsed
 	EveryN       int64
 	EveryUnit    string // SECOND|MINUTE|HOUR|DAY|...
 	Starts       string
@@ -699,8 +754,13 @@ type AlterSequence struct {
 	HasCycle     bool
 	Restart      bool  // bare RESTART (PG: ALTER SEQUENCE … RESTART)
 	HasRestart   bool
-	StartWith    int64 // RESTART WITH N — Oracle 12.2+
+	StartWith    int64 // RESTART WITH N — Oracle 12.2+ / MariaDB
 	HasStartWith bool
+	// Start is MariaDB's `ALTER SEQUENCE … START [WITH] N`: it only
+	// changes the value a later bare RESTART returns to (PG: same
+	// spelling, ALTER SEQUENCE … START WITH N).
+	Start    int64
+	HasStart bool
 	// IgnoredOptions records Oracle-only specs that have no PG equivalent
 	// (ORDER, NOORDER, KEEP, NOKEEP, SCALE, NOSCALE, SHARING, SESSION,
 	// GLOBAL, SHARD, NOSHARD). Captured verbatim for the explanation log.

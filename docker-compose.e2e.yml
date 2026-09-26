@@ -1,0 +1,30 @@
+# squishy — e2e overlay used by scripts/run_e2e.sh (`make e2e`).
+#
+#   docker compose -f docker-compose.yml [-f docker-compose.override.yml] \
+#                  -f docker-compose.e2e.yml ...
+#
+# - Own compose project ("squishy-e2e"): the e2e clean slate
+#   (`down -v`) never touches the dev stack started by `make up`, and both
+#   can run side by side.
+# - No host port publishing: every e2e participant (migrate, api, e2e test
+#   runner, sources) talks over the compose network, so the run cannot
+#   collide with ports already bound on the host by other stacks.
+name: squishy-e2e
+
+services:
+  postgres:
+    ports: !reset []
+  mysql-sample:
+    ports: !reset []
+  mariadb-sample:
+    ports: !reset []
+  oracle-sample:
+    ports: !reset []
+  db2-sample:
+    ports: !reset []
+  api:
+    ports: !reset []
+  squishy-mcp:
+    ports: !reset []
+  web:
+    ports: !reset []

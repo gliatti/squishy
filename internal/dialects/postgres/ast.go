@@ -77,6 +77,10 @@ type CreateTable struct {
 	Columns     []ColumnDef
 	PrimaryKey  []string // PK column names (inline constraint)
 	Checks      []string // raw CHECK expressions (table-level)
+	// CheckNames, when set, runs parallel to Checks: a non-empty entry
+	// renders `CONSTRAINT "name" CHECK (…)`, an empty or missing one a
+	// bare `CHECK (…)` whose name PG generates.
+	CheckNames []string
 	// PartitionBy, when non-nil, turns the emission into a partitioned-table
 	// parent (PG declarative partitioning). Children are emitted via a
 	// separate `CreatePartition` statement.
@@ -243,6 +247,13 @@ type CreateTrigger struct {
 	Table   string
 	FnName  string // referenced function (in same schema)
 	ForEach string // "ROW" | "STATEMENT" — default "ROW"
+
+	// Events, when non-empty, replaces Event: one "INSERT" | "UPDATE" |
+	// "DELETE" | "TRUNCATE" keyword per event, rendered joined by OR.
+	// UpdateOf restricts the UPDATE event to `UPDATE OF col, …` (the
+	// trigger fires only when one of the columns is an UPDATE target).
+	Events   []string
+	UpdateOf []string
 	// WhenCond is the optional `WHEN (cond)` clause text — PG accepts the
 	// same expression syntax inline on CREATE TRIGGER. Empty means no
 	// WHEN clause.

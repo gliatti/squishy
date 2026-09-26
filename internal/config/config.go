@@ -15,6 +15,12 @@ type Config struct {
 	LogLevel     string
 	BatchSize    int
 	MigrationDir string
+	// APIToken, when set, is the bearer token every /api/v1 request must
+	// carry (Authorization: Bearer <token>). Empty leaves the API open.
+	APIToken string
+	// AllowedOrigins are the browser origins allowed to call the API
+	// cross-origin (CORS) and to send state-changing requests.
+	AllowedOrigins []string
 }
 
 func Load() (Config, error) {
@@ -24,6 +30,12 @@ func Load() (Config, error) {
 		WorkerID:     getenv("SQUISHY_WORKER_ID", hostnameOr("api")),
 		LogLevel:     strings.ToLower(getenv("SQUISHY_LOG_LEVEL", "info")),
 		MigrationDir: getenv("SQUISHY_MIGRATIONS_DIR", "internal/storage/migrations"),
+		APIToken:     os.Getenv("SQUISHY_API_TOKEN"),
+	}
+	for _, o := range strings.Split(getenv("SQUISHY_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"), ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			c.AllowedOrigins = append(c.AllowedOrigins, o)
+		}
 	}
 	w, err := strconv.Atoi(getenv("SQUISHY_WORKERS", "4"))
 	if err != nil || w < 0 {

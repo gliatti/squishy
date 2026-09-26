@@ -131,7 +131,7 @@ func registerTools(s *server.MCPServer) {
 	), inspectMigrationHandler)
 
 	s.AddTool(mcp.NewTool("plan_migration",
-		mcp.WithDescription("Run the dialect parser on the inspected source schema, translate it to PostgreSQL using the migration's target_db_name/target_schema_name, and upsert the migration row with the freshly-computed plan. Default response is a COMPACT summary: counts, head of warnings, prerequisites, head of ddl_script, aggregated explanation/type-mapping summaries. Section + filters let you drill in without dumping the full plan (which can exceed 16 MB on large schemas)."),
+		mcp.WithDescription("Run the dialect parser on the inspected source schema, translate it to PostgreSQL using the migration's target_db_name/target_schema_name, and upsert the migration row with the freshly-computed plan. Default response is a COMPACT summary: counts, head of warnings, prerequisites, head of ddl_script, aggregated explanation/type-mapping summaries. Section + filters let you drill in without dumping the full plan (which can exceed 16 MB on large schemas). The summary lists generated_columns_copied_plain: MySQL/MariaDB generated columns created as plain columns copied from the source, whose generation can be restored with set_generated_override."),
 		mcp.WithString("migration_id", mcp.Required(), mcp.Description("Migration UUID")),
 		mcp.WithString("section", mcp.Description("Which slice to return: 'summary' (default), 'ddl', 'ddl_post', 'warnings', 'explanations', 'type_mappings'"), mcp.Enum("summary", "ddl", "ddl_post", "warnings", "explanations", "type_mappings")),
 		mcp.WithNumber("offset", mcp.Description("Pagination offset. For section=ddl|ddl_post it counts characters; for warnings|explanations|type_mappings it counts elements.")),
@@ -144,7 +144,7 @@ func registerTools(s *server.MCPServer) {
 	), planMigrationHandler)
 
 	s.AddTool(mcp.NewTool("get_prerequisites",
-		mcp.WithDescription("Get the list of prerequisites for a migration and their current acknowledgement state."),
+		mcp.WithDescription("Get the list of prerequisites for a migration and their current acknowledgement state. A blocking prerequisite on a refused generated column is resolved with set_generated_override (then plan_migration), or acknowledged to keep a plain copied column."),
 		mcp.WithString("migration_id", mcp.Required(), mcp.Description("Migration UUID")),
 	), getPrerequisitesHandler)
 
@@ -154,6 +154,26 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithArray("acked", mcp.Required(), mcp.Description("List of prerequisite IDs to mark as acknowledged"),
 			mcp.Items(map[string]any{"type": "string"})),
 	), ackPrerequisitesHandler)
+
+	s.AddTool(mcp.NewTool("list_generated_overrides",
+		mcp.WithDescription("List the generation-expression overrides stored on a MySQL/MariaDB migration, and the '<table>.<column>' generated columns of the current plan an override may target. Generated columns squishy refuses to translate are created as plain columns whose values are copied from the source (plan_migration lists them as generated_columns_copied_plain); an override makes PostgreSQL generate them again."),
+		mcp.WithString("migration_id", mcp.Required(), mcp.Description("Migration UUID")),
+	), listGeneratedOverridesHandler)
+
+	s.AddTool(mcp.NewTool("set_generated_override",
+		mcp.WithDescription("Create or replace the generation-expression override of one generated column of a MySQL/MariaDB migration (the other stored overrides are kept). The expression is PostgreSQL, placed verbatim in GENERATED ALWAYS AS (…) STORED; it must be immutable and print exactly what MySQL stores, e.g. CASE WHEN \"paid\" THEN '1' ELSE '0' END. The API validates it with a rolled-back CREATE TABLE on the target PostgreSQL and returns PostgreSQL's error when it is refused. The migration must be planned; run plan_migration afterwards for the override to take effect."),
+		mcp.WithString("migration_id", mcp.Required(), mcp.Description("Migration UUID")),
+		mcp.WithString("table", mcp.Required(), mcp.Description("Source table name (exact spelling, case-sensitive)")),
+		mcp.WithString("column", mcp.Required(), mcp.Description("Generated column name (case-insensitive)")),
+		mcp.WithString("expression", mcp.Required(), mcp.Description("PostgreSQL generation expression (one expression, no ';', no comment, no dollar quote)")),
+	), setGeneratedOverrideHandler)
+
+	s.AddTool(mcp.NewTool("delete_generated_override",
+		mcp.WithDescription("Delete the generation-expression override of one generated column of a migration (the other stored overrides are kept). Run plan_migration afterwards: a column squishy refuses to translate goes back to a plain column copied from the source."),
+		mcp.WithString("migration_id", mcp.Required(), mcp.Description("Migration UUID")),
+		mcp.WithString("table", mcp.Required(), mcp.Description("Source table name (exact spelling, case-sensitive)")),
+		mcp.WithString("column", mcp.Required(), mcp.Description("Generated column name (case-insensitive)")),
+	), deleteGeneratedOverrideHandler)
 
 	s.AddTool(mcp.NewTool("start_run",
 		mcp.WithDescription("Start a new migration run. Expands the data plan into steps + jobs. For instances with target_strategy=dedicated_db a leading create_target_db step issues CREATE DATABASE before anything else runs. Fails with 409 if a run is already active for this migration or if blocking prereqs are unresolved. Use skip_data=true to omit copy_table + create_index steps when iterating on routine/trigger translation after a successful first run."),

@@ -162,3 +162,53 @@ func TestWriteStmt_NilSafe(t *testing.T) {
 		t.Errorf("WriteStmt(nil) = %q, want empty", got)
 	}
 }
+
+// TestWriteSelectInto — the plpgsql INTO list lands after the head
+// projection, target variables are not quoted, and the rest of the
+// query renders exactly as WriteStmt would.
+func TestWriteSelectInto(t *testing.T) {
+	count := &ast.SelectStmt{
+		Cols: []ast.SelectItem{{Expr: ast.BuildFuncCall("COUNT", ast.BuildIdent("*"))}},
+		From: []ast.FromItem{&ast.FromTable{Name: "t"}},
+		Where: &ast.BinaryExpr{
+			Op:  "=",
+			Lhs: ast.BuildIdent("id"),
+			Rhs: ast.BuildIdent("p_id"),
+		},
+	}
+	if got, want := WriteSelectInto(count, []string{"n"}), `SELECT COUNT(*) INTO n FROM "t" WHERE "id" = "p_id"`; got != want {
+		t.Errorf("COUNT INTO:\n  got  %q\n  want %q", got, want)
+	}
+
+	distinct := &ast.SelectStmt{
+		Distinct: true,
+		Cols: []ast.SelectItem{
+			{Expr: ast.BuildIdent("a")},
+			{Expr: ast.BuildIdent("b")},
+		},
+		From:    []ast.FromItem{&ast.FromTable{Schema: "s", Name: "t"}},
+		OrderBy: []ast.OrderItem{{Expr: ast.BuildIdent("a"), Desc: true}},
+		Limit:   ast.BuildIntLit(1),
+	}
+	if got, want := WriteSelectInto(distinct, []string{"v_a", "v_b"}), `SELECT DISTINCT "a", "b" INTO v_a, v_b FROM "s"."t" ORDER BY "a" DESC LIMIT 1`; got != want {
+		t.Errorf("DISTINCT INTO:\n  got  %q\n  want %q", got, want)
+	}
+
+	// Only the head branch of a set-operation chain receives INTO.
+	union := &ast.SelectStmt{
+		Cols:   []ast.SelectItem{{Expr: ast.BuildIdent("a")}},
+		From:   []ast.FromItem{&ast.FromTable{Name: "t1"}},
+		SetOps: []ast.SetOp{{Op: "UNION", Stmt: &ast.SelectStmt{Cols: []ast.SelectItem{{Expr: ast.BuildIdent("a")}}, From: []ast.FromItem{&ast.FromTable{Name: "t2"}}}}},
+	}
+	if got, want := WriteSelectInto(union, []string{"v"}), `SELECT "a" INTO v FROM "t1" UNION SELECT "a" FROM "t2"`; got != want {
+		t.Errorf("UNION INTO:\n  got  %q\n  want %q", got, want)
+	}
+
+	// Empty into list and nil input degrade gracefully.
+	if got, want := WriteSelectInto(count, nil), WriteStmt(count); got != want {
+		t.Errorf("empty INTO: got %q, want %q", got, want)
+	}
+	if got := WriteSelectInto(nil, []string{"n"}); got != "" {
+		t.Errorf("nil SELECT: got %q, want empty", got)
+	}
+}

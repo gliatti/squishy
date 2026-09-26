@@ -28,6 +28,16 @@ type Params struct {
 }
 
 // MySQLDSN returns a go-sql-driver DSN (user:pass@tcp(host:port)/db?...).
+//
+// Every session is pinned to UTC: the driver runs `SET time_zone =
+// '+00:00'` on connect (unknown DSN parameters are session variables)
+// and parses DATETIME/TIMESTAMP values as UTC (loc). MySQL/MariaDB
+// convert TIMESTAMP values to the session time zone on read, so without
+// the pin a source whose time_zone is not UTC would hand the copier
+// shifted instants — for example a MariaDB system-versioned ROW END of
+// 07:28:15 instead of 06:28:15 UTC, which would no longer equal the
+// sentinel the emulation triggers stamp. Both settings are forced after
+// Extra so a connection override cannot break that invariant.
 func (p Params) MySQLDSN() string {
 	q := url.Values{}
 	q.Set("parseTime", "true")
@@ -36,6 +46,8 @@ func (p Params) MySQLDSN() string {
 	for k, v := range p.Extra {
 		q.Set(k, v)
 	}
+	q.Set("loc", "UTC")
+	q.Set("time_zone", "'+00:00'")
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s",
 		p.Username, p.Password, p.Host, p.Port, p.Database, q.Encode())
 }

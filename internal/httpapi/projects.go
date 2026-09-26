@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -22,7 +21,30 @@ type createProjectReq struct {
 	Description string `json:"description"`
 }
 
-var slugRe = regexp.MustCompile(`[^a-z0-9-]+`)
+// slugify derives a URL-safe project slug from a free-form name: the name
+// is lower-cased, every byte in [a-z0-9-] is kept, and each run of other
+// bytes (spaces, punctuation, every byte of a multi-byte UTF-8 sequence)
+// collapses into a single '-'. Leading/trailing dashes are trimmed. A
+// literal '-' adjacent to a replaced run is kept, so "a - b" → "a---b".
+// May return "" (e.g. "---"); the caller supplies a fallback.
+func slugify(name string) string {
+	lower := strings.ToLower(name)
+	out := make([]byte, 0, len(lower))
+	inRun := false
+	for i := 0; i < len(lower); i++ {
+		c := lower[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+			out = append(out, c)
+			inRun = false
+			continue
+		}
+		if !inRun {
+			out = append(out, '-')
+			inRun = true
+		}
+	}
+	return strings.Trim(string(out), "-")
+}
 
 func (d *Deps) createProject(w http.ResponseWriter, r *http.Request) {
 	var req createProjectReq
@@ -34,9 +56,7 @@ func (d *Deps) createProject(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "name required")
 		return
 	}
-	slug := strings.ToLower(req.Name)
-	slug = slugRe.ReplaceAllString(slug, "-")
-	slug = strings.Trim(slug, "-")
+	slug := slugify(req.Name)
 	if slug == "" {
 		slug = "p-" + time.Now().Format("20060102150405")
 	}
