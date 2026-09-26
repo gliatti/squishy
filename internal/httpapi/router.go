@@ -22,6 +22,10 @@ type Deps struct {
 	Repo *project.Repo
 	Bus  *events.Bus
 	Log  zerolog.Logger
+	// Token, when non-empty, is the bearer token /api/v1 requires.
+	Token string
+	// AllowedOrigins are the browser origins allowed cross-origin.
+	AllowedOrigins []string
 }
 
 // Handler builds the mux. Mount at / (not at /api/v1) — the prefix is added
@@ -32,7 +36,12 @@ func Handler(d Deps) http.Handler {
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
 	r.Use(requestLogger(d.Log))
-	r.Use(cors)
+	allowed := map[string]bool{}
+	for _, o := range d.AllowedOrigins {
+		allowed[o] = true
+	}
+	r.Use(cors(allowed))
+	r.Use(originGuard(allowed))
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) { okJSON(w, map[string]string{"status": "ok"}) })
 	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +58,7 @@ func Handler(d Deps) http.Handler {
 	})
 
 	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(requireToken(d.Token))
 		r.Route("/projects", func(r chi.Router) {
 			r.Post("/", d.createProject)
 			r.Get("/", d.listProjects)
@@ -113,19 +123,6 @@ func requestLogger(log zerolog.Logger) func(http.Handler) http.Handler {
 				Msg("http")
 		})
 	}
-}
-
-func cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 // ---- response helpers ----

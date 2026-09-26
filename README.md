@@ -81,7 +81,9 @@ The e2e run uses its own Compose project (`squishy-e2e`, overlay
 the `make up` stack nor collides with ports held by other local stacks. The
 `make up` host ports can be moved with `SQUISHY_PG_HOST_PORT`,
 `SQUISHY_MYSQL_HOST_PORT`, `SQUISHY_API_HOST_PORT`, `SQUISHY_WEB_HOST_PORT`
-(and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,MCP}_HOST_PORT`).
+(and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,MCP}_HOST_PORT`). They are bound
+to `127.0.0.1` by default; set `SQUISHY_BIND_ADDR=0.0.0.0` to expose them on
+the network (then also set `SQUISHY_API_TOKEN`).
 
 ## Architecture
 
@@ -225,7 +227,22 @@ make mcp-build       # build distroless prod image squishy-mcp:prod
 All via env vars (prefix `SQUISHY_`, see `.env.example` and
 `internal/config`): `SQUISHY_PG_DSN`, `SQUISHY_HTTP_ADDR`,
 `SQUISHY_WORKERS`, `SQUISHY_WORKER_ID`, `SQUISHY_BATCH_SIZE`,
-`SQUISHY_LOG_LEVEL`.
+`SQUISHY_LOG_LEVEL`, `SQUISHY_API_TOKEN`, `SQUISHY_ALLOWED_ORIGINS`.
+
+### API access
+
+- `SQUISHY_API_TOKEN`: when set, every `/api/v1` request must carry
+  `Authorization: Bearer <token>`. Compose passes it to the api, the MCP
+  server, the e2e runner and the web dev proxy (which adds the header, so
+  the browser never holds the token). Unset, the API is open and logs a
+  warning at boot: keep its port on localhost.
+- `SQUISHY_ALLOWED_ORIGINS` (comma-separated, default
+  `http://localhost:5173,http://127.0.0.1:5173`): the only browser origins
+  that get CORS headers. A state-changing request (POST/PUT/DELETE) sent by
+  a browser from any other origin is refused with 403, so a web page open
+  in the operator's browser cannot drive the API (CSRF). Requests without
+  an `Origin` header (curl, MCP, tests) are not affected. Add the web UI's
+  origin here when it is served from another host or port.
 
 ## Common make targets
 

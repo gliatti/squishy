@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.com/dalibo/squishy/internal/dataxfer"
@@ -349,7 +350,7 @@ func (d *Deps) hCreateRoutine(ctx context.Context, j *queue.Job) error {
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx,
-		fmt.Sprintf(`SET LOCAL search_path TO %q, public`, schema)); err != nil {
+		"SET LOCAL search_path TO "+pgx.Identifier{schema}.Sanitize()+", public"); err != nil {
 		// non-fatal — fall through and attempt the DDL, PG will throw its
 		// own error if search_path is the blocker.
 		d.Bus.Publish(ctx, events.Event{
@@ -375,7 +376,7 @@ func (d *Deps) hCreateRoutine(ctx context.Context, j *queue.Job) error {
 			tx2, err2 := d.TargetPool.Begin(ctx)
 			if err2 == nil {
 				defer tx2.Rollback(ctx)
-				_, _ = tx2.Exec(ctx, fmt.Sprintf(`SET LOCAL search_path TO %q, public`, schema))
+				_, _ = tx2.Exec(ctx, "SET LOCAL search_path TO "+pgx.Identifier{schema}.Sanitize()+", public")
 				if _, err3 := tx2.Exec(ctx, retryDDL); err3 == nil {
 					d.Bus.Publish(ctx, events.Event{
 						RunID: j.RunID, StepID: &j.StepID,
@@ -660,7 +661,7 @@ func (d *Deps) hValidate(ctx context.Context, j *queue.Job) error {
 			return fmt.Errorf("count source %s (for %s): %w", c.SourceTable, c.TargetTable, err)
 		}
 		var dstN int64
-		if err := d.TargetPool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %q.%q`, p.TargetSchema, c.TargetTable)).Scan(&dstN); err != nil {
+		if err := d.TargetPool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{p.TargetSchema, c.TargetTable}.Sanitize()).Scan(&dstN); err != nil {
 			return fmt.Errorf("count pg %s: %w", c.TargetTable, err)
 		}
 		if srcN != dstN {

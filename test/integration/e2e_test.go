@@ -22,6 +22,7 @@ import (
 
 var (
 	apiURL     = getenv("SQUISHY_API_URL", "http://api:8080")
+	apiToken   = os.Getenv("SQUISHY_API_TOKEN")
 	pgAdminDSN = getenv("TARGET_PG_DSN", "postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable")
 	mysqlDSN   = getenv("SQUISHY_MYSQL_DSN", "sakila:sakila@tcp(mysql-sample:3306)/sakila?parseTime=true&multiStatements=true")
 	fixtures   = []string{"customers", "orders", "order_items", "t_numeric", "t_string", "t_temporal", "t_defaults", "t_identity", "t_check"}
@@ -327,6 +328,9 @@ func doJSON(t *testing.T, method, path string, body any) map[string]any {
 	req, _ := http.NewRequest(method, apiURL+path, buf)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+apiToken)
 	}
 	res, err := http.DefaultClient.Do(req)
 	require.NoError(t, err, "%s %s", method, path)

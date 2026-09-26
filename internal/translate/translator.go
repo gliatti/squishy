@@ -2077,15 +2077,16 @@ func (t *translator) translateColumn(tableName string, c *ast.ColumnDef, tableCo
 func (t *translator) emitDefaultOnNullTrigger(tbl, col, defaultExpr string) {
 	schema := t.opt.TargetSchema
 	fnName := fmt.Sprintf("default_on_null_%s_%s", tbl, col)
-	fn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.%s() RETURNS trigger LANGUAGE plpgsql AS $$
+	body := fmt.Sprintf(`
 BEGIN
   IF NEW.%s IS NULL THEN
     NEW.%s := %s;
   END IF;
   RETURN NEW;
-END;$$;`,
-		quoteIdent(schema), quoteIdent(fnName),
-		quoteIdent(col), quoteIdent(col), defaultExpr)
+END;`, quoteIdent(col), quoteIdent(col), defaultExpr)
+	q := pgast.DollarQuote("", body)
+	fn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.%s() RETURNS trigger LANGUAGE plpgsql AS %s%s%s;`,
+		quoteIdent(schema), quoteIdent(fnName), q, body, q)
 	trgName := fmt.Sprintf("trg_default_on_null_%s_%s", tbl, col)
 	trg := fmt.Sprintf(`CREATE TRIGGER %s BEFORE INSERT OR UPDATE OF %s ON %s.%s
   FOR EACH ROW EXECUTE FUNCTION %s.%s();`,
@@ -2105,15 +2106,17 @@ END;$$;`,
 // emitOnUpdateTrigger creates a PG trigger that emulates MySQL's
 // `ON UPDATE CURRENT_TIMESTAMP` clause using the set_updated_at() helper.
 func (t *translator) emitOnUpdateTrigger(tbl, col string) {
-	fn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.set_%s_%s() RETURNS trigger LANGUAGE plpgsql AS $$
+	schema := quoteIdent(t.opt.TargetSchema)
+	fnName := quoteIdent("set_" + tbl + "_" + col)
+	fn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.%s() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   NEW.%s := now();
   RETURN NEW;
-END;$$;`, quoteIdent(t.opt.TargetSchema), tbl, col, quoteIdent(col))
-	trg := fmt.Sprintf(`CREATE TRIGGER trg_%s_%s BEFORE UPDATE ON %s.%s
-  FOR EACH ROW EXECUTE FUNCTION %s.set_%s_%s();`,
-		tbl, col, quoteIdent(t.opt.TargetSchema), quoteIdent(tbl),
-		quoteIdent(t.opt.TargetSchema), tbl, col)
+END;$$;`, schema, fnName, quoteIdent(col))
+	trg := fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON %s.%s
+  FOR EACH ROW EXECUTE FUNCTION %s.%s();`,
+		quoteIdent("trg_"+tbl+"_"+col), schema, quoteIdent(tbl),
+		schema, fnName)
 	t.res.Plan.PostActions = append(t.res.Plan.PostActions, fn, trg)
 }
 
@@ -3106,13 +3109,17 @@ func (t *translator) translateEvent(s *ast.CreateEvent) {
 	var snippet string
 	switch s.ScheduleKind {
 	case "EVERY":
-		snippet = fmt.Sprintf("SELECT cron.schedule('%s', '%s', $$ %s $$);",
-			s.Name, cronExpr, strings.TrimSpace(s.Body))
+		body := " " + strings.TrimSpace(s.Body) + " "
+		q := pgast.DollarQuote("", body)
+		snippet = fmt.Sprintf("SELECT cron.schedule(%s, %s, %s%s%s);",
+			sqlString(s.Name), sqlString(cronExpr), q, body, q)
 	case "AT":
 		// one-shot: schedule now() + small delay as-is — pg_cron doesn't
 		// natively support one-shot; user should adjust.
-		snippet = fmt.Sprintf("-- one-shot MySQL EVENT %s AT %s\nSELECT cron.schedule('%s', '<cron expr>', $$ %s $$);",
-			s.Name, s.At, s.Name, strings.TrimSpace(s.Body))
+		body := " " + strings.TrimSpace(s.Body) + " "
+		q := pgast.DollarQuote("", body)
+		snippet = fmt.Sprintf("-- one-shot MySQL EVENT %s AT %s\nSELECT cron.schedule(%s, '<cron expr>', %s%s%s);",
+			s.Name, s.At, sqlString(s.Name), q, body, q)
 	}
 
 	if t.caps().HasPgCron && s.ScheduleKind == "EVERY" {
@@ -3156,16 +3163,20 @@ func (t *translator) translateEvent(s *ast.CreateEvent) {
 		if body == "" {
 			body = "-- empty body"
 		}
-		selfScheduling := fmt.Sprintf(`DO $do$
+		job := fmt.Sprintf(" %s; PERFORM cron.unschedule(%s); ", body, sqlString(s.Name))
+		jq := pgast.DollarQuote("job", job)
+		do := fmt.Sprintf(`
 DECLARE
   fire_at   TIMESTAMPTZ := %s;
   cron_expr TEXT := to_char(fire_at AT TIME ZONE 'UTC',
                             'MI FMHH24 FMDD FMMM') || ' *';
 BEGIN
   PERFORM cron.schedule(%s, cron_expr,
-    $job$ %s; PERFORM cron.unschedule(%s); $job$);
+    %s%s%s);
 END
-$do$;`, atExpr, sqlString(s.Name), body, sqlString(s.Name))
+`, atExpr, sqlString(s.Name), jq, job, jq)
+		dq := pgast.DollarQuote("do", do)
+		selfScheduling := "DO " + dq + do + dq + ";"
 
 		t.res.Plan.Events = append(t.res.Plan.Events, PGEvent{
 			Name: s.Name, PgCron: selfScheduling, Comment: s.Comment,
@@ -3704,7 +3715,7 @@ func emitAlterTriggerRuntimeFallback(s *ast.AlterTrigger, name, _targetSchema st
 	default:
 		return ""
 	}
-	return "DO $$\n" +
+	body := "\n" +
 		"DECLARE r record;\n" +
 		"BEGIN\n" +
 		"  SELECT n.nspname AS schema, c.relname AS tbl\n" +
@@ -3719,7 +3730,9 @@ func emitAlterTriggerRuntimeFallback(s *ast.AlterTrigger, name, _targetSchema st
 		"    RETURN;\n" +
 		"  END IF;\n" +
 		"  " + execStmt + "\n" +
-		"END $$;\n"
+		"END "
+	q := pgast.DollarQuote("", body)
+	return "DO " + q + body + q + ";\n"
 }
 
 // alterTriggerHint produces a PG-syntax template for the manual-review
@@ -4061,19 +4074,20 @@ func (t *translator) translateCreateTypeBody(s *ast.CreateTypeBody) {
 		t.usedAdminpack = true
 	}
 		body := wrapProcedureBody(pgBody)
+		q := pgast.DollarQuote("", "\n"+body+"\n")
 
 		var ddl string
 		if returns != "" {
 			ddl = fmt.Sprintf(
-				"CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s LANGUAGE plpgsql AS $$\n%s\n$$;",
+				"CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s LANGUAGE plpgsql AS %s\n%s\n%s;",
 				quoteIdent(schema), quoteIdent(fnName),
-				strings.Join(paramParts, ", "), returns, body,
+				strings.Join(paramParts, ", "), returns, q, body, q,
 			)
 		} else {
 			ddl = fmt.Sprintf(
-				"CREATE OR REPLACE PROCEDURE %s.%s(%s) LANGUAGE plpgsql AS $$\n%s\n$$;",
+				"CREATE OR REPLACE PROCEDURE %s.%s(%s) LANGUAGE plpgsql AS %s\n%s\n%s;",
 				quoteIdent(schema), quoteIdent(fnName),
-				strings.Join(paramParts, ", "), body,
+				strings.Join(paramParts, ", "), q, body, q,
 			)
 		}
 		t.res.Plan.Routines = append(t.res.Plan.Routines, PGRoutine{

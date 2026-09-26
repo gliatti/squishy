@@ -1038,7 +1038,7 @@ func rewriteDynTriggerRange(stmts []ast.PLStmt, m dynTriggerMatch, targetSchema,
 			// the post-range execute/close still find a parseable
 			// statement on the cursor. Direct EXECUTE IMMEDIATE sinks
 			// don't involve cursors so the no-op parse is skipped.
-			fnHead := fmt.Sprintf("CREATE OR REPLACE FUNCTION %q.%q() RETURNS trigger LANGUAGE plpgsql AS $f$ ", targetSchema, fnName)
+			fnHead := "CREATE OR REPLACE FUNCTION " + quoteIdent(targetSchema) + "." + quoteIdent(fnName) + "() RETURNS trigger LANGUAGE plpgsql AS $f$ "
 			fnTail := " RETURN NEW; END $f$;"
 			fnExec := assembleConcat([]ast.Expr{
 				quoteStringLit(fnHead),
@@ -1048,7 +1048,7 @@ func rewriteDynTriggerRange(stmts []ast.PLStmt, m dynTriggerMatch, targetSchema,
 			trgExec := assembleConcat([]ast.Expr{
 				quoteStringLit("CREATE TRIGGER "),
 				&ast.Ident{Parts: []string{normalizeOracleIdent(m.varName)}},
-				quoteStringLit(fmt.Sprintf(" EXECUTE FUNCTION %q.%q();", targetSchema, fnName)),
+				quoteStringLit(" EXECUTE FUNCTION " + quoteIdent(targetSchema) + "." + quoteIdent(fnName) + "();"),
 			})
 			wrapperBody = append(wrapperBody, &ast.ExecuteImmediateStmt{SQL: fnExec})
 			wrapperBody = append(wrapperBody, &ast.ExecuteImmediateStmt{SQL: trgExec})

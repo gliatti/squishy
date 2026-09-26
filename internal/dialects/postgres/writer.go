@@ -255,11 +255,13 @@ func writeCreateFunction(b *strings.Builder, f *CreateFunction) {
 	if f.Volatile != "" {
 		vol = " " + f.Volatile
 	}
+	body := strings.TrimRight(f.Body, "\n")
+	q := DollarQuote("body", body)
 	fmt.Fprintf(b,
-		"CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s\nLANGUAGE %s%s%s AS $body$\n%s\n$body$;\n",
+		"CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s\nLANGUAGE %s%s%s AS %s\n%s\n%s;\n",
 		qIdent(f.Schema), qIdent(f.Name),
 		f.Params, f.Returns,
-		lang, vol, sec, strings.TrimRight(f.Body, "\n"))
+		lang, vol, sec, q, body, q)
 }
 
 func writeCreateProcedure(b *strings.Builder, p *CreateProcedure) {
@@ -271,10 +273,12 @@ func writeCreateProcedure(b *strings.Builder, p *CreateProcedure) {
 	if strings.EqualFold(p.Security, "DEFINER") {
 		sec = " SECURITY DEFINER"
 	}
+	body := strings.TrimRight(p.Body, "\n")
+	q := DollarQuote("body", body)
 	fmt.Fprintf(b,
-		"CREATE OR REPLACE PROCEDURE %s.%s(%s)\nLANGUAGE %s%s AS $body$\n%s\n$body$;\n",
+		"CREATE OR REPLACE PROCEDURE %s.%s(%s)\nLANGUAGE %s%s AS %s\n%s\n%s;\n",
 		qIdent(p.Schema), qIdent(p.Name),
-		p.Params, lang, sec, strings.TrimRight(p.Body, "\n"))
+		p.Params, lang, sec, q, body, q)
 }
 
 func writeCreateView(b *strings.Builder, v *CreateView) {
@@ -350,6 +354,38 @@ func writeCreateTrigger(b *strings.Builder, t *CreateTrigger) {
 
 func qIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// DollarQuote returns a dollar-quote delimiter ($<tag>$, $<tag>_1$, ...;
+// $$, $_1$, ... for an empty tag) that does not occur in body, so a body
+// (possibly kept verbatim from the source) can never close the quote early
+// and append statements. It only picks a delimiter: it collects every
+// $tag$ marker by a byte scan (tag bytes as in an unquoted identifier,
+// minus '$') and never rewrites the body.
+func DollarQuote(tag, body string) string {
+	used := map[string]bool{}
+	for i := 0; i < len(body); i++ {
+		if body[i] != '$' {
+			continue
+		}
+		j := i + 1
+		for j < len(body) && isDollarTagByte(body[j]) {
+			j++
+		}
+		if j < len(body) && body[j] == '$' {
+			used[body[i+1:j]] = true
+		}
+	}
+	t := tag
+	for n := 1; used[t]; n++ {
+		t = fmt.Sprintf("%s_%d", tag, n)
+	}
+	return "$" + t + "$"
+}
+
+func isDollarTagByte(c byte) bool {
+	return c == '_' || c >= 0x80 ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 // sqlLit renders a safely-escaped SQL string literal.

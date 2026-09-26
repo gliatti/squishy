@@ -141,7 +141,13 @@ func main() {
 		runStateLoop(ctx, db.Pool, bus, log)
 	}()
 
-	h := httpapi.Handler(httpapi.Deps{DB: db.Pool, Repo: repo, Bus: bus, Log: log})
+	if cfg.APIToken == "" {
+		log.Warn().Msg("SQUISHY_API_TOKEN is not set: /api/v1 is unauthenticated, keep the API port bound to localhost")
+	}
+	h := httpapi.Handler(httpapi.Deps{
+		DB: db.Pool, Repo: repo, Bus: bus, Log: log,
+		Token: cfg.APIToken, AllowedOrigins: cfg.AllowedOrigins,
+	})
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           h,
