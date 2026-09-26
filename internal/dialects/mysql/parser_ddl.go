@@ -129,6 +129,30 @@ func (p *Parser) parseCreateTable(start Position, temporary, orReplace bool) ast
 	if s.Options.SystemVersioning {
 		s.SystemVersioned = true
 	}
+	// Column-level form: without the table-level clause, a column declared
+	// `WITH SYSTEM VERSIONING` makes the table system-versioned, but only
+	// for the columns declared so. Checked on MariaDB 11.8: `CREATE TABLE
+	// t (a int, b int WITH SYSTEM VERSIONING)` is shown by SHOW CREATE
+	// TABLE as `a … WITHOUT SYSTEM VERSIONING, b …` plus the table-level
+	// `WITH SYSTEM VERSIONING`, and an UPDATE of a alone writes no history
+	// row. The parser normalises hand-written DDL the same way: the table
+	// is flagged SystemVersioned and every other column (but the ROW START
+	// / ROW END ones) WithoutSystemVersioning, so no consumer versions
+	// columns MariaDB does not.
+	columnLevel := false
+	for _, c := range s.Columns {
+		if c.WithSystemVersioning {
+			columnLevel = true
+		}
+	}
+	if columnLevel && !s.Options.SystemVersioning {
+		s.SystemVersioned = true
+		for _, c := range s.Columns {
+			if !c.WithSystemVersioning && !c.SystemVersioning {
+				c.WithoutSystemVersioning = true
+			}
+		}
+	}
 	if p.isKw("PARTITION") {
 		s.Partitioning = p.parsePartitionBy()
 	}
@@ -275,8 +299,76 @@ func (p *Parser) parsePartitionFunc(pn *ast.Partitioning, subOnly bool) {
 			p.expectPunct("(")
 			pn.ExprText = p.captureBalancedExpr()
 		}
+	case !subOnly && p.isKw("SYSTEM_TIME"):
+		p.advance()
+		pn.Method = "SYSTEM_TIME"
+		p.parseSystemTimePartitionRule(pn)
 	default:
-		p.errorHere("unsupported partition function", "HASH|KEY|RANGE|LIST")
+		p.errorHere("unsupported partition function", "HASH|KEY|RANGE|LIST|SYSTEM_TIME")
+	}
+}
+
+// parseSystemTimePartitionRule parses the rotation rule of MariaDB's
+// history partitioning (the SYSTEM_TIME keyword already consumed):
+//
+//	PARTITION BY SYSTEM_TIME
+//	  [ LIMIT n [AUTO]
+//	  | INTERVAL n unit [STARTS {TIMESTAMP 'ts' | expr}] [AUTO] ]
+//
+// SHOW CREATE TABLE renders it this way (e.g. `INTERVAL 1 HOUR STARTS
+// TIMESTAMP'2026-01-01 00:00:00' AUTO`); the optional PARTITIONS n and
+// the (PARTITION p HISTORY, …, PARTITION p CURRENT) list follow and are
+// parsed by parsePartitionBy.
+func (p *Parser) parseSystemTimePartitionRule(pn *ast.Partitioning) {
+	switch {
+	case p.isKw("LIMIT"):
+		p.advance()
+		if p.cur.Kind != TOK_NUMBER {
+			p.errorHere("expected row count after LIMIT", "NUMBER")
+			return
+		}
+		n, err := strconv.ParseInt(p.cur.Lit, 10, 64)
+		if err != nil || n <= 0 {
+			p.errorHere("invalid PARTITION BY SYSTEM_TIME LIMIT", "positive integer")
+			return
+		}
+		pn.SystemTimeLimit = n
+		p.advance()
+	case p.isKw("INTERVAL"):
+		iv, ok := p.parseIntervalLit().(*ast.IntervalLit)
+		if !ok || iv.Unit == "" {
+			p.errorHere("invalid PARTITION BY SYSTEM_TIME INTERVAL", "INTERVAL n unit")
+			return
+		}
+		pn.SystemTimeInterval = iv
+		if p.isKw("STARTS") {
+			p.advance()
+			start := p.cur.Pos
+			if p.isKw("TIMESTAMP") || p.isKw("DATE") {
+				// Typed literal `TIMESTAMP'…'` (SHOW CREATE TABLE's form).
+				typ := ast.DataType(&ast.TimestampType{P: astPos(start)})
+				if p.isKw("DATE") {
+					typ = &ast.DateType{P: astPos(start)}
+				}
+				p.advance()
+				if p.cur.Kind != TOK_STRING {
+					p.errorHere("expected a typed string literal after STARTS", "STRING")
+					return
+				}
+				pn.SystemTimeStarts = &ast.CastExpr{
+					Expr: &ast.Literal{Kind: "string", Text: p.cur.Lit, P: astPos(p.cur.Pos)},
+					Type: typ,
+					P:    astPos(start),
+				}
+				p.advance()
+			} else {
+				pn.SystemTimeStarts = p.parseExpr()
+			}
+		}
+	}
+	if p.isWord("AUTO") {
+		p.advance()
+		pn.SystemTimeAuto = true
 	}
 }
 
@@ -363,6 +455,17 @@ func (p *Parser) parsePartitionDefinition() *ast.PartitionDefinition {
 	p.advance()
 	name, _ := p.parseIdent()
 	d := &ast.PartitionDefinition{Name: name}
+
+	// MariaDB PARTITION BY SYSTEM_TIME: `PARTITION p HISTORY` /
+	// `PARTITION p CURRENT` (non-reserved words).
+	switch {
+	case p.isWord("HISTORY"):
+		p.advance()
+		d.History = true
+	case p.isWord("CURRENT"):
+		p.advance()
+		d.Current = true
+	}
 
 	if p.isKw("VALUES") {
 		p.advance()
@@ -794,6 +897,7 @@ optionsLoop:
 			if p.isKw("NOT") {
 				p.advance()
 				p.expectKw("ENFORCED")
+				col.CheckNotEnforced = true
 			} else if p.isKw("ENFORCED") {
 				p.advance()
 			}
@@ -820,6 +924,23 @@ optionsLoop:
 			p.advance()
 			if p.isKw("DISK") || p.isKw("MEMORY") {
 				p.advance()
+			}
+		case (p.isKw("WITH") || p.isKw("WITHOUT")) && p.peekLookaheadKw("SYSTEM"):
+			// MariaDB column attribute `{WITH | WITHOUT} SYSTEM VERSIONING`.
+			// WITHOUT excludes the column from versioning: an UPDATE that
+			// only assigns such columns rewrites the current row in place
+			// (no history row, ROW START unchanged). WITH on a column of a
+			// table without the table-level clause makes the table
+			// system-versioned for the WITH columns only (the caller sets
+			// SystemVersioned and flags the other columns WITHOUT).
+			with := p.isKw("WITH")
+			p.advance() // WITH | WITHOUT
+			p.advance() // SYSTEM
+			p.expectKw("VERSIONING")
+			if with {
+				col.WithSystemVersioning = true
+			} else {
+				col.WithoutSystemVersioning = true
 			}
 		default:
 			break optionsLoop
@@ -1347,6 +1468,18 @@ func (p *Parser) parseIndexedCols() []ast.IndexedCol {
 			p.advance()
 			c.Order = "DESC"
 		}
+		// MariaDB 10.5+ application-time key part:
+		//   UNIQUE (room_id, booking WITHOUT OVERLAPS)
+		// where `booking` names a PERIOD FOR, not a column.
+		if p.isKw("WITHOUT") {
+			p.advance()
+			if p.cur.Kind == TOK_IDENT && strings.EqualFold(p.cur.Lit, "OVERLAPS") {
+				p.advance()
+			} else {
+				p.errorHere("expected OVERLAPS", "OVERLAPS")
+			}
+			c.WithoutOverlaps = true
+		}
 		cols = append(cols, c)
 		if !p.isPunct(",") {
 			break
@@ -1615,7 +1748,11 @@ func (p *Parser) parsePrimary() ast.Expr {
 	case p.isKw("FALSE"):
 		p.advance()
 		return &ast.Literal{Kind: "bool", Text: "FALSE", P: astPos(start)}
-	case p.isKw("CURRENT_TIMESTAMP") || p.isKw("NOW") || p.isKw("LOCALTIMESTAMP"):
+	case p.isKw("CURRENT_TIMESTAMP") || p.isKw("NOW") || p.isKw("LOCALTIMESTAMP") ||
+		p.isKw("CURRENT_DATE") || p.isKw("CURRENT_TIME"):
+		// Niladic date/time keywords (grammar: specificFunction →
+		// CURRENT_DATE | CURRENT_TIME | CURRENT_TIMESTAMP | LOCALTIMESTAMP …),
+		// with the optional `(n)` precision / empty `()` form.
 		name := p.cur.Lit
 		p.advance()
 		fc := &ast.FuncCall{Name: name, P: astPos(start)}
@@ -1641,11 +1778,13 @@ func (p *Parser) parsePrimary() ast.Expr {
 		if p.isPunct("(") {
 			p.advance()
 			fc := &ast.FuncCall{Name: strings.ToUpper(name), P: astPos(start)}
-			// Aggregate-style argument prefix: DISTINCT / ALL preceding the
-			// expression. We discard the qualifier — the AST does not yet
-			// model per-call set-quantifiers, but accepting it keeps real
-			// MySQL queries parsing.
-			if p.isKw("DISTINCT") || p.isKw("ALL") {
+			// Aggregate set quantifier (grammar: aggregateWindowedFunction —
+			// `aggregator=(ALL|DISTINCT)? functionArg`). DISTINCT is kept on
+			// the node; ALL is the default and is dropped.
+			if p.isKw("DISTINCT") {
+				fc.Distinct = true
+				p.advance()
+			} else if p.isKw("ALL") {
 				p.advance()
 			}
 			if !p.isPunct(")") {
@@ -1655,7 +1794,30 @@ func (p *Parser) parsePrimary() ast.Expr {
 					fc.Args = append(fc.Args, p.parseFuncArg())
 				}
 			}
+			// GROUP_CONCAT tail (grammar: aggregateWindowedFunction —
+			// GROUP_CONCAT '(' … functionArgs (ORDER BY orderByExpression
+			// (',' orderByExpression)*)? (SEPARATOR separator=STRING_LITERAL)?
+			// ')'). The argument parser stops at ORDER naturally.
+			if p.isKw("ORDER") {
+				fc.AggOrderBy = p.parseOrderByClause()
+			}
+			if p.cur.Kind == TOK_IDENT && strings.EqualFold(p.cur.Lit, "SEPARATOR") {
+				p.advance()
+				if p.cur.Kind == TOK_STRING {
+					fc.AggSeparator = &ast.Literal{Kind: "string", Text: p.cur.Lit, P: astPos(p.cur.Pos)}
+					p.advance()
+				} else {
+					p.errorHere("expected string literal after SEPARATOR", "STRING")
+				}
+			}
 			p.expectPunct(")")
+			// Window function call (grammar: overClause — OVER
+			// ('(' windowSpec ')' | windowName)).
+			if p.isKw("OVER") {
+				p.advance()
+				spec := p.parseOverWindowSpec()
+				return &ast.WindowedAgg{Func: fc, Over: spec, P: fc.P}
+			}
 			return fc
 		}
 		// identifier path (schema.table.col, NEW.col, OLD.col)
@@ -1669,8 +1831,72 @@ func (p *Parser) parsePrimary() ast.Expr {
 		return &ast.Ident{Parts: parts, Backtick: bt, P: astPos(start)}
 	}
 	p.errorHere("unexpected token in expression", "expression")
-	p.advance()
+	// Never step over the statement terminator: the caller's resync
+	// (captureUntilStmtEnd / syncToDelimiter) must still find it, otherwise
+	// a malformed expression swallows the following statement.
+	if !p.atStatementEnd() {
+		p.advance()
+	}
 	return &ast.RawExpr{Text: "", P: astPos(start)}
+}
+
+// parseOverWindowSpec parses the part of an overClause that follows OVER
+// (grammar: overClause / windowSpec):
+//
+//	'(' [PARTITION BY expr (',' expr)*] [orderByClause] [frameClause] ')'
+//
+// The frame clause (ROWS | RANGE | GROUPS …) is not decomposed: its tokens
+// are kept, single-space separated, in WindowSpec.Frame. A bare window name
+// (`OVER w`) refers to the WINDOW clause, which the parser skips, so it is
+// reported as an error instead of being silently dropped.
+func (p *Parser) parseOverWindowSpec() *ast.WindowSpec {
+	spec := &ast.WindowSpec{}
+	if p.cur.Kind == TOK_IDENT || p.cur.Kind == TOK_QUOTED_IDENT {
+		p.errorHere("named window references are not supported (WINDOW clause is not modeled)", "'('")
+		spec.RawSpec = p.cur.Lit
+		p.advance()
+		return spec
+	}
+	if !p.expectPunct("(") {
+		return spec
+	}
+	if p.isKw("PARTITION") {
+		p.advance()
+		p.expectKw("BY")
+		spec.PartitionBy = append(spec.PartitionBy, p.parseExpr())
+		for p.isPunct(",") {
+			p.advance()
+			spec.PartitionBy = append(spec.PartitionBy, p.parseExpr())
+		}
+	}
+	if p.isKw("ORDER") {
+		spec.OrderBy = p.parseOrderByClause()
+	}
+	if (p.cur.Kind == TOK_IDENT || p.cur.Kind == TOK_KEYWORD) &&
+		(strings.EqualFold(p.cur.Lit, "ROWS") || strings.EqualFold(p.cur.Lit, "RANGE") ||
+			strings.EqualFold(p.cur.Lit, "GROUPS")) {
+		var parts []string
+		depth := 0
+		for p.cur.Kind != TOK_EOF && !p.atStatementEnd() {
+			if p.isPunct(")") {
+				if depth == 0 {
+					break
+				}
+				depth--
+			} else if p.isPunct("(") {
+				depth++
+			}
+			tok := p.cur.Raw
+			if tok == "" {
+				tok = p.cur.Lit
+			}
+			parts = append(parts, tok)
+			p.advance()
+		}
+		spec.Frame = strings.Join(parts, " ")
+	}
+	p.expectPunct(")")
+	return spec
 }
 
 // parseFuncArg parses one argument of a function call. Handles the special
@@ -1714,42 +1940,69 @@ func (p *Parser) parseCaseExpr() ast.Expr {
 	return out
 }
 
-// parseCastExpr parses `CAST(<expr> AS <type>)`.
+// parseCastExpr parses `CAST(<expr> AS <type>)` (grammar: specificFunction
+// CAST '(' expression AS convertedDataType ')'). convertedDataType adds the
+// `SIGNED [INTEGER]` / `UNSIGNED [INTEGER]` spellings that parseDataType
+// does not accept; both are 64-bit integers in MySQL, surfaced here as a
+// BIGINT IntType (Unsigned for the latter).
 func (p *Parser) parseCastExpr() ast.Expr {
 	start := p.cur.Pos
 	p.expectKw("CAST")
 	p.expectPunct("(")
 	inner := p.parseExpr()
 	p.expectKw("AS")
-	dt := p.parseDataType()
+	var dt ast.DataType
+	if p.isKw("UNSIGNED") || ((p.cur.Kind == TOK_IDENT || p.cur.Kind == TOK_KEYWORD) &&
+		strings.EqualFold(p.cur.Lit, "SIGNED")) {
+		tstart := p.cur.Pos
+		unsigned := p.isKw("UNSIGNED")
+		p.advance()
+		if p.isKw("INTEGER") || p.isKw("INT") {
+			p.advance()
+		}
+		dt = &ast.IntType{Name: "BIGINT", Unsigned: unsigned, P: astPos(tstart)}
+	} else {
+		dt = p.parseDataType()
+	}
 	p.expectPunct(")")
 	return &ast.CastExpr{Expr: inner, Type: dt, P: astPos(start)}
 }
 
-// parseIntervalLit parses `INTERVAL <expr> <unit>`. We capture the value
-// expression as text (for round-trip) and the unit keyword verbatim. Common
-// shapes: `INTERVAL 1 DAY`, `INTERVAL '1' DAY`, `INTERVAL 1 YEAR_MONTH`.
+// parseIntervalLit parses `INTERVAL <expr> <unit>` (grammar: intervalExpr
+// — INTERVAL expression intervalType). A literal quantity — number,
+// string or negated number — is kept as its literal text in Value
+// (`INTERVAL 1 DAY`, `INTERVAL '1' DAY`, `INTERVAL -1 DAY`); any other
+// quantity, identifiers included (`INTERVAL n DAY`, `INTERVAL (x + 1) DAY`,
+// `INTERVAL n * 7 DAY`, `INTERVAL f(x) DAY`), is kept typed in Expr with
+// Value left "". Value is therefore always literal text and consumers
+// never have to guess whether it names a column. The unit is taken
+// verbatim (DAY, HOUR, YEAR_MONTH, …).
 func (p *Parser) parseIntervalLit() ast.Expr {
 	start := p.cur.Pos
 	p.expectKw("INTERVAL")
-	// Capture the value as the next primary expression — usually a number
-	// literal or a quoted string. Using parsePrimary avoids consuming the
-	// trailing unit keyword that follows it.
-	val := p.parsePrimary()
+	// Arithmetic-level expression: stops at the unit word, which is never
+	// an operator.
+	val := p.parseAdd()
 	unit := ""
 	switch {
 	case p.cur.Kind == TOK_KEYWORD || p.cur.Kind == TOK_IDENT:
 		unit = p.cur.Lit
 		p.advance()
 	}
-	value := ""
+	out := &ast.IntervalLit{Unit: unit, P: astPos(start)}
 	switch v := val.(type) {
 	case *ast.Literal:
-		value = v.Text
-	case *ast.Ident:
-		value = strings.Join(v.Parts, ".")
+		out.Value = v.Text
+	case *ast.UnaryExpr:
+		if lit, ok := v.Rhs.(*ast.Literal); ok && v.Op == "-" && lit.Kind == "number" {
+			out.Value = "-" + lit.Text
+		} else {
+			out.Expr = val
+		}
+	default:
+		out.Expr = val
 	}
-	return &ast.IntervalLit{Value: value, Unit: unit, P: astPos(start)}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1768,8 +2021,8 @@ func (p *Parser) parseCreateView(start Position, orReplace bool, algorithm, defi
 		s.Columns = p.parseColList()
 	}
 	p.expectKw("AS")
-	// Capture the SELECT body verbatim up to a WITH CHECK OPTION or delimiter.
-	startOff := p.cur.Pos.Offset
+	// Delimit the SELECT body up to a WITH CHECK OPTION or delimiter.
+	bodyStart := p.cur.Pos
 	for !p.atStatementEnd() && p.cur.Kind != TOK_EOF {
 		if p.isKw("WITH") && p.peekLookaheadKw("CHECK") || p.isKw("WITH") && (p.peekLookaheadKw("CASCADED") || p.peekLookaheadKw("LOCAL")) {
 			break
@@ -1777,7 +2030,13 @@ func (p *Parser) parseCreateView(start Position, orReplace bool, algorithm, defi
 		p.advance()
 	}
 	endOff := p.cur.Pos.Offset
-	s.SelectBody = strings.TrimSpace(string(p.src[startOff:endOff]))
+	s.SelectBody = strings.TrimSpace(string(p.src[bodyStart.Offset:endOff]))
+	// Typed body (grammar: createView … AS selectStatement). The fragment
+	// is parsed by a bounded sub-parser so the statement boundary above —
+	// and the ErrorList Parse() returns — are the same whether or not the
+	// body parses. A failure is recorded on the node, not in p.errs: the
+	// translator reports it as an explicit warning.
+	s.Select, s.SelectParseError = p.parseViewBody(bodyStart, endOff)
 	if p.isKw("WITH") {
 		p.advance()
 		opt := ""
@@ -1793,6 +2052,30 @@ func (p *Parser) parseCreateView(start Position, orReplace bool, algorithm, defi
 		s.CheckOption = strings.TrimSpace(opt + "CHECK OPTION")
 	}
 	return s
+}
+
+// parseViewBody parses the view query delimited by [start.Offset, endOff)
+// as a selectStatement. It returns the typed query, or nil and the parser
+// diagnostic when the fragment is empty, does not parse, is followed by
+// tokens the query grammar does not cover, or carries a procedural INTO.
+func (p *Parser) parseViewBody(start Position, endOff int) (*ast.SelectStmt, string) {
+	sp := p.subParser(start, endOff)
+	if sp.cur.Kind == TOK_EOF {
+		return nil, "empty SELECT"
+	}
+	sel := sp.parseSelectStatement()
+	switch {
+	case len(sp.errs) > 0:
+		return nil, sp.errs.Error()
+	case sel == nil:
+		return nil, "empty SELECT"
+	case sp.pendingInto != nil:
+		return nil, "SELECT … INTO is not allowed in a view"
+	case sp.cur.Kind != TOK_EOF:
+		sp.errorHere("unexpected token after view SELECT", "EOF")
+		return nil, sp.errs.Error()
+	}
+	return sel, ""
 }
 
 // peekLookaheadKw is a small 1-token lookahead helper. The lexer has a
@@ -1814,6 +2097,7 @@ func (p *Parser) parseCreateTrigger(start Position, definer string) *ast.CreateT
 	// INSERT | UPDATE | DELETE
 	if p.isKw("INSERT") || p.isKw("UPDATE") || p.isKw("DELETE") {
 		s.Event = p.cur.Lit
+		s.Events = []string{strings.ToUpper(p.cur.Lit)}
 		p.advance()
 	}
 	p.expectKw("ON")
@@ -1966,7 +2250,18 @@ func (p *Parser) parseCreateEvent(start Position, definer string) *ast.CreateEve
 	if p.isKw("AT") {
 		p.advance()
 		s.ScheduleKind = "AT"
+		atStart := p.cur.Pos
 		s.At = p.captureExprUpto("ON", "DO", "COMMENT", "ENABLE", "DISABLE")
+		// Typed schedule (grammar: scheduleExpression — AT timestampValue
+		// intervalExpr*), parsed from the delimited fragment so the raw
+		// capture and Parse()'s ErrorList are unchanged. AtExpr stays nil
+		// when the fragment does not parse as one expression.
+		sp := p.subParser(atStart, p.cur.Pos.Offset)
+		if sp.cur.Kind != TOK_EOF {
+			if e := sp.parseExpr(); e != nil && len(sp.errs) == 0 && sp.cur.Kind == TOK_EOF {
+				s.AtExpr = e
+			}
+		}
 	} else if p.isKw("EVERY") {
 		p.advance()
 		s.ScheduleKind = "EVERY"
@@ -2147,6 +2442,126 @@ func (p *Parser) parseCreateSequence(start Position, orReplace, temporary bool) 
 		}
 	}
 	return s
+}
+
+// parseAlterSequence parses MariaDB 10.3+ `ALTER SEQUENCE [IF EXISTS] name
+// [option ...]` (the ALTER keyword is already consumed). Options mirror
+// CREATE SEQUENCE plus RESTART:
+//
+//	INCREMENT [BY|=] n
+//	MINVALUE [=] n | NO MINVALUE | NOMINVALUE
+//	MAXVALUE [=] n | NO MAXVALUE | NOMAXVALUE
+//	START [WITH|=] n            (new start value, used by a bare RESTART)
+//	CACHE [=] n | NOCACHE
+//	CYCLE | NOCYCLE | NO CYCLE
+//	RESTART [[WITH|=] n]
+func (p *Parser) parseAlterSequence(start Position) ast.Stmt {
+	p.expectKw("SEQUENCE")
+	s := &ast.AlterSequence{P: astPos(start)}
+	if p.isKw("IF") {
+		p.advance()
+		p.expectKw("EXISTS")
+	}
+	ref := p.parseTableRef()
+	s.Schema = ref.Schema
+	s.Name = ref.Name
+	for !p.atStatementEnd() && p.cur.Kind != TOK_EOF {
+		switch {
+		case p.isKw("INCREMENT"):
+			p.advance()
+			if p.isKw("BY") {
+				p.advance()
+			}
+			p.consumePunct("=")
+			if n, ok := p.parseSignedInt(); ok {
+				s.Increment, s.HasIncr = n, true
+			}
+		case p.isKw("MINVALUE"):
+			p.advance()
+			p.consumePunct("=")
+			if n, ok := p.parseSignedInt(); ok {
+				s.MinValue, s.HasMin = n, true
+			}
+		case p.isKw("NOMINVALUE"):
+			p.advance()
+			s.NoMin = true
+		case p.isKw("MAXVALUE"):
+			p.advance()
+			p.consumePunct("=")
+			if n, ok := p.parseSignedInt(); ok {
+				s.MaxValue, s.HasMax = n, true
+			}
+		case p.isKw("NOMAXVALUE"):
+			p.advance()
+			s.NoMax = true
+		case p.isKw("NO"):
+			p.advance()
+			switch {
+			case p.isKw("MINVALUE"):
+				p.advance()
+				s.NoMin = true
+			case p.isKw("MAXVALUE"):
+				p.advance()
+				s.NoMax = true
+			case p.isKw("CYCLE"):
+				p.advance()
+				s.Cycle, s.HasCycle = false, true
+			case p.isKw("CACHE"):
+				p.advance()
+				s.NoCache = true
+			default:
+				p.errorHere("expected MINVALUE, MAXVALUE, CYCLE or CACHE after NO", "SEQUENCE_OPTION")
+				p.advance()
+			}
+		case p.isKw("CYCLE"):
+			p.advance()
+			s.Cycle, s.HasCycle = true, true
+		case p.isKw("NOCYCLE"):
+			p.advance()
+			s.Cycle, s.HasCycle = false, true
+		case p.isKw("CACHE"):
+			p.advance()
+			p.consumePunct("=")
+			if n, ok := p.parseSignedInt(); ok {
+				s.Cache, s.HasCache = n, true
+			}
+		case p.isKw("NOCACHE"):
+			p.advance()
+			s.NoCache = true
+		case p.isKw("START"):
+			// ALTER … START WITH n only changes the value a later bare
+			// RESTART goes back to; PG spells it the same way.
+			p.advance()
+			if p.isKw("WITH") {
+				p.advance()
+			}
+			p.consumePunct("=")
+			if n, ok := p.parseSignedInt(); ok {
+				s.Start, s.HasStart = n, true
+			}
+		case p.isCurWord("RESTART"):
+			p.advance()
+			s.Restart, s.HasRestart = true, true
+			if p.isKw("WITH") {
+				p.advance()
+			}
+			p.consumePunct("=")
+			if n, ok := p.parseSignedInt(); ok {
+				s.StartWith, s.HasStartWith = n, true
+			}
+		default:
+			p.errorHere("unexpected ALTER SEQUENCE option "+p.cur.Lit, "SEQUENCE_OPTION")
+			p.advance()
+		}
+	}
+	return s
+}
+
+// isCurWord reports whether the current token is the given word, whether
+// the lexer classified it as a keyword or as a plain identifier (single
+// token compare — used for option words that are not reserved).
+func (p *Parser) isCurWord(w string) bool {
+	return (p.cur.Kind == TOK_KEYWORD || p.cur.Kind == TOK_IDENT) && strings.EqualFold(p.cur.Lit, w)
 }
 
 // parseSignedInt parses an optionally-signed integer literal at the current

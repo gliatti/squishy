@@ -358,6 +358,13 @@ func planMigrationHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 		"type_mappings_summary": summarizeTypeMappings(p.TypeMappings),
 		"_pagination_hint":      "section=ddl|ddl_post|warnings|explanations|type_mappings + offset/limit. Filters: severity, kind, object, level, reason_contains.",
 	}
+	// Generated columns created plain and copied from the source: each one
+	// still needs an override (set_generated_override) or an ack.
+	if copied, err := copiedGeneratedColumns(ctx, id); err != nil {
+		summary["generated_columns_copied_plain_error"] = err.Error()
+	} else {
+		summary["generated_columns_copied_plain"] = copied
+	}
 	return mcp.NewToolResultText(formatJSON(mustJSON(summary))), nil
 }
 
@@ -448,6 +455,158 @@ func ackPrerequisitesHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	acked := req.GetStringSlice("acked", nil)
 	body := map[string]any{"acked": acked}
 	return callHandler(ctx, "POST", "/api/v1/migrations/"+id+"/prerequisites/ack", body), nil
+}
+
+// ---- generated-column overrides ----
+
+// generatedOverride mirrors translate.GeneratedOverride on the wire.
+type generatedOverride struct {
+	Table      string `json:"table"`
+	Column     string `json:"column"`
+	Expression string `json:"expression"`
+}
+
+func generatedOverridesPath(migrationID string) string {
+	return "/api/v1/migrations/" + migrationID + "/generated-overrides"
+}
+
+func listGeneratedOverridesHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	id, errRes := requireString(req, "migration_id")
+	if errRes != nil {
+		return errRes, nil
+	}
+	return callHandler(ctx, "GET", generatedOverridesPath(id), nil), nil
+}
+
+// fetchGeneratedOverrides reads the override list stored on a migration.
+func fetchGeneratedOverrides(ctx context.Context, migrationID string) ([]generatedOverride, error) {
+	raw, err := doRequest(ctx, "GET", generatedOverridesPath(migrationID), nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Overrides []generatedOverride `json:"overrides"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode generated overrides: %w", err)
+	}
+	return resp.Overrides, nil
+}
+
+// sameOverrideTarget matches the API's rule: table exact (MySQL table
+// names are case-sensitive), column case-insensitive (one identifier).
+func sameOverrideTarget(ov generatedOverride, table, column string) bool {
+	return ov.Table == table && strings.EqualFold(ov.Column, column)
+}
+
+// putGeneratedOverrides replaces the whole list. A refusal (400 with
+// PostgreSQL's error, 502 when the target is unreachable, 409 when the
+// migration is not planned) comes back verbatim as a tool error.
+func putGeneratedOverrides(ctx context.Context, migrationID string, list []generatedOverride) *mcp.CallToolResult {
+	if list == nil {
+		list = []generatedOverride{}
+	}
+	return callHandler(ctx, "PUT", generatedOverridesPath(migrationID), map[string]any{"overrides": list})
+}
+
+func setGeneratedOverrideHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	id, errRes := requireString(req, "migration_id")
+	if errRes != nil {
+		return errRes, nil
+	}
+	table, errRes := requireString(req, "table")
+	if errRes != nil {
+		return errRes, nil
+	}
+	column, errRes := requireString(req, "column")
+	if errRes != nil {
+		return errRes, nil
+	}
+	expr, errRes := requireString(req, "expression")
+	if errRes != nil {
+		return errRes, nil
+	}
+	current, err := fetchGeneratedOverrides(ctx, id)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	next := make([]generatedOverride, 0, len(current)+1)
+	replaced := false
+	for _, ov := range current {
+		if sameOverrideTarget(ov, table, column) {
+			if !replaced {
+				next = append(next, generatedOverride{Table: table, Column: column, Expression: expr})
+				replaced = true
+			}
+			continue
+		}
+		next = append(next, ov)
+	}
+	if !replaced {
+		next = append(next, generatedOverride{Table: table, Column: column, Expression: expr})
+	}
+	return putGeneratedOverrides(ctx, id, next), nil
+}
+
+func deleteGeneratedOverrideHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	id, errRes := requireString(req, "migration_id")
+	if errRes != nil {
+		return errRes, nil
+	}
+	table, errRes := requireString(req, "table")
+	if errRes != nil {
+		return errRes, nil
+	}
+	column, errRes := requireString(req, "column")
+	if errRes != nil {
+		return errRes, nil
+	}
+	current, err := fetchGeneratedOverrides(ctx, id)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	next := make([]generatedOverride, 0, len(current))
+	for _, ov := range current {
+		if !sameOverrideTarget(ov, table, column) {
+			next = append(next, ov)
+		}
+	}
+	if len(next) == len(current) {
+		return mcp.NewToolResultText(formatJSON(mustJSON(map[string]any{
+			"deleted":   false,
+			"reason":    "no override is stored for " + table + "." + column,
+			"overrides": current,
+		}))), nil
+	}
+	return putGeneratedOverrides(ctx, id, next), nil
+}
+
+// copiedGeneratedColumns lists "<table>.<column>" for every generated
+// column the migration's current plan creates as a plain column copied
+// from the source (target_plan.tables[].copied_generated).
+func copiedGeneratedColumns(ctx context.Context, migrationID string) ([]string, error) {
+	raw, err := doRequest(ctx, "GET", "/api/v1/migrations/"+migrationID, nil)
+	if err != nil {
+		return nil, err
+	}
+	var m struct {
+		TargetPlan struct {
+			Tables []struct {
+				Name            string   `json:"name"`
+				CopiedGenerated []string `json:"copied_generated"`
+			} `json:"tables"`
+		} `json:"target_plan"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, fmt.Errorf("decode migration: %w", err)
+	}
+	out := []string{}
+	for _, t := range m.TargetPlan.Tables {
+		for _, c := range t.CopiedGenerated {
+			out = append(out, t.Name+"."+c)
+		}
+	}
+	return out, nil
 }
 
 func startRunHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

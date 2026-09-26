@@ -25,6 +25,34 @@ type Options struct {
 	//
 	// Typical members: "postgis", "pg_cron", "pgcrypto", "citext", "vector".
 	TargetExtensions []string
+
+	// MariaDBRowEndMax is the value a MariaDB source stores in the ROW
+	// END column of current rows of a system-versioned table — the
+	// server's TIMESTAMP maximum, as UTC wall-clock text (e.g.
+	// "2106-02-07 06:28:15.999999"), probed by the inspector
+	// (inspect.SourceSchema.RowEndMax). The system-versioning emulation
+	// stamps the same value on rows written in PostgreSQL; when it is
+	// unknown the emulation is not attempted (warning + blocking
+	// prerequisite instead).
+	MariaDBRowEndMax string
+
+	// ParseError is the error the source dialect's Parse returned with
+	// the statements, nil when the source DDL parsed cleanly. Parser
+	// error recovery can hand back a statement whose expressions were cut
+	// short (e.g. MariaDB's `concat(v,'x') regexp 'ax'` parsed as
+	// `concat(v,'x')`, or `binary concat(v,'x')` parsed as "binary"), so
+	// every MySQL/MariaDB generated column is refused (blocking
+	// prerequisite) while it is set.
+	ParseError error
+
+	// GeneratedOverrides are the user-provided PostgreSQL generation
+	// expressions of MySQL/MariaDB generated columns, persisted on the
+	// migration (squishy.migrations.generated_overrides). A column with
+	// an override is emitted `GENERATED ALWAYS AS (<expression>) STORED`
+	// verbatim — no translation, no refusal, an info explanation — and
+	// an override that matches no source generated column is reported
+	// (table.generated_override_unused). See mysql_generated_override.go.
+	GeneratedOverrides []GeneratedOverride
 }
 
 // hasExt reports whether opt.TargetExtensions contains ext (case-insensitive).
@@ -70,6 +98,9 @@ func Translate(stmts []ast.Stmt, opt Options) *Result {
 	t.preRegisterUserTypes(stmts)
 	t.preCollectPackageVars(stmts)
 	t.preCollectTriggerTables(stmts)
+	if dialects.IsMySQLFamily(opt.SourceKind) {
+		t.mysqlSigs = collectMySQLRoutineSigs(stmts, opt.SourceKind, t.caps())
+	}
 	// emittedTypes tracks which CREATE TYPE we've already pushed into
 	// Plan.PreActions during the dependency walk, so the main-loop
 	// translateCreateType call doesn't double-emit. We pre-emit composite
@@ -147,6 +178,9 @@ func Translate(stmts []ast.Stmt, opt Options) *Result {
 		t.translateAlterTrigger(at)
 	}
 	t.harmonizeFKTypes()
+	t.resolveMySQLGeneratedConcat()
+	t.computeCopyColumns()
+	t.emitSystemVersioning()
 	t.buildDDL()
 	t.buildPrerequisites()
 	return t.res
@@ -212,6 +246,9 @@ func columnIndex(cols []PGColumn, name string) int {
 type translator struct {
 	opt Options
 	res *Result
+	// mysqlSigs holds the PG parameter types of the MySQL / MariaDB
+	// routines of the dump (see mysql_call_casts.go); nil otherwise.
+	mysqlSigs *mysqlRoutineSigs
 	// triggerTable maps a normalised (lowercase, unschema'd) trigger name
 	// to the table it was created on. Populated by translateTrigger so
 	// translateAlterTrigger can resolve `ALTER TRIGGER name ENABLE/DISABLE/
@@ -255,6 +292,66 @@ type translator struct {
 	// lookup sees a fully populated Plan.Routines, regardless of the
 	// dump's CREATE/ALTER ordering.
 	pendingAlterTriggers []*ast.AlterTrigger
+	// pendingGenConcat buffers the MySQL/MariaDB generated columns (CONCAT
+	// rewrite / text-conversion refusal). They are resolved after
+	// harmonizeFKTypes, against the final PG column types
+	// (resolveMySQLGeneratedConcat).
+	pendingGenConcat []mysqlGenPending
+	// sysverDropped maps a lower-cased table name to the lower-cased
+	// system-versioning period columns translateTable dropped from it
+	// (non-emulated MariaDB system-versioned tables), so a later
+	// ALTER TABLE ADD PRIMARY KEY / UNIQUE leaves them out too.
+	sysverDropped map[string]map[string]bool
+	// sequenceNames lists the name of every CREATE SEQUENCE the
+	// translation emits (translateSequence). A PostgreSQL sequence is a
+	// relation, so emitSystemVersioning keeps the history-table names it
+	// derives clear of them.
+	sequenceNames []string
+	// spatialCols maps a Plan.Tables index to the lower-cased names of
+	// its spatial source columns (*ast.SpatialType), which the data
+	// copier cannot transfer: computeCopyColumns leaves them out of an
+	// explicit copy list.
+	spatialCols map[int]map[string]bool
+}
+
+// markSpatialColumn records a spatial source column of the table at
+// Plan.Tables index tableIdx.
+func (t *translator) markSpatialColumn(tableIdx int, col string) {
+	if t.spatialCols == nil {
+		t.spatialCols = map[int]map[string]bool{}
+	}
+	if t.spatialCols[tableIdx] == nil {
+		t.spatialCols[tableIdx] = map[string]bool{}
+	}
+	t.spatialCols[tableIdx][strings.ToLower(col)] = true
+}
+
+// computeCopyColumns sets PGTable.CopyColumns on every table whose
+// current-table copy cannot use the source catalog's default column list
+// (every non-generated, non-spatial column): an emulated system-versioned
+// table (its ROW START / ROW END are GENERATED in the catalog) and a
+// table with refused generated columns created plain (CopiedGenerated).
+// The list is every translated column without a PG generation expression,
+// spatial source columns excluded, in source order. Other tables keep a
+// nil list. It runs after resolveMySQLGeneratedConcat (which turns the
+// refused generated columns plain) and before emitSystemVersioning (which
+// appends the history tables, copied through HistoryCopyColumns).
+func (t *translator) computeCopyColumns() {
+	for i := range t.res.Plan.Tables {
+		tbl := &t.res.Plan.Tables[i]
+		if tbl.SystemVersioning == nil && len(tbl.CopiedGenerated) == 0 {
+			continue
+		}
+		spatial := t.spatialCols[i]
+		cols := make([]string, 0, len(tbl.Columns))
+		for _, c := range tbl.Columns {
+			if c.Generated != nil || spatial[strings.ToLower(c.Name)] {
+				continue
+			}
+			cols = append(cols, c.Name)
+		}
+		tbl.CopyColumns = cols
+	}
 }
 
 type objectTypeInfo struct {
@@ -667,10 +764,34 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 	// out of the SELECT list. Keeping them in the PG DDL therefore yields
 	// NOT-NULL violations on COPY. Drop them here, and exclude them from any
 	// primary key that references them.
+	//
+	// Exception: a table whose SYSTEM_TIME period names two explicit ROW
+	// START / ROW END columns is emulated (see mariadb_temporal.go): the
+	// columns are kept, the copier transfers them, and a history table +
+	// triggers reproduce the versioning. The forms that cannot be emulated
+	// (implicit hidden columns, transaction-precise BIGINT UNSIGNED
+	// columns, unknown source ROW END sentinel — see
+	// mariadbSystemVersioning) keep the drop-and-warn path below.
+	//
+	// dropped is keyed by lower-cased column name (MySQL/MariaDB column
+	// identifiers are case-insensitive).
+	//
+	// The implicit form (hidden row_start / row_end columns) is first
+	// rewritten to the equivalent explicit declaration
+	// (withImplicitSystemTime), so it is emulated the same way. When the
+	// table cannot be emulated anyway (e.g. unknown ROW END sentinel), the
+	// declared statement is kept: hidden columns the source never listed
+	// are not reported as dropped.
+	withPeriod, implicitSysver := withImplicitSystemTime(s)
+	sv, notEmulated := mariadbSystemVersioning(withPeriod, t.opt.MariaDBRowEndMax)
+	if sv != nil {
+		s = withPeriod
+		sv.Implicit = implicitSysver
+	}
 	dropped := map[string]bool{}
 	for _, c := range s.Columns {
-		if c.SystemVersioning {
-			dropped[c.Name] = true
+		if c.SystemVersioning && sv == nil {
+			dropped[strings.ToLower(c.Name)] = true
 			t.res.Explanations = append(t.res.Explanations, Explanation{
 				Object: s.Name + "." + c.Name,
 				Source: "GENERATED ALWAYS AS ROW START|END (SYSTEM VERSIONING)",
@@ -687,6 +808,10 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 	// so the user knows the temporal semantics aren't replicated.
 	for _, pd := range s.Periods {
 		kind := "PERIOD FOR " + pd.Name
+		if strings.EqualFold(pd.Name, "SYSTEM_TIME") && sv != nil {
+			// Emulated: explained once by the SYSTEM VERSIONING block below.
+			continue
+		}
 		if strings.EqualFold(pd.Name, "SYSTEM_TIME") {
 			// Folded into the system-versioning prereq below; just record
 			// the column pair for traceability.
@@ -694,21 +819,31 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 				Object: s.Name,
 				Source: kind + " (" + pd.StartCol + ", " + pd.EndCol + ")",
 				Target: "(dropped)",
-				Reason: "PostgreSQL has no PERIOD FOR clause. The (start, end) timestamp columns are kept as plain columns; rebuild row-versioning logic via triggers or the temporal_tables extension.",
+				Reason: "PostgreSQL has no PERIOD FOR clause, and this table's system versioning is not emulated (see its table.system_versioning warning): the ROW START / ROW END columns " + pd.StartCol + " / " + pd.EndCol + " are dropped with it; rebuild row-versioning logic via triggers or the temporal_tables extension.",
 				Level:  "warn",
 			})
 		} else {
-			// Application-time period (MD-03 territory): no temporal semantics
-			// in PG. Document and move on.
+			// Application-time period. At the schema level MariaDB's
+			// PERIOD FOR <name> (s, e) is exactly two plain columns plus
+			// an implicit table CHECK named after the period
+			// (information_schema.CHECK_CONSTRAINTS lists it as
+			// `CONSTRAINT <name> CHECK (s < e)`, and an INSERT with
+			// s >= e fails with "CONSTRAINT `<name>` failed"). Replicate
+			// that constraint as a named PG CHECK built from AST nodes.
+			// The rest of the feature is DML syntax (UPDATE/DELETE …
+			// FOR PORTION OF): a migrated routine using it fails to parse
+			// and is reported on its own, application SQL is outside the
+			// migrated schema — hence an info note. A key declared
+			// `WITHOUT OVERLAPS` over the period is reported separately
+			// (see the key handling below).
+			t.periodCheck(&tbl, s.Name, pd)
 			t.res.Explanations = append(t.res.Explanations, Explanation{
 				Object: s.Name,
 				Source: kind + " (" + pd.StartCol + ", " + pd.EndCol + ")",
-				Target: "(dropped)",
-				Reason: "PostgreSQL has no application-time PERIOD FOR clause. The two columns remain as plain columns; range-overlap exclusion (and FOR PORTION OF) must be rebuilt with EXCLUDE constraints + tstzrange.",
-				Level:  "warn",
+				Target: "CONSTRAINT " + pgQuote(pd.Name) + " CHECK (" + pgQuote(pd.StartCol) + " < " + pgQuote(pd.EndCol) + ")",
+				Reason: "MariaDB application-time periods are two plain columns plus an implicit CHECK (start < end) named after the period; both are migrated. The period itself only adds DML syntax (UPDATE/DELETE … FOR PORTION OF " + pd.Name + "), which PostgreSQL does not have: application queries using it must be rewritten as explicit UPDATE/INSERT splits of the affected rows.",
+				Level:  "info",
 			})
-			t.warn(s.Name, "table.application_period",
-				"PERIOD FOR "+pd.Name+" ("+pd.StartCol+", "+pd.EndCol+") has no PG equivalent")
 		}
 	}
 
@@ -716,24 +851,46 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 	// Emit a blocking prerequisite so the user explicitly chooses a remediation
 	// path (history table + triggers, or the temporal_tables extension) before
 	// the migration silently loses temporal history.
-	if s.SystemVersioned {
+	if s.SystemVersioned && sv != nil {
+		// Emulated — the history table, triggers and the explanation are
+		// produced by emitSystemVersioning once every table is known (the
+		// history table name must not collide with a source table).
+	} else if s.SystemVersioned {
 		t.res.Explanations = append(t.res.Explanations, Explanation{
 			Object: s.Name,
 			Source: "WITH SYSTEM VERSIONING",
 			Target: "(plain table — temporal history NOT replicated)",
-			Reason: "PostgreSQL has no native system-versioning. The current row is migrated as a plain table; historical rows (the system-versioned shadow table in MariaDB) and the AS OF / FOR SYSTEM_TIME query semantics are NOT carried over.",
+			Reason: "PostgreSQL has no native system-versioning. The current row is migrated as a plain table; historical rows (the system-versioned shadow table in MariaDB) and the AS OF / FOR SYSTEM_TIME query semantics are NOT carried over. Not emulated: " + sysverNotEmulatedReason(notEmulated) + ".",
 			Level:  "warn",
 		})
 		t.warn(s.Name, "table.system_versioning",
-			"WITH SYSTEM VERSIONING has no PG equivalent — temporal history not replicated")
+			"WITH SYSTEM VERSIONING has no PG equivalent — temporal history not replicated ("+sysverNotEmulatedReason(notEmulated)+")")
+	}
+
+	if len(dropped) > 0 {
+		if t.sysverDropped == nil {
+			t.sysverDropped = map[string]map[string]bool{}
+		}
+		t.sysverDropped[strings.ToLower(s.Name)] = dropped
 	}
 
 	// Columns
 	for _, c := range s.Columns {
-		if dropped[c.Name] {
+		if dropped[strings.ToLower(c.Name)] {
 			continue
 		}
-		pgCol, expl, mappings := t.translateColumn(s.Name, c)
+		pgCol, expl, mappings := t.translateColumn(s.Name, c, s.Columns, s.Options)
+		if _, spatial := c.Type.(*ast.SpatialType); spatial {
+			// The data copier cannot transfer a spatial column: an
+			// explicit copy list must leave it out (computeCopyColumns).
+			// This table is appended to Plan.Tables right after its
+			// columns: its index is the current length.
+			t.markSpatialColumn(len(t.res.Plan.Tables), c.Name)
+		}
+		if sv != nil && (isColumn(c.Name, sv.RowStart) || isColumn(c.Name, sv.RowEnd)) {
+			// MariaDB period columns are implicitly NOT NULL.
+			pgCol.NotNull = true
+		}
 		tbl.Columns = append(tbl.Columns, pgCol)
 		t.res.Explanations = append(t.res.Explanations, expl...)
 		t.res.TypeMappings = append(t.res.TypeMappings, mappings...)
@@ -751,8 +908,19 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 				continue
 			}
 			t.warnUnsupportedConstraintState(s.Name, "PRIMARY KEY", c.Name, c.State)
+			if t.skipWithoutOverlapsKey(s.Name, "PRIMARY KEY", c.Name, c.Columns) {
+				continue
+			}
 			for _, col := range c.Columns {
-				if dropped[col.Name] {
+				if dropped[strings.ToLower(col.Name)] {
+					continue
+				}
+				if sv != nil && isColumn(col.Name, sv.RowEnd) {
+					// MariaDB appends ROW END to the primary key so a key
+					// value can repeat across versions. The PG current
+					// table holds one version per key (ROW END is the
+					// constant sentinel there); the history table carries
+					// the (key, ROW END) key instead.
 					continue
 				}
 				tbl.PK = append(tbl.PK, col.Name)
@@ -762,14 +930,21 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 				continue
 			}
 			t.warnUnsupportedConstraintState(s.Name, "UNIQUE", c.Name, c.State)
-			// Unique via index (created post-copy)
+			if t.skipWithoutOverlapsKey(s.Name, "UNIQUE", c.Name, c.Columns) {
+				continue
+			}
+			// Unique via index (created post-copy). On an emulated
+			// system-versioned table MariaDB appends ROW END to every
+			// unique key; the current table holds one version per row,
+			// so the key is enforced without it (see the PK case).
+			uqCols := withoutColumn(c.Columns, dropped, sv)
 			name := c.Name
 			if name == "" {
-				name = fmt.Sprintf("uq_%s_%s", s.Name, joinCols(c.Columns))
+				name = fmt.Sprintf("uq_%s_%s", s.Name, joinCols(uqCols))
 			}
 			t.res.Plan.Indexes = append(t.res.Plan.Indexes, PGIndex{
 				Schema: t.opt.TargetSchema, Table: s.Name, Name: name,
-				Unique: true, Columns: columnsNames(c.Columns),
+				Unique: true, Columns: columnsNames(uqCols),
 			})
 		case *ast.FKConstraint:
 			if t.dropDisabledConstraint(s.Name, "FOREIGN KEY", c.Name, c.State) {
@@ -809,7 +984,8 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 				continue
 			}
 			t.warnUnsupportedConstraintState(s.Name, "CHECK", c.Name, c.State)
-			tbl.Checks = append(tbl.Checks, rawExpr(c.Expr))
+			tbl.Checks = append(tbl.Checks, rawExpr(t.castMySQLDDLExpr("table."+s.Name, c.Expr)))
+			tbl.CheckNames = append(tbl.CheckNames, c.Name)
 			if !c.Enforced {
 				// MariaDB CHECK ... NOT ENFORCED is parsed but not actually
 				// validated. PG has no NOT ENFORCED equivalent — every CHECK
@@ -929,11 +1105,11 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 		}
 	}
 
-	// AUTO_INCREMENT table option → ALTER SEQUENCE post-copy
-	if s.Options.HasAutoInc {
-		t.res.Plan.PostActions = append(t.res.Plan.PostActions,
-			fmt.Sprintf("-- AUTO_INCREMENT=%d source; restart identity to match after data load", s.Options.AutoIncrement))
-	}
+	// AUTO_INCREMENT columns → post-copy identity restart. The copy
+	// inserts the source key values explicitly (GENERATED BY DEFAULT), so
+	// the identity sequence is still at 1 afterwards and the next INSERT
+	// that relies on it would collide with a copied row.
+	t.emitIdentityRestarts(s, tbl)
 	if s.Options.Engine != "" && !strings.EqualFold(s.Options.Engine, "InnoDB") {
 		eng := strings.ToUpper(s.Options.Engine)
 		// MariaDB-specific engines have semantics that go well beyond storage
@@ -962,7 +1138,12 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 	// MySQL/MariaDB PARTITION BY clause (structured AST) → PG declarative
 	// partitioning. Same failure semantics as Oracle below: degrade to an
 	// unpartitioned table and surface the cause as a warning.
-	if s.Partitioning != nil && !dialects.IsOracle(t.opt.SourceKind) {
+	if s.Partitioning != nil && !dialects.IsOracle(t.opt.SourceKind) && s.Partitioning.Method == "SYSTEM_TIME" {
+		// MariaDB history partitioning: storage layout of the versions,
+		// carried by the system-versioning emulation (or reported with
+		// it) — see systemTimePartitioning.
+		t.systemTimePartitioning(s, sv)
+	} else if s.Partitioning != nil && !dialects.IsOracle(t.opt.SourceKind) {
 		part, notes, err := translateMysqlPartitioning(s.Partitioning)
 		for _, n := range notes {
 			t.res.Explanations = append(t.res.Explanations, Explanation{
@@ -1113,6 +1294,17 @@ FOREIGN TABLE is in place if you don't want both.`,
 		}
 	}
 
+	if sv != nil {
+		// The history copy transfers every column of the translated
+		// table (see PGSystemVersioning.HistoryCopyColumns). The
+		// current-table list (PGTable.CopyColumns) is computed by
+		// computeCopyColumns, once resolveMySQLGeneratedConcat has
+		// turned the refused generated columns into plain ones.
+		for _, c := range tbl.Columns {
+			sv.HistoryCopyColumns = append(sv.HistoryCopyColumns, c.Name)
+		}
+	}
+	tbl.SystemVersioning = sv
 	t.res.Plan.Tables = append(t.res.Plan.Tables, tbl)
 }
 
@@ -1543,21 +1735,36 @@ func (t *translator) translateAlterTable(s *ast.AlterTable) {
 			if tblIdx < 0 {
 				continue
 			}
+			if t.skipWithoutOverlapsKey(s.Table.Name, "PRIMARY KEY", c.Name, c.Columns) {
+				continue
+			}
 			tbl := &t.res.Plan.Tables[tblIdx]
 			// Only set if not already populated (avoid duplicating an inline PK).
+			// The MariaDB system-versioning period columns are left out
+			// exactly as in translateTable: ROW END of an emulated table
+			// (the history table carries the (pk…, ROW END) key), or the
+			// period columns dropped from a non-emulated one.
 			if len(tbl.PK) == 0 {
-				for _, col := range c.Columns {
+				for _, col := range withoutColumn(c.Columns, t.sysverDropped[strings.ToLower(s.Table.Name)], tbl.SystemVersioning) {
 					tbl.PK = append(tbl.PK, col.Name)
 				}
 			}
 		case *ast.UQConstraint:
+			if t.skipWithoutOverlapsKey(s.Table.Name, "UNIQUE", c.Name, c.Columns) {
+				continue
+			}
+			uqCols := c.Columns
+			if tblIdx >= 0 {
+				// Same key-part filtering as translateTable's UNIQUE.
+				uqCols = withoutColumn(c.Columns, t.sysverDropped[strings.ToLower(s.Table.Name)], t.res.Plan.Tables[tblIdx].SystemVersioning)
+			}
 			name := c.Name
 			if name == "" {
-				name = fmt.Sprintf("uq_%s_%s", s.Table.Name, joinCols(c.Columns))
+				name = fmt.Sprintf("uq_%s_%s", s.Table.Name, joinCols(uqCols))
 			}
 			t.res.Plan.Indexes = append(t.res.Plan.Indexes, PGIndex{
 				Schema: t.opt.TargetSchema, Table: s.Table.Name, Name: name,
-				Unique: true, Columns: columnsNames(c.Columns),
+				Unique: true, Columns: columnsNames(uqCols),
 			})
 		case *ast.FKConstraint:
 			name := c.Name
@@ -1578,7 +1785,9 @@ func (t *translator) translateAlterTable(s *ast.AlterTable) {
 				continue
 			}
 			t.res.Plan.Tables[tblIdx].Checks = append(
-				t.res.Plan.Tables[tblIdx].Checks, rawExpr(c.Expr))
+				t.res.Plan.Tables[tblIdx].Checks, rawExpr(t.castMySQLDDLExpr("table."+s.Table.Name, c.Expr)))
+			t.res.Plan.Tables[tblIdx].CheckNames = append(
+				t.res.Plan.Tables[tblIdx].CheckNames, c.Name)
 			if !c.Enforced {
 				// See translateTable: NOT ENFORCED has no PG equivalent.
 				t.res.Explanations = append(t.res.Explanations, Explanation{
@@ -1593,7 +1802,7 @@ func (t *translator) translateAlterTable(s *ast.AlterTable) {
 	}
 }
 
-func (t *translator) translateColumn(tableName string, c *ast.ColumnDef) (PGColumn, []Explanation, []TypeMapping) {
+func (t *translator) translateColumn(tableName string, c *ast.ColumnDef, tableCols []*ast.ColumnDef, tableOpts ast.TableOptions) (PGColumn, []Explanation, []TypeMapping) {
 	expls := []Explanation{}
 	mappings := []TypeMapping{}
 
@@ -1681,7 +1890,12 @@ func (t *translator) translateColumn(tableName string, c *ast.ColumnDef) (PGColu
 
 	// DEFAULT translation
 	if c.HasDefault && c.Default != nil {
-		pg.Default = translateDefault(c.Default)
+		def := t.castMySQLDDLExpr(tableName+"."+c.Name, c.Default)
+		if dialects.IsMySQLFamily(t.opt.SourceKind) && pg.Type == "BOOLEAN" {
+			// TINYINT(1) / BIT(1) DEFAULT 0 → DEFAULT FALSE.
+			def = mysqlBoolDefault(def)
+		}
+		pg.Default = translateDefault(def)
 		// Oracle-specific expression rewrites (SYSDATE/SYSTIMESTAMP/NVL/…).
 		// PG parses `DEFAULT SYSDATE` as a column-reference because SYSDATE is
 		// not a PG function; we substitute these before emission.
@@ -1693,8 +1907,28 @@ func (t *translator) translateColumn(tableName string, c *ast.ColumnDef) (PGColu
 	// GENERATED
 	if c.Generated != nil {
 		stored := !c.Generated.Virtual // PG only supports STORED
-		pg.Generated = &PGGenerated{Expr: rawExpr(c.Generated.Expr), Stored: true}
-		if !stored {
+		genExpr := t.castMySQLDDLExpr(tableName+"."+c.Name, c.Generated.Expr)
+		if dialects.IsMySQLFamily(t.opt.SourceKind) {
+			// PG generation expressions must be immutable: CONCAT is
+			// either rewritten into a || chain or refused, and a text
+			// conversion PG prints differently (hex / bit literal,
+			// boolean converted or stored as text) is refused, once every
+			// column type is final (resolveMySQLGeneratedConcat). With
+			// parse errors every generated column is refused there: the
+			// recovered expression may have lost its CONCAT.
+			// translateCreateTable appends this column's table to
+			// Plan.Tables right after its columns: its index is the
+			// current length (a name lookup would confuse `u` and `U`).
+			t.pendingGenConcat = append(t.pendingGenConcat, mysqlGenPending{
+				table: tableName, tableIdx: len(t.res.Plan.Tables),
+				col: c, expr: genExpr, cols: tableCols, opts: tableOpts,
+			})
+		}
+		pg.Generated = &PGGenerated{Expr: rawExpr(genExpr), Stored: true}
+		// MySQL/MariaDB: the VIRTUAL → STORED note is emitted by
+		// resolveMySQLGeneratedConcat, only for a column that keeps a
+		// generation expression (a refused one becomes a plain column).
+		if !stored && !dialects.IsMySQLFamily(t.opt.SourceKind) {
 			expls = append(expls, Explanation{
 				Object: tableName + "." + c.Name,
 				Source: "GENERATED ... VIRTUAL",
@@ -1707,13 +1941,15 @@ func (t *translator) translateColumn(tableName string, c *ast.ColumnDef) (PGColu
 
 	// Column-level CHECK
 	check := tr.Check
+	promotedJSON := false
 	if c.Check != nil {
-		colCheck := rawExpr(c.Check)
+		colCheck := rawExpr(t.castMySQLDDLExpr(tableName+"."+c.Name, c.Check))
 		// MariaDB/MySQL's idiom for JSON columns is LONGTEXT + CHECK(JSON_VALID(col)).
 		// PG has no JSON_VALID function; the clean equivalent is a native JSONB
 		// column with no CHECK needed. Promote and drop the check.
-		if isJSONValidCheck(colCheck, c.Name) {
+		if isJSONValidCheck(c.Check, c.Name) {
 			pg.Type = "JSONB"
+			promotedJSON = true
 			expls = append(expls, Explanation{
 				Object: tableName + "." + c.Name,
 				Source: mysqlTypeRepr(c.Type) + " CHECK(JSON_VALID)",
@@ -1747,6 +1983,22 @@ func (t *translator) translateColumn(tableName string, c *ast.ColumnDef) (PGColu
 		} else if t, ok := c.Type.(*ast.TextType); ok {
 			colColl, colCharset = t.Collation, t.Charset
 		}
+	}
+	if promotedJSON && (colColl != "" || colCharset != "") {
+		// MariaDB's JSON alias is LONGTEXT CHARACTER SET utf8mb4 COLLATE
+		// utf8mb4_bin + CHECK(JSON_VALID(col)); the collation only governs
+		// byte-wise comparison of the JSON text. The column is now a
+		// native jsonb, which is not a collatable type — PG rejects
+		// `jsonb COLLATE …` ("collations are not supported by type
+		// jsonb"). jsonb compares by value, so the collation is dropped.
+		expls = append(expls, Explanation{
+			Object: tableName + "." + c.Name,
+			Source: collationSource(colColl, colCharset),
+			Target: "(none — jsonb is not collatable)",
+			Reason: "The source collation only applied to the textual JSON storage. The column was promoted to jsonb, which compares by JSON value and accepts no COLLATE clause, so the collation is dropped.",
+			Level:  "info",
+		})
+		colColl, colCharset = "", ""
 	}
 	if colColl != "" || colCharset != "" {
 		pgColl, note := mapMySQLColumnCollation(colColl, colCharset)
@@ -1825,15 +2077,16 @@ func (t *translator) translateColumn(tableName string, c *ast.ColumnDef) (PGColu
 func (t *translator) emitDefaultOnNullTrigger(tbl, col, defaultExpr string) {
 	schema := t.opt.TargetSchema
 	fnName := fmt.Sprintf("default_on_null_%s_%s", tbl, col)
-	fn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.%s() RETURNS trigger LANGUAGE plpgsql AS $$
+	body := fmt.Sprintf(`
 BEGIN
   IF NEW.%s IS NULL THEN
     NEW.%s := %s;
   END IF;
   RETURN NEW;
-END;$$;`,
-		quoteIdent(schema), quoteIdent(fnName),
-		quoteIdent(col), quoteIdent(col), defaultExpr)
+END;`, quoteIdent(col), quoteIdent(col), defaultExpr)
+	q := pgast.DollarQuote("", body)
+	fn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.%s() RETURNS trigger LANGUAGE plpgsql AS %s%s%s;`,
+		quoteIdent(schema), quoteIdent(fnName), q, body, q)
 	trgName := fmt.Sprintf("trg_default_on_null_%s_%s", tbl, col)
 	trg := fmt.Sprintf(`CREATE TRIGGER %s BEFORE INSERT OR UPDATE OF %s ON %s.%s
   FOR EACH ROW EXECUTE FUNCTION %s.%s();`,
@@ -1853,15 +2106,17 @@ END;$$;`,
 // emitOnUpdateTrigger creates a PG trigger that emulates MySQL's
 // `ON UPDATE CURRENT_TIMESTAMP` clause using the set_updated_at() helper.
 func (t *translator) emitOnUpdateTrigger(tbl, col string) {
-	fn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.set_%s_%s() RETURNS trigger LANGUAGE plpgsql AS $$
+	schema := quoteIdent(t.opt.TargetSchema)
+	fnName := quoteIdent("set_" + tbl + "_" + col)
+	fn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.%s() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   NEW.%s := now();
   RETURN NEW;
-END;$$;`, quoteIdent(t.opt.TargetSchema), tbl, col, quoteIdent(col))
-	trg := fmt.Sprintf(`CREATE TRIGGER trg_%s_%s BEFORE UPDATE ON %s.%s
-  FOR EACH ROW EXECUTE FUNCTION %s.set_%s_%s();`,
-		tbl, col, quoteIdent(t.opt.TargetSchema), quoteIdent(tbl),
-		quoteIdent(t.opt.TargetSchema), tbl, col)
+END;$$;`, schema, fnName, quoteIdent(col))
+	trg := fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON %s.%s
+  FOR EACH ROW EXECUTE FUNCTION %s.%s();`,
+		quoteIdent("trg_"+tbl+"_"+col), schema, quoteIdent(tbl),
+		schema, fnName)
 	t.res.Plan.PostActions = append(t.res.Plan.PostActions, fn, trg)
 }
 
@@ -1912,13 +2167,19 @@ func (t *translator) translateView(s *ast.CreateView) {
 			}
 		}
 	}
-	rewritten := rewriteMySQLBody(s.SelectBody)
-	// For Oracle sources, run the Oracle-specific expression rewriter over
-	// the view body too (LISTAGG → string_agg, NVL → COALESCE, SYSDATE → …).
-	// rewriteMySQLBody only knows MySQL idioms and leaves Oracle built-ins
-	// like LISTAGG verbatim, which then fail at CREATE VIEW time.
-	if dialects.IsOracle(t.opt.SourceKind) {
-		rewritten = rewriteOracleExpr(rewritten)
+	var (
+		rewritten string
+		refs      []string
+		reason    string
+		level     = "info"
+	)
+	switch {
+	case dialects.IsOracle(t.opt.SourceKind):
+		// Oracle view bodies still go through the Oracle text passes
+		// (LISTAGG → string_agg, NVL → COALESCE, SYSDATE → …) over the
+		// captured source text. Moving them onto the typed AST is a
+		// follow-up; the MySQL lexer is no longer involved here.
+		rewritten = rewriteOracleExpr(s.SelectBody)
 		// Rewrite Oracle composite-type constructor calls (`warehouse_typ(
 		// w.warehouse_id, w.warehouse_name, w.location_id)`) into the PG
 		// `ROW(...)::"mig"."<type>"` form. Without this the CREATE VIEW
@@ -1953,6 +2214,54 @@ func (t *translator) translateView(s *ast.CreateView) {
 		if hasOuterJoinPlus(rewritten) {
 			rewritten = rewriteOraclePlusOuterJoins(rewritten)
 		}
+		reason = "View body translated by the Oracle expression rewriter; review function usage."
+	case s.Select != nil:
+		// MySQL / MariaDB: the dialect parser typed the body. Rewrite
+		// the MySQL idioms on the AST (GROUP_CONCAT → string_agg,
+		// JSON_EXTRACT paths, bare JOIN → CROSS JOIN, INTERVAL, <=>, …)
+		// and render it with the PG writer.
+		sel := rewriteMySQLSelect(s.Select)
+		// Calls to the migrated stored functions: cast the arguments
+		// to the parameter types, as MySQL converts them (see
+		// mysql_call_casts.go).
+		sel, callDiags := castMySQLCallArgsInSelect(sel, t.mysqlSigs)
+		for _, d := range callDiags {
+			t.warn("view."+name, "view.call_args", d)
+		}
+		rewritten = pgast.WriteSelectStmt(sel)
+		refs = collectTableRefs(sel)
+		if refs == nil {
+			// Typed body that reads no relation: keep References
+			// non-nil so the planner trusts it instead of falling back
+			// to the text token walk.
+			refs = []string{}
+		}
+		if labels := mysqlResidualIdioms(sel); len(labels) > 0 {
+			t.warn("view."+name, "view.functions",
+				"view uses MySQL-specific functions the translator could not rewrite ("+
+					strings.Join(labels, "; ")+"); manual review required")
+		}
+		reason = "View body parsed and translated (MySQL idioms rewritten by AST passes)."
+	default:
+		// No typed body: the MySQL parser failed on it, or the source
+		// dialect (DB2) does not type view bodies. Copy the source text
+		// verbatim and say so — never pass it through silently.
+		rewritten = s.SelectBody
+		// A real parse failure is blocking; a dialect that never types
+		// view bodies (DB2 today) is surfaced as info so every DB2 view
+		// does not gate the run — the body is the source's own SQL.
+		cause := s.SelectParseError
+		sev := SeverityBlocking
+		if cause == "" {
+			cause = "no typed SELECT for source kind " + string(t.opt.SourceKind)
+			if t.opt.SourceKind != "" && !dialects.IsMySQLFamily(t.opt.SourceKind) {
+				sev = SeverityInfo
+			}
+		}
+		t.warnSev("view."+name, "view.parse",
+			"view body could not be parsed ("+cause+"); copied verbatim — manual review required", sev)
+		reason = "View body could not be parsed and is copied verbatim; manual review required."
+		level = "warn"
 	}
 	node := &pgast.CreateView{
 		Schema:      t.opt.TargetSchema,
@@ -1962,29 +2271,19 @@ func (t *translator) translateView(s *ast.CreateView) {
 		CheckOption: s.CheckOption,
 		Security:    s.SQLSecurity,
 	}
-	// The rewriter covers JSON_EXTRACT / JSON_UNQUOTE / GROUP_CONCAT structurally
-	// on simple paths. Only flag the view for manual review if any of those
-	// MySQL-specific calls survived the rewrite — that means the rewriter
-	// deemed the case too ambiguous (e.g. path uses [] or *).
-	upperRewritten := strings.ToUpper(rewritten)
-	if strings.Contains(upperRewritten, "JSON_EXTRACT(") ||
-		strings.Contains(upperRewritten, "JSON_UNQUOTE(") ||
-		strings.Contains(upperRewritten, "GROUP_CONCAT(") {
-		t.warn("view."+name, "view.functions",
-			"view uses MySQL-specific functions (JSON_EXTRACT/GROUP_CONCAT); manual review required")
-	}
 	t.res.Plan.Views = append(t.res.Plan.Views, PGView{
 		Schema: t.opt.TargetSchema, Name: name,
 		SelectBody: s.SelectBody, CheckOption: s.CheckOption,
-		Security: s.SQLSecurity,
-		DDL:      pgast.Write([]pgast.Stmt{node}),
+		Security:   s.SQLSecurity,
+		DDL:        pgast.Write([]pgast.Stmt{node}),
+		References: refs,
 	})
 	t.res.Explanations = append(t.res.Explanations, Explanation{
 		Object: "view." + name,
 		Source: "CREATE VIEW",
 		Target: "CREATE OR REPLACE VIEW",
-		Reason: "View body is copied verbatim; review function usage.",
-		Level:  "info",
+		Reason: reason,
+		Level:  level,
 	})
 }
 
@@ -2156,18 +2455,17 @@ you can copy/paste each section into the right place.`,
 	}
 
 	fnName := s.Name + "_fn"
-	retStmt := "RETURN NEW;"
-	if strings.EqualFold(s.Time, "AFTER") && strings.EqualFold(s.Event, "DELETE") {
-		retStmt = "RETURN OLD;"
-	}
+	retRow := t.triggerReturnRow(s, s.Time)
+	retStmt := triggerReturnStmt(retRow)
 
 	// Phase 3.8: thread REFERENCING aliases through to the AST visitor
 	// orchestrator so the row-alias rename happens on the parsed Idents
 	// before pgast translation. The legacy rewriteRowAlias text pass
 	// stays as a safety net during the transition window — it's a no-op
 	// when the AST visitor already substituted the names.
-	pgBody, untranslated, notes, usedAdmin := TranslateRoutineBodyExtV(
-		s.Body, t.opt.SourceKind, s.NewAlias, s.OldAlias,
+	pgBody, untranslated, notes, usedAdmin := translateRoutineBodyWithSigs(
+		s.Body, t.opt.SourceKind, s.NewAlias, s.OldAlias, "", t.mysqlSigs,
+		makeTriggerBareReturnVisitor(retRow),
 	)
 	pgBody = rewritePackageVarRefs(pgBody, t.packageVars)
 	if usedAdmin {
@@ -2212,8 +2510,20 @@ you can copy/paste each section into the right place.`,
 			forEach = "STATEMENT"
 		}
 	}
+	// FOLLOWS / PRECEDES ordering is honoured by renaming the PG trigger
+	// (see below). The name is settled here, before the CREATE TRIGGER
+	// node is built, so the rename lands in the AST instead of being
+	// patched into the emitted DDL text.
+	pgTrigName := s.Name
+	orderRename := ""
+	if s.Order == "FOLLOWS" || s.Order == "PRECEDES" {
+		if nn := autoRenameForOrder(s.Name, s.OrderRef, s.Order); nn != "" && nn != s.Name {
+			orderRename = nn
+			pgTrigName = nn
+		}
+	}
 	trg := &pgast.CreateTrigger{
-		Name:     s.Name,
+		Name:     pgTrigName,
 		Timing:   s.Time,
 		Event:    s.Event,
 		Schema:   t.opt.TargetSchema,
@@ -2223,9 +2533,10 @@ you can copy/paste each section into the right place.`,
 		WhenCond: s.WhenCond,
 	}
 	t.res.Plan.Routines = append(t.res.Plan.Routines, PGRoutine{
-		Kind: "trigger", Schema: t.opt.TargetSchema, Name: s.Name,
+		Kind: "trigger", Schema: t.opt.TargetSchema, Name: pgTrigName,
 		RawBody: s.Body,
 		DDL:     pgast.Write([]pgast.Stmt{fn, trg}),
+		Table:   tblName, FnName: fnName,
 	})
 	t.rememberTrigger(s.Name, tblName)
 	for _, u := range untranslated {
@@ -2243,15 +2554,8 @@ you can copy/paste each section into the right place.`,
 		//
 		// FOLLOWS R : this trigger must fire AFTER R. Need name > R.
 		// PRECEDES R: this trigger must fire BEFORE R. Need name < R.
-		newName := autoRenameForOrder(s.Name, s.OrderRef, s.Order)
-		if newName != "" && newName != s.Name {
-			// Patch the last-emitted PGRoutine (the one we just appended
-			// above) so the CREATE TRIGGER carries the new name.
-			if n := len(t.res.Plan.Routines); n > 0 {
-				r := &t.res.Plan.Routines[n-1]
-				r.Name = newName
-				r.DDL = strings.ReplaceAll(r.DDL, quoteIdent(s.Name), quoteIdent(newName))
-			}
+		if newName := orderRename; newName != "" {
+			// The CREATE TRIGGER node above already carries newName.
 			// The matching `ALTER TRIGGER <orig> ENABLE` that DBMS_METADATA
 			// emits separately can no longer find a trigger under the old
 			// name (we renamed it) AND the ENABLE is a no-op anyway since
@@ -2353,15 +2657,16 @@ func (t *translator) tryAutoSplitCompoundTrigger(s *ast.CreateTrigger) bool {
 	}
 	for _, sec := range sections {
 		fnName := strings.ToLower(s.Name) + "_" + sec.suffix + "_fn"
-		retStmt := "RETURN NEW;"
-		if strings.EqualFold(sec.timing, "AFTER") && strings.EqualFold(s.Event, "DELETE") {
-			retStmt = "RETURN OLD;"
-		}
-		pgBody, untranslated, notes, usedAdmin := TranslateRoutineBodyExt(sec.body, t.opt.SourceKind)
+		retRow := t.triggerReturnRow(s, sec.timing)
+		retStmt := triggerReturnStmt(retRow)
+		pgBody, untranslated, notes, usedAdmin := translateRoutineBodyWithSigs(
+			sec.body, t.opt.SourceKind, "", "", "", t.mysqlSigs,
+			makeTriggerBareReturnVisitor(retRow),
+		)
 		pgBody = rewritePackageVarRefs(pgBody, t.packageVars)
-	if usedAdmin {
-		t.usedAdminpack = true
-	}
+		if usedAdmin {
+			t.usedAdminpack = true
+		}
 		body := wrapTriggerBody(pgBody, retStmt)
 
 		fn := &pgast.CreateFunction{
@@ -2388,6 +2693,7 @@ func (t *translator) tryAutoSplitCompoundTrigger(s *ast.CreateTrigger) bool {
 			Kind: "trigger", Schema: t.opt.TargetSchema, Name: trgName,
 			RawBody: sec.body,
 			DDL:     pgast.Write([]pgast.Stmt{fn, trg}),
+			Table:   tblName, FnName: fnName,
 		})
 		for _, u := range untranslated {
 			t.warn("trigger."+s.Name+"."+sec.suffix, "routine.untranslated_construct", u)
@@ -2655,18 +2961,10 @@ func rewriteRowAlias(body, from, to string) string {
 
 // wrapTriggerBody ensures the translated PL/pgSQL is a proper BEGIN ... END
 // block and has a trailing RETURN statement (PG trigger functions must
-// return NEW or OLD).
+// return NEW or OLD). Early bare `RETURN;` statements are not handled
+// here: makeTriggerBareReturnVisitor already replaced them on the parsed
+// AST (translateRoutineBodyWithSigs) before the body was rendered.
 func wrapTriggerBody(pgBody, retStmt string) string {
-	// Oracle accepts bare `RETURN;` inside a trigger body as an early
-	// exit. PG's plpgsql refuses RETURN-without-expression in a function
-	// returning `trigger` ("missing expression at or near ';'"). Promote
-	// every bare RETURN to the trigger's natural return value (NEW for
-	// INSERT/UPDATE/AFTER triggers, OLD for BEFORE DELETE) so the
-	// auto-translated routine compiles. retStmt is the suffix the wrapper
-	// appends — reuse the same expression for any inline early-return.
-	if retExpr := strings.TrimSuffix(strings.TrimSpace(retStmt), ";"); retExpr != "" {
-		pgBody = rewriteBareReturn(pgBody, retExpr)
-	}
 	trimmed := strings.TrimSpace(pgBody)
 	// If the body is a naked single statement (no BEGIN), wrap it.
 	upper := strings.ToUpper(trimmed)
@@ -2682,65 +2980,6 @@ func wrapTriggerBody(pgBody, retStmt string) string {
 		return fmt.Sprintf("%s\n  %s\nEND;", inner, retStmt)
 	}
 	return fmt.Sprintf("%s\n  %s", trimmed, retStmt)
-}
-
-// rewriteBareReturn replaces `RETURN;` (and `RETURN ;`) tokens at statement
-// boundaries with `<retExpr>;` so an Oracle early-exit `return;` inside a
-// trigger body becomes a valid PG `RETURN NEW;` (or RETURN OLD; depending
-// on the trigger event). String literals are skipped so identifiers
-// containing `RETURN` inside a string are left alone.
-func rewriteBareReturn(s, retExpr string) string {
-	upper := strings.ToUpper(s)
-	var out strings.Builder
-	out.Grow(len(s) + 8)
-	i := 0
-	inStr := false
-	for i < len(s) {
-		c := s[i]
-		if inStr {
-			out.WriteByte(c)
-			if c == '\'' {
-				if i+1 < len(s) && s[i+1] == '\'' {
-					out.WriteByte(s[i+1])
-				i += 2
-				continue
-				}
-				inStr = false
-			}
-			i++
-			continue
-		}
-		if c == '\'' {
-			out.WriteByte(c)
-			inStr = true
-			i++
-			continue
-		}
-		// Match RETURN at a word boundary, followed by optional whitespace
-		// and a `;` — the bare-return form to rewrite. Anything else
-		// (RETURN expr; / RETURN INTO / RETURN QUERY ...) is left as-is.
-		if i+6 <= len(upper) && upper[i:i+6] == "RETURN" {
-			leftOK := i == 0 || !isIdentByte(s[i-1])
-			j := i + 6
-			rightOK := j == len(s) || !isIdentByte(s[j])
-			if leftOK && rightOK {
-				k := j
-				for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
-					k++
-				}
-				if k < len(s) && s[k] == ';' {
-					out.WriteString("RETURN ")
-					out.WriteString(retExpr)
-					out.WriteByte(';')
-					i = k + 1
-					continue
-				}
-			}
-		}
-		out.WriteByte(c)
-		i++
-	}
-	return out.String()
 }
 
 // findTrailingEnd returns the byte offset of the trailing `END[;]` keyword in
@@ -2777,7 +3016,7 @@ func findTrailingEnd(s string) int {
 
 func (t *translator) translateProcedure(s *ast.CreateProcedure) {
 	sig := pgProcSignature(s.Params, false, t.caps(), t.opt.SourceKind)
-	pgBody, untranslated, notes, usedAdmin := TranslateRoutineBodyExtVS(s.Body, t.opt.SourceKind, "", "", t.opt.TargetSchema)
+	pgBody, untranslated, notes, usedAdmin := translateRoutineBodyWithSigs(s.Body, t.opt.SourceKind, "", "", t.opt.TargetSchema, t.mysqlSigs, nil)
 	pgBody = rewritePackageVarRefs(pgBody, t.packageVars)
 	if usedAdmin {
 		t.usedAdminpack = true
@@ -2830,7 +3069,7 @@ func (t *translator) translateFunction(s *ast.CreateFunction) {
 	case s.Characteristics.Deterministic && s.Characteristics.SQLDataAccess == "":
 		vol = "IMMUTABLE"
 	}
-	pgBody, untranslated, notes, usedAdmin := TranslateRoutineBodyExtVS(s.Body, t.opt.SourceKind, "", "", t.opt.TargetSchema)
+	pgBody, untranslated, notes, usedAdmin := translateRoutineBodyWithSigs(s.Body, t.opt.SourceKind, "", "", t.opt.TargetSchema, t.mysqlSigs, nil)
 	pgBody = rewritePackageVarRefs(pgBody, t.packageVars)
 	if usedAdmin {
 		t.usedAdminpack = true
@@ -2870,13 +3109,17 @@ func (t *translator) translateEvent(s *ast.CreateEvent) {
 	var snippet string
 	switch s.ScheduleKind {
 	case "EVERY":
-		snippet = fmt.Sprintf("SELECT cron.schedule('%s', '%s', $$ %s $$);",
-			s.Name, cronExpr, strings.TrimSpace(s.Body))
+		body := " " + strings.TrimSpace(s.Body) + " "
+		q := pgast.DollarQuote("", body)
+		snippet = fmt.Sprintf("SELECT cron.schedule(%s, %s, %s%s%s);",
+			sqlString(s.Name), sqlString(cronExpr), q, body, q)
 	case "AT":
 		// one-shot: schedule now() + small delay as-is — pg_cron doesn't
 		// natively support one-shot; user should adjust.
-		snippet = fmt.Sprintf("-- one-shot MySQL EVENT %s AT %s\nSELECT cron.schedule('%s', '<cron expr>', $$ %s $$);",
-			s.Name, s.At, s.Name, strings.TrimSpace(s.Body))
+		body := " " + strings.TrimSpace(s.Body) + " "
+		q := pgast.DollarQuote("", body)
+		snippet = fmt.Sprintf("-- one-shot MySQL EVENT %s AT %s\nSELECT cron.schedule(%s, '<cron expr>', %s%s%s);",
+			s.Name, s.At, sqlString(s.Name), q, body, q)
 	}
 
 	if t.caps().HasPgCron && s.ScheduleKind == "EVERY" {
@@ -2900,21 +3143,40 @@ func (t *translator) translateEvent(s *ast.CreateEvent) {
 	// time, derives the cron expression from it, schedules the job, and the
 	// job's body unschedules itself after the first fire.
 	if t.caps().HasPgCron && s.ScheduleKind == "AT" {
-		atExpr := rewriteMySQLInterval(s.At)
+		// The AT expression is typed by the MySQL parser; rewrite its
+		// idioms (CURRENT_TIMESTAMP, INTERVAL n UNIT, DATE_ADD, …) on
+		// the AST and render it with the PG writer. An expression the
+		// parser could not type is copied verbatim and flagged.
+		var atExpr string
+		if s.AtExpr != nil {
+			at, callDiags := castMySQLCallArgsInExpr(rewriteMySQLExpr(s.AtExpr), t.mysqlSigs)
+			for _, d := range callDiags {
+				t.warn("event."+s.Name, "event.call_args", d)
+			}
+			atExpr = pgast.WriteExpr(at)
+		} else {
+			atExpr = s.At
+			t.warn("event."+s.Name, "event.at",
+				"ON SCHEDULE AT expression could not be parsed; copied verbatim")
+		}
 		body := strings.TrimSpace(s.Body)
 		if body == "" {
 			body = "-- empty body"
 		}
-		selfScheduling := fmt.Sprintf(`DO $do$
+		job := fmt.Sprintf(" %s; PERFORM cron.unschedule(%s); ", body, sqlString(s.Name))
+		jq := pgast.DollarQuote("job", job)
+		do := fmt.Sprintf(`
 DECLARE
   fire_at   TIMESTAMPTZ := %s;
   cron_expr TEXT := to_char(fire_at AT TIME ZONE 'UTC',
                             'MI FMHH24 FMDD FMMM') || ' *';
 BEGIN
   PERFORM cron.schedule(%s, cron_expr,
-    $job$ %s; PERFORM cron.unschedule(%s); $job$);
+    %s%s%s);
 END
-$do$;`, atExpr, sqlString(s.Name), body, sqlString(s.Name))
+`, atExpr, sqlString(s.Name), jq, job, jq)
+		dq := pgast.DollarQuote("do", do)
+		selfScheduling := "DO " + dq + do + dq + ";"
 
 		t.res.Plan.Events = append(t.res.Plan.Events, PGEvent{
 			Name: s.Name, PgCron: selfScheduling, Comment: s.Comment,
@@ -3031,6 +3293,7 @@ func (t *translator) translateSequence(s *ast.CreateSequence) {
 	}
 	b.WriteString(";")
 	t.res.Plan.PreActions = append(t.res.Plan.PreActions, b.String())
+	t.sequenceNames = append(t.sequenceNames, s.Name)
 
 	t.res.Explanations = append(t.res.Explanations, Explanation{
 		Object: "sequence." + s.Name,
@@ -3059,7 +3322,10 @@ func (t *translator) translateSequence(s *ast.CreateSequence) {
 // SEQUENCE accepts START only at CREATE time.
 func (t *translator) translateAlterSequence(s *ast.AlterSequence) {
 	schema := s.Schema
-	if schema == "" {
+	if schema == "" || !dialects.IsOracle(t.opt.SourceKind) {
+		// Non-Oracle sources: like translateSequence, the sequence always
+		// lives in the target schema — a source database qualifier
+		// (MariaDB `db`.`seq`) names no PG schema.
 		schema = t.opt.TargetSchema
 	}
 	if dialects.IsOracle(t.opt.SourceKind) {
@@ -3093,6 +3359,10 @@ func (t *translator) translateAlterSequence(s *ast.AlterSequence) {
 		wrote++
 	case s.HasMax:
 		fmt.Fprintf(&b, " MAXVALUE %d", s.MaxValue)
+		wrote++
+	}
+	if s.HasStart {
+		fmt.Fprintf(&b, " START WITH %d", s.Start)
 		wrote++
 	}
 	if s.HasRestart {
@@ -3445,7 +3715,7 @@ func emitAlterTriggerRuntimeFallback(s *ast.AlterTrigger, name, _targetSchema st
 	default:
 		return ""
 	}
-	return "DO $$\n" +
+	body := "\n" +
 		"DECLARE r record;\n" +
 		"BEGIN\n" +
 		"  SELECT n.nspname AS schema, c.relname AS tbl\n" +
@@ -3460,7 +3730,9 @@ func emitAlterTriggerRuntimeFallback(s *ast.AlterTrigger, name, _targetSchema st
 		"    RETURN;\n" +
 		"  END IF;\n" +
 		"  " + execStmt + "\n" +
-		"END $$;\n"
+		"END "
+	q := pgast.DollarQuote("", body)
+	return "DO " + q + body + q + ";\n"
 }
 
 // alterTriggerHint produces a PG-syntax template for the manual-review
@@ -3802,19 +4074,20 @@ func (t *translator) translateCreateTypeBody(s *ast.CreateTypeBody) {
 		t.usedAdminpack = true
 	}
 		body := wrapProcedureBody(pgBody)
+		q := pgast.DollarQuote("", "\n"+body+"\n")
 
 		var ddl string
 		if returns != "" {
 			ddl = fmt.Sprintf(
-				"CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s LANGUAGE plpgsql AS $$\n%s\n$$;",
+				"CREATE OR REPLACE FUNCTION %s.%s(%s) RETURNS %s LANGUAGE plpgsql AS %s\n%s\n%s;",
 				quoteIdent(schema), quoteIdent(fnName),
-				strings.Join(paramParts, ", "), returns, body,
+				strings.Join(paramParts, ", "), returns, q, body, q,
 			)
 		} else {
 			ddl = fmt.Sprintf(
-				"CREATE OR REPLACE PROCEDURE %s.%s(%s) LANGUAGE plpgsql AS $$\n%s\n$$;",
+				"CREATE OR REPLACE PROCEDURE %s.%s(%s) LANGUAGE plpgsql AS %s\n%s\n%s;",
 				quoteIdent(schema), quoteIdent(fnName),
-				strings.Join(paramParts, ", "), body,
+				strings.Join(paramParts, ", "), q, body, q,
 			)
 		}
 		t.res.Plan.Routines = append(t.res.Plan.Routines, PGRoutine{
@@ -4326,7 +4599,7 @@ func (t *translator) buildDDL() {
 	for _, tbl := range t.res.Plan.Tables {
 		ct := &pgast.CreateTable{
 			Schema: tbl.Schema, Name: tbl.Name,
-			PrimaryKey: tbl.PK, Checks: tbl.Checks,
+			PrimaryKey: tbl.PK, Checks: tbl.Checks, CheckNames: tbl.CheckNames,
 		}
 		for _, c := range tbl.Columns {
 			col := pgast.ColumnDef{
@@ -4533,6 +4806,171 @@ func (t *translator) buildDDL() {
 
 	t.res.DDLScript = "-- Generated by squishy.\n" + pgast.Write(pre)
 	t.res.DDLPostCopy = pgast.Write(post)
+}
+
+// emitIdentityRestarts appends, for every AUTO_INCREMENT column of s that
+// became a PG identity column in tbl, a post-copy statement moving the
+// identity sequence past both the copied data and the source's
+// AUTO_INCREMENT counter (the table option, the next value MySQL would
+// have handed out — it can exceed max(col)+1 after deletes or a
+// rolled-back insert):
+//
+//	SELECT setval(pg_get_serial_sequence('"s"."t"', 'c'),
+//	  GREATEST(<AUTO_INCREMENT>, COALESCE((SELECT max("c")::bigint FROM "s"."t"), 0) + 1), false);
+//
+// is_called=false makes the next nextval() return exactly that value.
+// pg_get_serial_sequence parses its first argument as a (quoted)
+// relation name and takes the second as a literal column name, so both
+// keep their case. Post-actions run in the create_fk step, i.e. after
+// every copy_table step. The NUMERIC(20,0) + explicit-sequence path of
+// translateColumn emits its own setval and is not an identity column.
+func (t *translator) emitIdentityRestarts(s *ast.CreateTable, tbl PGTable) {
+	autoInc := map[string]bool{}
+	for _, c := range s.Columns {
+		if c.AutoInc {
+			autoInc[c.Name] = true
+		}
+	}
+	if len(autoInc) == 0 {
+		return
+	}
+	floor := int64(1)
+	if s.Options.HasAutoInc && int64(s.Options.AutoIncrement) > floor {
+		floor = int64(s.Options.AutoIncrement)
+	}
+	rel := quoteIdent(tbl.Schema) + "." + quoteIdent(tbl.Name)
+	for _, c := range tbl.Columns {
+		if !c.Identity || !autoInc[c.Name] {
+			continue
+		}
+		t.res.Plan.PostActions = append(t.res.Plan.PostActions,
+			fmt.Sprintf("SELECT setval(pg_get_serial_sequence(%s, %s), GREATEST(%d, COALESCE((SELECT max(%s)::bigint FROM %s), 0) + 1), false);",
+				sqlStringLit(rel), sqlStringLit(c.Name), floor, quoteIdent(c.Name), rel))
+	}
+}
+
+// sqlStringLit renders a single scalar value (an identifier or a quoted
+// relation name built by quoteIdent) as a PG string literal, doubling
+// every single quote.
+func sqlStringLit(v string) string {
+	out := make([]rune, 0, len(v)+2)
+	out = append(out, '\'')
+	for _, r := range v {
+		if r == '\'' {
+			out = append(out, '\'')
+		}
+		out = append(out, r)
+	}
+	out = append(out, '\'')
+	return string(out)
+}
+
+// castMySQLDDLExpr applies the call-argument casts of mysql_call_casts.go
+// to a MySQL / MariaDB table-level expression (CHECK, DEFAULT, generated
+// column) before it is rendered. MySQL and MariaDB reject stored
+// functions in these expressions, so a dump accepted by the source
+// should never carry one; the pass keeps the conversion uniform with the
+// other paths and reports a call it cannot convert instead of passing it
+// silently. No-op for other source kinds (mysqlSigs is nil).
+func (t *translator) castMySQLDDLExpr(obj string, e ast.Expr) ast.Expr {
+	if t.mysqlSigs == nil || e == nil {
+		return e
+	}
+	out, diags := castMySQLCallArgsInExpr(e, t.mysqlSigs)
+	for _, d := range diags {
+		t.warn(obj, "table.call_args", d)
+	}
+	return out
+}
+
+// triggerDMLEvents returns the typed DML event list of a trigger
+// (ast.CreateTrigger.Events, filled by the MySQL / MariaDB parser). A
+// trigger built without it (the other dialect parsers, or a hand-made
+// AST) falls back to its single Event keyword; a joined multi-event
+// display string is never split.
+func triggerDMLEvents(s *ast.CreateTrigger) []string {
+	if s == nil {
+		return nil
+	}
+	if len(s.Events) > 0 {
+		return s.Events
+	}
+	if s.Event != "" {
+		return []string{s.Event}
+	}
+	return nil
+}
+
+// triggerReturnRow returns the trigger record ("NEW" or "OLD") the PG
+// trigger function of s returns, for a trigger (or compound-trigger
+// section) firing at timing.
+//
+// MySQL / MariaDB (mysqlTriggerReturnRow): decided by the event only.
+//
+// Oracle / DB2: the historical rule is kept unchanged in this change —
+// OLD only for an AFTER trigger whose event is DELETE, NEW otherwise
+// (display Event keyword, as before). Known gap, left to the Oracle /
+// DB2 work: a BEFORE DELETE … FOR EACH ROW trigger (or compound BEFORE
+// EACH ROW section) returns NEW, which is NULL on DELETE, so PG skips
+// every deleted row.
+func (t *translator) triggerReturnRow(s *ast.CreateTrigger, timing string) string {
+	if dialects.IsMySQLFamily(t.opt.SourceKind) {
+		return mysqlTriggerReturnRow(triggerDMLEvents(s))
+	}
+	if strings.EqualFold(timing, "AFTER") && strings.EqualFold(s.Event, "DELETE") {
+		return "OLD"
+	}
+	return "NEW"
+}
+
+// mysqlTriggerReturnRow returns the trigger record a MySQL / MariaDB
+// trigger returns, from its typed DML event list (ast.CreateTrigger.Events
+// — a MySQL / MariaDB trigger has exactly one event).
+//
+// In a DELETE trigger NEW is NULL, and a BEFORE ROW trigger function that
+// returns NULL makes PG silently skip the operation for that row: a
+// `BEFORE DELETE … FOR EACH ROW` translated with `RETURN NEW;` would turn
+// every DELETE on the table into a no-op. So a trigger whose only event
+// is DELETE returns OLD, every other one returns NEW. PG ignores the
+// value returned by AFTER and statement-level triggers, so the same rule
+// is safe whatever the timing.
+func mysqlTriggerReturnRow(events []string) string {
+	if len(events) == 1 && strings.EqualFold(events[0], "DELETE") {
+		return "OLD"
+	}
+	return "NEW"
+}
+
+// triggerReturnNode returns `RETURN <row>;` (row is "NEW" or "OLD", see
+// triggerReturnRow) as a typed PL AST node positioned at p. Every call
+// builds a fresh node, so a substituted statement never aliases another
+// one.
+func triggerReturnNode(row string, p ast.Position) ast.PLStmt {
+	return &ast.ReturnStmt{Expr: &ast.Ident{Parts: []string{row}, P: p}, P: p}
+}
+
+// triggerReturnStmt renders triggerReturnNode through the PG PL writer:
+// the statement the trigger wrapper appends after the translated body.
+func triggerReturnStmt(row string) string {
+	return strings.TrimSpace(pgast.WritePLStmt(triggerReturnNode(row, ast.Position{})))
+}
+
+// makeTriggerBareReturnVisitor returns the ast.Rewriter that turns every
+// bare early-exit `RETURN;` (ReturnStmt with no expression) of a parsed
+// trigger body into the trigger's own return statement
+// (triggerReturnNode with the same row as the closing RETURN). Oracle
+// accepts a bare RETURN in a trigger body as "leave the trigger now";
+// PL/pgSQL rejects it in a function returning `trigger`. The
+// substitution happens on the typed AST before the PG writer runs, so
+// the rendered body is never re-scanned.
+func makeTriggerBareReturnVisitor(row string) ast.Rewriter {
+	return func(n ast.Node) ast.Node {
+		r, ok := n.(*ast.ReturnStmt)
+		if !ok || r.Expr != nil {
+			return n
+		}
+		return triggerReturnNode(row, r.P)
+	}
 }
 
 // pgQuote quotes an identifier exactly like dialects/postgres writer does.
@@ -4812,9 +5250,16 @@ func rawExpr(e ast.Expr) string {
 		return x.Text
 	case *ast.Ident:
 		parts := make([]string, 0, len(x.Parts))
-		for _, p := range x.Parts {
+		for i, p := range x.Parts {
 			if p == "*" {
 				parts = append(parts, "*")
+				continue
+			}
+			if i == 0 && !x.Backtick && isPGTriggerVarName(p) {
+				// PL/pgSQL trigger variable built by a translation pass
+				// (see triggerReturnNode): quoting it would turn the
+				// NEW / OLD record or TG_OP into a column lookup.
+				parts = append(parts, p)
 				continue
 			}
 			parts = append(parts, quoteIdent(p))
@@ -4875,11 +5320,21 @@ func rawExpr(e ast.Expr) string {
 	case *ast.ParenExpr:
 		return "(" + rawExpr(x.Inner) + ")"
 	case *ast.FuncCall:
+		if strings.EqualFold(x.Name, "GROUP_CONCAT") {
+			return rawGroupConcat(x)
+		}
 		args := make([]string, 0, len(x.Args))
 		for _, a := range x.Args {
 			args = append(args, rawExpr(a))
 		}
 		name := mapFunction(x.Name)
+		if x.Distinct || len(x.AggOrderBy) > 0 || x.AggSeparator != nil {
+			// Aggregate modifiers (MySQL aggregateWindowedFunction):
+			// `NAME(DISTINCT a ORDER BY x)` is also valid PG. A SEPARATOR
+			// outside GROUP_CONCAT has no PG meaning; it is kept verbatim
+			// so PG rejects it loudly instead of it being dropped.
+			return name + "(" + rawAggArgs(x.Distinct, strings.Join(args, ", "), x.AggOrderBy, x.AggSeparator, true) + ")"
+		}
 		// Oracle niladic pseudocolumns: render WITHOUT trailing parens.
 		// `rewriteOracleExpr` later rewrites SYSDATE → CURRENT_TIMESTAMP::
 		// timestamp(0); appending `()` would leave `…(0)()` (a syntax error
@@ -4890,7 +5345,7 @@ func rawExpr(e ast.Expr) string {
 		if len(args) == 0 {
 			switch strings.ToUpper(x.Name) {
 			case "SYSDATE", "SYSTIMESTAMP", "CURRENT_TIMESTAMP", "CURRENT_DATE",
-				"LOCALTIMESTAMP", "UID", "ROWNUM", "LEVEL":
+				"CURRENT_TIME", "LOCALTIMESTAMP", "UID", "ROWNUM", "LEVEL":
 				return name
 			}
 		}
@@ -4969,6 +5424,9 @@ func rawExpr(e ast.Expr) string {
 		// warning at parse time.
 		return rawExpr(x.Inner)
 	case *ast.IntervalLit:
+		if x.Expr != nil && x.Value == "" {
+			return rawIntervalExpr(x)
+		}
 		val := x.Value
 		if !strings.HasPrefix(val, "'") {
 			val = "'" + val + "'"
@@ -4980,6 +5438,10 @@ func rawExpr(e ast.Expr) string {
 	case *ast.CastExpr:
 		typ := ""
 		if x.Type != nil {
+			// A cast target synthesised by a translation pass is an
+			// *ast.PGType, which MapType returns verbatim; a source
+			// type (including a UserDefinedType named like a PG
+			// built-in) is mapped.
 			typ = MapType(dialectKindFromCtx(), x.Type, "", Caps{}).PG
 		}
 		if typ == "" {
@@ -4990,6 +5452,20 @@ func rawExpr(e ast.Expr) string {
 		return x.Text
 	}
 	return ""
+}
+
+// isPGTriggerVarName reports whether p is one of the PL/pgSQL trigger
+// special variables spelled in its canonical upper case. Only nodes
+// synthesised by translation passes carry that exact spelling in an
+// unquoted Ident: the Oracle case-fold pass lowercases every unquoted
+// source identifier, and a quoted source identifier sets Backtick.
+func isPGTriggerVarName(p string) bool {
+	switch p {
+	case "NEW", "OLD", "TG_OP", "TG_NAME", "TG_WHEN", "TG_LEVEL",
+		"TG_RELID", "TG_TABLE_NAME", "TG_TABLE_SCHEMA", "TG_NARGS", "TG_ARGV":
+		return true
+	}
+	return false
 }
 
 // isWordOp reports whether op is a word-shaped unary operator that needs a
@@ -5008,6 +5484,94 @@ func isWordOp(op string) bool {
 // which is the only case CAST is currently emitted on.
 func dialectKindFromCtx() dialects.Kind {
 	return dialects.KindPostgres
+}
+
+// rawIntervalExpr renders a MySQL `INTERVAL <expr> <unit>` whose value is
+// a computed expression (grammar: intervalExpr — INTERVAL expression
+// intervalType), e.g. `INTERVAL (n + 1) DAY`. PG interval literals only
+// take a constant string, so a single-field unit becomes a scaled unit
+// interval: `((n + 1) * INTERVAL '1 day')`. Compound units (HOUR_MINUTE,
+// YEAR_MONTH, …) take a formatted string in MySQL and have no scalar PG
+// form: they are emitted as `INTERVAL (<expr>) <UNIT>`, which PG rejects
+// loudly instead of silently producing a wrong interval.
+func rawIntervalExpr(x *ast.IntervalLit) string {
+	val := rawExpr(x.Expr)
+	unit := ""
+	switch strings.ToUpper(x.Unit) {
+	case "MICROSECOND", "MICROSECONDS":
+		unit = "1 microsecond"
+	case "SECOND", "SECONDS":
+		unit = "1 second"
+	case "MINUTE", "MINUTES":
+		unit = "1 minute"
+	case "HOUR", "HOURS":
+		unit = "1 hour"
+	case "DAY", "DAYS":
+		unit = "1 day"
+	case "WEEK", "WEEKS":
+		unit = "1 week"
+	case "MONTH", "MONTHS":
+		unit = "1 month"
+	case "QUARTER", "QUARTERS":
+		unit = "3 months"
+	case "YEAR", "YEARS":
+		unit = "1 year"
+	}
+	if unit == "" {
+		return "INTERVAL (" + val + ") " + x.Unit
+	}
+	return "((" + val + ") * INTERVAL '" + unit + "')"
+}
+
+// rawGroupConcat renders MySQL GROUP_CONCAT from its typed FuncCall fields
+// (grammar: aggregateWindowedFunction — GROUP_CONCAT '(' [DISTINCT]
+// functionArgs [ORDER BY …] [SEPARATOR 'x'] ')') as PG string_agg:
+//
+//	GROUP_CONCAT([DISTINCT] a [, b…] [ORDER BY o] [SEPARATOR 's'])
+//	→ string_agg([DISTINCT] (a)::text [|| (b)::text…], 's' [ORDER BY o])
+//
+// The separator defaults to ',' (MySQL's default). Several arguments are
+// concatenated with `||`, which yields NULL when any part is NULL — the
+// row is then skipped by string_agg, exactly like MySQL skips rows where
+// any GROUP_CONCAT argument is NULL. DISTINCT combined with an ORDER BY
+// on something other than the aggregated text is rejected by PG ("ORDER
+// BY expressions must appear in argument list"): that surfaces loudly
+// rather than silently reordering.
+func rawGroupConcat(x *ast.FuncCall) string {
+	parts := make([]string, 0, len(x.Args))
+	for _, a := range x.Args {
+		parts = append(parts, "("+rawExpr(a)+")::text")
+	}
+	value := strings.Join(parts, " || ")
+	sep := sqlString(",")
+	if x.AggSeparator != nil {
+		sep = rawExpr(x.AggSeparator)
+	}
+	return "string_agg(" + rawAggArgs(x.Distinct, value+", "+sep, x.AggOrderBy, nil, false) + ")"
+}
+
+// rawAggArgs renders the inside of an aggregate call's parens: an optional
+// DISTINCT, the argument list, an optional ORDER BY and (when keepSep is
+// set) a verbatim SEPARATOR clause.
+func rawAggArgs(distinct bool, args string, orderBy []ast.OrderItem, sep ast.Expr, keepSep bool) string {
+	var b strings.Builder
+	if distinct {
+		b.WriteString("DISTINCT ")
+	}
+	b.WriteString(args)
+	if len(orderBy) > 0 {
+		items := make([]string, len(orderBy))
+		for i, oi := range orderBy {
+			items[i] = renderOrderItem(oi)
+		}
+		b.WriteString(" ORDER BY ")
+		b.WriteString(strings.Join(items, ", "))
+	}
+	if keepSep && sep != nil {
+		b.WriteString(" SEPARATOR ")
+		b.WriteString(rawExpr(sep))
+	}
+	return b.String()
 }
 
 // renderOrderItem renders one ast.OrderItem as PG-flavoured ORDER BY text.
@@ -5084,28 +5648,34 @@ func sqlString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-// isJSONValidCheck reports whether the given CHECK expression text is the
-// MariaDB/MySQL idiom `JSON_VALID(col)` (case-insensitive, backtick- or
-// double-quote-quoted column ref accepted). Used to detect the legacy
-// LONGTEXT-backed JSON column pattern and promote it to native PG JSONB.
-func isJSONValidCheck(expr, col string) bool {
-	s := strings.TrimSpace(expr)
-	for strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
-		s = strings.TrimSpace(s[1 : len(s)-1])
-	}
-	upper := strings.ToUpper(s)
-	if !strings.HasPrefix(upper, "JSON_VALID(") || !strings.HasSuffix(s, ")") {
+// isJSONValidCheck reports whether the typed CHECK expression is the
+// MariaDB/MySQL idiom `JSON_VALID(col)`: function name case-insensitive,
+// redundant parentheses and backtick/double-quote quoting accepted (the
+// parser already resolved both into ParenExpr / Ident nodes). Used to
+// detect the legacy LONGTEXT-backed JSON column pattern and promote it to
+// native PG JSONB. Pure AST match: no expression text is inspected.
+func isJSONValidCheck(e ast.Expr, col string) bool {
+	e = unwrapParens(e)
+	fc, ok := e.(*ast.FuncCall)
+	if !ok || !strings.EqualFold(fc.Name, "JSON_VALID") || len(fc.Args) != 1 {
 		return false
 	}
-	inner := strings.TrimSpace(s[len("JSON_VALID(") : len(s)-1])
-	// strip wrapping quotes around the identifier
-	for _, q := range []byte{'`', '"'} {
-		if len(inner) >= 2 && inner[0] == q && inner[len(inner)-1] == q {
-			inner = inner[1 : len(inner)-1]
-			break
-		}
+	id, ok := unwrapParens(fc.Args[0]).(*ast.Ident)
+	if !ok || len(id.Parts) != 1 {
+		return false
 	}
-	return strings.EqualFold(inner, col)
+	return strings.EqualFold(id.Parts[0], col)
+}
+
+// unwrapParens strips any number of redundant ParenExpr layers.
+func unwrapParens(e ast.Expr) ast.Expr {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok || p.Inner == nil {
+			return e
+		}
+		e = p.Inner
+	}
 }
 
 func indent(s, prefix string) string {

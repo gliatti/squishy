@@ -44,9 +44,26 @@ func WriteStmt(s ast.Stmt) string {
 	return ""
 }
 
+// WriteSelectInto renders a PL/pgSQL `SELECT … INTO v1, v2 FROM …`
+// statement: the INTO list is placed right after the head query's
+// projection (PG's canonical position); set-operation branches, ORDER
+// BY, LIMIT/OFFSET and the lock clause render exactly as WriteStmt
+// would. Target variables are emitted verbatim — they are plpgsql
+// variables, not relation columns, so they are never quoted. An empty
+// into list yields the plain SELECT. Returns "" for nil.
+func WriteSelectInto(s *ast.SelectStmt, into []string) string {
+	return writeSelectWithInto(s, into)
+}
+
 // writeSelect renders a complete SELECT (with optional WITH preamble,
 // UNION/INTERSECT/MINUS chain, ORDER BY, LIMIT/OFFSET, lock clause).
 func writeSelect(s *ast.SelectStmt) string {
+	return writeSelectWithInto(s, nil)
+}
+
+// writeSelectWithInto is writeSelect with an optional plpgsql INTO
+// target list for the head query branch.
+func writeSelectWithInto(s *ast.SelectStmt, into []string) string {
 	if s == nil {
 		return ""
 	}
@@ -55,12 +72,12 @@ func writeSelect(s *ast.SelectStmt) string {
 		b.WriteString(writeWith(s.With))
 		b.WriteByte(' ')
 	}
-	b.WriteString(writeQueryBody(s))
+	b.WriteString(writeQueryBody(s, into))
 	for _, op := range s.SetOps {
 		b.WriteByte(' ')
 		b.WriteString(op.Op)
 		b.WriteByte(' ')
-		b.WriteString(writeQueryBody(op.Stmt))
+		b.WriteString(writeQueryBody(op.Stmt, nil))
 	}
 	if len(s.OrderBy) > 0 {
 		b.WriteString(" ORDER BY ")
@@ -117,8 +134,13 @@ func writeWith(w *ast.WithClause) string {
 
 // writeQueryBody renders one SELECT branch — projection, FROM, WHERE,
 // GROUP BY, HAVING. Used for the head of a query and for each branch
-// of a UNION/INTERSECT/MINUS chain.
-func writeQueryBody(s *ast.SelectStmt) string {
+// of a UNION/INTERSECT/MINUS chain. into, when non-empty, is the
+// plpgsql `INTO v1, v2` target list emitted after the projection; only
+// the head branch ever receives one.
+func writeQueryBody(s *ast.SelectStmt, into []string) string {
+	if s == nil {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString("SELECT")
 	if s.Distinct {
@@ -130,6 +152,10 @@ func writeQueryBody(s *ast.SelectStmt) string {
 		cols[i] = writeSelectItem(c)
 	}
 	b.WriteString(strings.Join(cols, ", "))
+	if len(into) > 0 {
+		b.WriteString(" INTO ")
+		b.WriteString(strings.Join(into, ", "))
+	}
 	if len(s.From) > 0 {
 		b.WriteString(" FROM ")
 		from := make([]string, len(s.From))

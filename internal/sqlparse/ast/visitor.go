@@ -59,6 +59,12 @@ func Walk(v Visitor, n Node) {
 		for _, a := range x.Args {
 			Walk(v, a)
 		}
+		for _, oi := range x.AggOrderBy {
+			Walk(v, oi.Expr)
+		}
+		Walk(v, x.AggSeparator)
+	case *IntervalLit:
+		Walk(v, x.Expr)
 	case *CaseExpr:
 		Walk(v, x.Operand)
 		for _, w := range x.Whens {
@@ -112,7 +118,7 @@ func Walk(v Visitor, n Node) {
 	case *SelectStmt:
 		if x.With != nil {
 			for _, c := range x.With.CTEs {
-				Walk(v, c.Body)
+				walkSelect(v, c.Body)
 			}
 		}
 		for _, c := range x.Cols {
@@ -132,7 +138,7 @@ func Walk(v Visitor, n Node) {
 		Walk(v, x.Limit)
 		Walk(v, x.Offset)
 		for _, so := range x.SetOps {
-			Walk(v, so.Stmt)
+			walkSelect(v, so.Stmt)
 		}
 	case *FromSubquery:
 		if x.Stmt != nil {
@@ -190,6 +196,80 @@ func Walk(v Visitor, n Node) {
 		for _, ma := range x.WhenNotMatched {
 			walkMergeAction(v, ma)
 		}
+
+	// --- DDL nodes carrying typed bodies ---
+	case *CreateView:
+		walkSelect(v, x.Select)
+	case *CreateEvent:
+		Walk(v, x.AtExpr)
+
+	// --- PL (procedural) declarations and statements ---
+	case *Block:
+		for _, d := range x.Decls {
+			Walk(v, d)
+		}
+		walkPLStmts(v, x.Stmts)
+		if x.Except != nil {
+			for _, h := range x.Except.Handlers {
+				walkPLStmts(v, h.Body)
+			}
+		}
+	case *DeclareVar:
+		Walk(v, x.Default)
+	case *DeclareCursor:
+		walkSelect(v, x.Stmt)
+	case *DeclareHandler:
+		Walk(v, x.Action)
+	case *AssignStmt:
+		Walk(v, x.Expr)
+	case *IfStmt:
+		for _, br := range x.Branches {
+			Walk(v, br.Cond)
+			walkPLStmts(v, br.Body)
+		}
+		walkPLStmts(v, x.Else)
+	case *CaseStmt:
+		Walk(v, x.Expr)
+		for _, w := range x.When {
+			Walk(v, w.Match)
+			walkPLStmts(v, w.Body)
+		}
+		walkPLStmts(v, x.Else)
+	case *WhileStmt:
+		Walk(v, x.Cond)
+		walkPLStmts(v, x.Body)
+	case *LoopStmt:
+		walkPLStmts(v, x.Body)
+	case *RepeatStmt:
+		walkPLStmts(v, x.Body)
+		Walk(v, x.Cond)
+	case *LeaveStmt:
+		Walk(v, x.WhenCond)
+	case *IterateStmt:
+		Walk(v, x.WhenCond)
+	case *ReturnStmt:
+		Walk(v, x.Expr)
+	case *CallStmt:
+		for _, a := range x.Args {
+			Walk(v, a)
+		}
+	case *SelectInto:
+		walkSelect(v, x.Stmt)
+	}
+}
+
+// walkSelect walks a *SelectStmt slot, skipping a typed-nil pointer
+// (which would otherwise reach Walk as a non-nil Node interface).
+func walkSelect(v Visitor, s *SelectStmt) {
+	if s != nil {
+		Walk(v, s)
+	}
+}
+
+// walkPLStmts walks a procedural statement list in order.
+func walkPLStmts(v Visitor, stmts []PLStmt) {
+	for _, s := range stmts {
+		Walk(v, s)
 	}
 }
 

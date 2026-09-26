@@ -117,9 +117,18 @@ func (p *Parser) parsePLDecl() ast.PLDecl {
 	if p.isKw("CURSOR") {
 		p.advance()
 		p.expectKw("FOR")
-		// capture the SELECT body until ';'
-		sel := p.captureUntilStmtEnd()
-		return &ast.DeclareCursor{Name: name, SelectBody: sel, P: astPos(start)}
+		// Delimit the query up to ';' (SelectBody keeps that raw text), then
+		// parse the delimited fragment as a selectStatement (grammar:
+		// declareCursor — DECLARE uid CURSOR FOR selectStatement). Stmt is
+		// nil when the query does not parse; the diagnostics stay in p.errs.
+		bodyStart := p.cur.Pos
+		body := p.captureUntilStmtEnd()
+		sel, into, _ := p.parseDelimitedSelect(bodyStart, p.cur.Pos.Offset)
+		if sel != nil && into != nil {
+			p.errorAt(bodyStart, "SELECT … INTO is not allowed in a cursor declaration")
+			sel = nil
+		}
+		return &ast.DeclareCursor{Name: name, Stmt: sel, SelectBody: body, P: astPos(start)}
 	}
 	// DECLARE list: `DECLARE a, b, c INT [DEFAULT 0]` — all share the same
 	// type and default. Collect names.
@@ -224,21 +233,14 @@ func (p *Parser) parsePLStmt() ast.PLStmt {
 		return &ast.CloseStmt{Cursor: n}
 	case p.isKw("FETCH"):
 		return p.parseFetch()
-	case p.isKw("SIGNAL"):
+	case p.isKw("SIGNAL") || p.isKw("RESIGNAL"):
 		return p.parseSignal()
+	case p.isKw("TRUNCATE"):
+		return p.parseTruncate().(*ast.TruncateTable)
 	case p.isKw("SET"):
 		return p.parseAssign()
 	case p.isKw("SELECT"):
-		// Procedural SELECT INTO (Oracle / MariaDB MySQL-compat) keeps the
-		// dedicated SelectInto path because the AST tracks the captured
-		// variables on a different node. Plain SELECT goes through the
-		// structured DML parser and surfaces as a typed *ast.SelectStmt;
-		// the translator's plTranslator.stmt() case renders it via
-		// emitSelectStmt.
-		if p.peekProceduralSelectInto() {
-			return p.parseSelectInto()
-		}
-		return p.parseSelectStatement()
+		return p.parsePLSelect()
 	case p.isKw("INSERT"):
 		return p.parseInsertStatement()
 	case p.isKw("UPDATE"):
@@ -251,89 +253,83 @@ func (p *Parser) parsePLStmt() ast.PLStmt {
 		return p.parseAssignOrRaw()
 	}
 	// fallback: capture raw up to ;
-	return &ast.RawSQL{Text: p.captureUntilStmtEnd(), P: astPos(p.cur.Pos)}
+	// Nothing keyword-led is PL/pgSQL-compatible as-is (START TRANSACTION in
+	// particular fails at runtime with "unsupported transaction command in
+	// PL/pgSQL"), so the statement is "not understood" (Verbatim false).
+	pos := p.cur.Pos
+	return &ast.RawSQL{Text: p.captureUntilStmtEnd(), P: astPos(pos)}
+}
+
+// errorAt records a parse error anchored at pos.
+func (p *Parser) errorAt(pos Position, msg string) {
+	p.errs = append(p.errs, &ParseError{Pos: pos, Msg: msg})
+}
+
+// parseDelimitedSelect parses the source fragment [start.Offset, endOff) as
+// one selectStatement with a bounded sub-parser. It returns the typed query
+// (nil when the fragment does not parse or leaves unconsumed tokens), the
+// procedural INTO variables the query carried (nil when none) and the rune
+// offsets of that INTO clause. The sub-parser's diagnostics are appended to
+// p.errs.
+func (p *Parser) parseDelimitedSelect(start Position, endOff int) (*ast.SelectStmt, []string, [2]int) {
+	sp := p.subParser(start, endOff)
+	if sp.cur.Kind == TOK_EOF {
+		p.errorAt(start, "expected SELECT")
+		return nil, nil, [2]int{}
+	}
+	sel := sp.parseSelectStatement()
+	if len(sp.errs) == 0 && sp.cur.Kind != TOK_EOF {
+		if sp.isKw("INTO") {
+			sp.errorHere("SELECT … INTO OUTFILE / DUMPFILE is not supported", "")
+		} else {
+			sp.errorHere("unexpected token after SELECT", "';'")
+		}
+	}
+	p.errs = append(p.errs, sp.errs...)
+	if len(sp.errs) > 0 {
+		sel = nil
+	}
+	return sel, sp.pendingInto, sp.pendingIntoSpan
+}
+
+// parsePLSelect parses a SELECT statement inside a routine body. The
+// statement is first delimited up to ';' (so a query the typed parser
+// rejects never shifts the statement boundary), then parsed as a
+// selectStatement. Outcomes:
+//
+//   - `SELECT … INTO v1, v2 …` (grammar: selectIntoExpression, variable
+//     form — before FROM, after LIMIT or after the lock clause) →
+//     *ast.SelectInto with Vars and the typed Stmt (INTO clause removed);
+//     Stmt is nil when the query does not parse. RawQuery holds the source
+//     text without the INTO clause — the legacy `SELECT <list> <rest>`
+//     shape the text translator appends ` INTO <vars>` to.
+//   - plain SELECT that parses → the typed *ast.SelectStmt.
+//   - anything else (parse error, INTO OUTFILE / DUMPFILE, unsupported
+//     trailing clause) → *ast.RawSQL with the statement text and
+//     Verbatim false; the diagnostics stay in p.errs.
+func (p *Parser) parsePLSelect() ast.PLStmt {
+	start := p.cur.Pos
+	raw := p.captureUntilStmtEnd()
+	endOff := p.cur.Pos.Offset
+	sel, into, span := p.parseDelimitedSelect(start, endOff)
+	if into != nil {
+		head := strings.TrimSpace(string(p.src[start.Offset:span[0]]))
+		tail := strings.TrimSpace(string(p.src[span[1]:endOff]))
+		query := head
+		if tail != "" {
+			query = head + " " + tail
+		}
+		return &ast.SelectInto{Vars: into, Stmt: sel, RawQuery: query, P: astPos(start)}
+	}
+	if sel == nil {
+		return &ast.RawSQL{Text: raw, P: astPos(start)}
+	}
+	return sel
 }
 
 func (p *Parser) peekIsPunct(lit string) bool {
 	t := p.l.Peek()
 	return t.Kind == TOK_PUNCT && t.Lit == lit
-}
-
-// peekProceduralSelectInto reports whether the SELECT statement starting at
-// the current cursor position contains a procedural `INTO <var>[, <var>...]`
-// clause before its FROM clause (or before the statement terminator if there
-// is no FROM). The check walks the source text from the current rune offset
-// — it does not consume tokens — and stops at depth-zero `;`, `)` or end of
-// input. INTO inside a string literal or a nested parenthesis group is
-// ignored. This is the discriminator between `SELECT a INTO @x FROM t` and a
-// plain `SELECT a FROM t`: the former routes through parseSelectInto, the
-// latter through the structured parseSelectStatement.
-func (p *Parser) peekProceduralSelectInto() bool {
-	if p.cur.Pos.Offset < 0 || p.cur.Pos.Offset >= len(p.src) {
-		return false
-	}
-	src := p.src[p.cur.Pos.Offset:]
-	depth := 0
-	inStr := false
-	for i := 0; i < len(src); i++ {
-		c := src[i]
-		if inStr {
-			if c == '\'' {
-				if i+1 < len(src) && src[i+1] == '\'' {
-					i++
-					continue
-				}
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case '\'':
-			inStr = true
-			continue
-		case '(':
-			depth++
-			continue
-		case ')':
-			if depth == 0 {
-				return false
-			}
-			depth--
-			continue
-		case ';':
-			if depth == 0 {
-				return false
-			}
-			continue
-		}
-		if depth != 0 {
-			continue
-		}
-		if !isPlSelectIntoIdentStart(c) {
-			continue
-		}
-		j := i + 1
-		for j < len(src) && isPlSelectIntoIdentByte(src[j]) {
-			j++
-		}
-		word := strings.ToUpper(string(src[i:j]))
-		switch word {
-		case "INTO":
-			return true
-		case "FROM":
-			return false
-		}
-		i = j - 1
-	}
-	return false
-}
-
-func isPlSelectIntoIdentStart(r rune) bool {
-	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
-}
-
-func isPlSelectIntoIdentByte(r rune) bool {
-	return isPlSelectIntoIdentStart(r) || (r >= '0' && r <= '9') || r == '$' || r == '#'
 }
 
 // parseIf — IF cond THEN stmts [ELSEIF cond THEN stmts]* [ELSE stmts] END IF
@@ -487,10 +483,19 @@ func (p *Parser) parseFetch() *ast.FetchStmt {
 	return f
 }
 
+// parseSignal parses SIGNAL and RESIGNAL (grammar: signalStatement,
+// resignalStatement): `[RE]SIGNAL [SQLSTATE [VALUE] 'xxxxx'] [SET item =
+// value, …]`. RESIGNAL sets Resignal; both SQLSTATE and SET MESSAGE_TEXT
+// are optional there.
 func (p *Parser) parseSignal() *ast.SignalStmt {
 	start := p.cur.Pos
-	p.expectKw("SIGNAL")
 	s := &ast.SignalStmt{P: astPos(start)}
+	if p.isKw("RESIGNAL") {
+		s.Resignal = true
+		p.advance()
+	} else {
+		p.expectKw("SIGNAL")
+	}
 	if p.isKw("SQLSTATE") {
 		p.advance()
 		if p.isKw("VALUE") {
@@ -584,42 +589,94 @@ func (p *Parser) parseAssignOrRaw() ast.PLStmt {
 		e := p.parseExpr()
 		return &ast.AssignStmt{Target: name, Expr: e, P: astPos(start)}
 	}
-	// restore-ish: we can't rewind, so treat as raw SQL starting from the
-	// consumed identifier.
+	// Not an assignment: keep the statement as raw SQL. Only the statements
+	// PL/pgSQL accepts unchanged are Verbatim (non-reserved words, lexed as
+	// IDENT); anything else is "not understood":
+	//   - bare COMMIT / ROLLBACK (grammar rules commitWork / rollbackWork
+	//     without WORK, AND CHAIN, RELEASE or TO SAVEPOINT). PL/pgSQL has no
+	//     SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO SAVEPOINT;
+	//   - GET [CURRENT] DIAGNOSTICS whose items are all `var = ROW_COUNT`
+	//     (see getDiagnosticsVerbatim).
+	if strings.EqualFold(saved.Lit, "GET") {
+		return p.parseGetDiagnosticsRaw(saved, start)
+	}
+	verbatim := (strings.EqualFold(saved.Lit, "COMMIT") || strings.EqualFold(saved.Lit, "ROLLBACK")) &&
+		p.atStatementEnd()
 	rest := p.captureUntilStmtEnd()
-	return &ast.RawSQL{Text: saved.Lit + " " + rest, P: astPos(start)}
+	return &ast.RawSQL{Text: joinRawHead(saved.Lit, rest), Verbatim: verbatim, P: astPos(start)}
 }
 
-// parseSelectInto — SELECT <list> INTO <vars> FROM ... (rest as raw).
-func (p *Parser) parseSelectInto() ast.PLStmt {
-	// Easiest: capture the whole statement text, then extract INTO targets
-	// with a small text pass. Works for the common shape without committing
-	// to a full SELECT grammar yet.
-	start := p.cur.Pos
-	raw := p.captureUntilStmtEnd()
-	// try to find " INTO " followed by comma-list of idents then whitespace
-	// and another SQL keyword (FROM/WHERE). The regex-free split:
-	up := strings.ToUpper(raw)
-	idx := strings.Index(up, " INTO ")
-	if idx < 0 {
-		return &ast.RawSQL{Text: raw, P: astPos(start)}
+// joinRawHead rebuilds a raw statement from its already-consumed leading word
+// and the captured remainder, without a trailing blank when the remainder is
+// empty (bare `COMMIT`).
+func joinRawHead(head, rest string) string {
+	if rest == "" {
+		return head
 	}
-	head := raw[:idx]
-	tail := raw[idx+len(" INTO "):]
-	// vars go up to the next keyword boundary (FROM/WHERE/GROUP/ORDER/LIMIT)
-	endIdx := len(tail)
-	for _, kw := range []string{" FROM ", " WHERE ", " GROUP ", " ORDER ", " LIMIT "} {
-		if j := strings.Index(strings.ToUpper(tail), kw); j >= 0 && j < endIdx {
-			endIdx = j
+	return head + " " + rest
+}
+
+// parseGetDiagnosticsRaw captures a GET … DIAGNOSTICS statement (grammar rule
+// getDiagnostics) as RawSQL, the leading GET already consumed. It is Verbatim
+// only in the one shape PL/pgSQL accepts unchanged:
+//
+//	GET [CURRENT] DIAGNOSTICS v = ROW_COUNT [, w = ROW_COUNT …]
+//
+// PG's GET DIAGNOSTICS has no CONDITION n form, no NUMBER item and no @user /
+// @@system variable targets, and PG's STACKED form only exposes the error
+// items of an exception handler, so MySQL's `GET DIAGNOSTICS CONDITION 1
+// @p = MESSAGE_TEXT` handler idiom (and every other shape) stays Verbatim
+// false for the translator to handle or warn about.
+func (p *Parser) parseGetDiagnosticsRaw(saved Token, start Position) ast.PLStmt {
+	startOff := p.cur.Pos.Offset
+	verbatim := p.getDiagnosticsVerbatim()
+	// Resync on the statement end from wherever the classifier stopped.
+	p.captureUntilStmtEnd()
+	rest := strings.TrimSpace(string(p.src[startOff:p.cur.Pos.Offset]))
+	return &ast.RawSQL{Text: joinRawHead(saved.Lit, rest), Verbatim: verbatim, P: astPos(start)}
+}
+
+// getDiagnosticsVerbatim consumes the tokens after GET while they match the
+// PL/pgSQL-compatible GET [CURRENT] DIAGNOSTICS v = ROW_COUNT [, …] shape and
+// reports whether the whole statement matched. It stops (leaving the rest for
+// the caller to capture) at the first token that does not fit.
+func (p *Parser) getDiagnosticsVerbatim() bool {
+	if p.isWord("CURRENT") {
+		p.advance()
+	}
+	if !p.isWord("DIAGNOSTICS") {
+		return false
+	}
+	p.advance()
+	for {
+		// Target: a plain local variable. `@x` / `@@x` start with PUNCT.
+		// Quoted (backtick) names are left to the translator: the raw text
+		// would reach PG with MySQL quoting.
+		if p.cur.Kind != TOK_IDENT {
+			return false
 		}
+		p.advance()
+		if !p.isPunct("=") {
+			return false
+		}
+		p.advance()
+		if !p.isWord("ROW_COUNT") {
+			return false
+		}
+		p.advance()
+		if !p.isPunct(",") {
+			break
+		}
+		p.advance()
 	}
-	varsPart := tail[:endIdx]
-	rest := strings.TrimSpace(tail[endIdx:])
-	var vars []string
-	for _, v := range strings.Split(varsPart, ",") {
-		vars = append(vars, strings.TrimSpace(v))
-	}
-	return &ast.SelectInto{Vars: vars, RawQuery: strings.TrimSpace(head) + " " + rest, P: astPos(start)}
+	return p.atStatementEnd()
+}
+
+// isWord reports whether the current token is the word w, lexed either as a
+// keyword or as a non-reserved identifier, compared case-insensitively on
+// that single token.
+func (p *Parser) isWord(w string) bool {
+	return (p.cur.Kind == TOK_KEYWORD || p.cur.Kind == TOK_IDENT) && strings.EqualFold(p.cur.Lit, w)
 }
 
 // captureUntilStmtEnd returns the source text from current position up to,

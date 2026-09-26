@@ -164,8 +164,10 @@ type PLRaise struct {
 
 func (*PLRaise) plStmt() {}
 
-// PLRawSQL is pass-through SQL (INSERT/UPDATE/DELETE/SELECT) already
-// rewritten by the body rewriter. The writer appends a trailing `;`.
+// PLRawSQL is SQL text emitted as-is: statements the translator already
+// rendered (via the dialects/postgres writer, or the Oracle text passes),
+// verbatim-compatible statements, and TODO comments. The writer appends a
+// trailing `;`.
 type PLRawSQL struct {
 	Text string
 }

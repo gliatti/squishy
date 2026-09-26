@@ -17,13 +17,17 @@ import (
 //   lockClause; plus the full insertStatement, updateStatement (single +
 //   multi), and deleteStatement (single + multi USING form).
 //
+// selectIntoExpression is modeled for its variable-list alternative
+// (`INTO @x, v` before FROM, after LIMIT or after the lock clause): the
+// variables land in Parser.pendingInto for the routine-body dispatcher.
+// overClause / windowSpec are decomposed into WindowSpec (see
+// parseOverWindowSpec).
+//
 // Productions intentionally NOT modeled at this stage — they are uncommon in
 // migrated dumps and downgrade gracefully into a NoopStmt or RawSQL fallback:
-//   selectIntoExpression (INTO DUMPFILE / INTO OUTFILE / INTO @vars within
-//   the SELECT body), windowClause (named window definitions; OVER (...) on
-//   aggregates is captured raw in WindowSpec.RawSpec), JSON_TABLE, LATERAL,
-//   selectSpec hints other than ALL/DISTINCT (HIGH_PRIORITY,
-//   STRAIGHT_JOIN, SQL_*_RESULT, …), indexHint.
+//   selectIntoExpression INTO DUMPFILE / INTO OUTFILE, windowClause (named
+//   window definitions), JSON_TABLE, LATERAL, selectSpec hints other than
+//   ALL/DISTINCT (HIGH_PRIORITY, STRAIGHT_JOIN, SQL_*_RESULT, …), indexHint.
 // ---------------------------------------------------------------------------
 
 // ParseSelect parses a stand-alone SELECT (with optional WITH preamble) and
@@ -34,6 +38,18 @@ func ParseSelect(src string) (*ast.SelectStmt, ErrorList) {
 	p.advance()
 	stmt := p.parseSelectStatement()
 	return stmt, p.errs
+}
+
+// ParseExpr parses a stand-alone expression (grammar rule expression). The
+// whole input must be consumed: trailing tokens are reported as an error.
+func ParseExpr(src string) (ast.Expr, ErrorList) {
+	p := &Parser{l: NewLexer(src), src: []rune(src)}
+	p.advance()
+	e := p.parseExpr()
+	if p.cur.Kind != TOK_EOF {
+		p.errorHere("trailing tokens after expression", "EOF")
+	}
+	return e, p.errs
 }
 
 // ParseInsert parses a stand-alone INSERT statement.
@@ -100,9 +116,11 @@ func (p *Parser) parseSelectStatement() *ast.SelectStmt {
 	if p.isKw("LIMIT") {
 		stmt.Limit, stmt.Offset = p.parseLimitClause()
 	}
+	p.parseSelectIntoVariables()
 	if lock := p.parseLockClause(); lock != "" {
 		stmt.ForUpdate = lock
 	}
+	p.parseSelectIntoVariables()
 	return stmt
 }
 
@@ -126,6 +144,7 @@ func (p *Parser) parseQuerySpecification() *ast.SelectStmt {
 	stmt := &ast.SelectStmt{P: astPos(start)}
 	p.consumeSelectSpec(stmt)
 	stmt.Cols = p.parseSelectElements()
+	p.parseSelectIntoVariables()
 	if p.isKw("FROM") {
 		p.advance()
 		stmt.From = p.parseTableSources()
@@ -161,7 +180,9 @@ func (p *Parser) parseQuerySpecification() *ast.SelectStmt {
 	if p.isKw("LIMIT") {
 		stmt.Limit, stmt.Offset = p.parseLimitClause()
 	}
+	p.parseSelectIntoVariables()
 	stmt.ForUpdate = p.parseLockClause()
+	p.parseSelectIntoVariables()
 	return stmt
 }
 
@@ -383,10 +404,61 @@ func (p *Parser) parseLimitAtom() ast.Expr {
 	}
 }
 
+// parseSelectIntoVariables consumes a procedural `INTO var [, var]*`
+// clause at the current position (grammar: selectIntoExpression,
+// selectIntoVariables alternative — assignmentField: `@`-prefixed session
+// variable or local variable name) and stores the variables in
+// p.pendingInto. INTO OUTFILE / INTO DUMPFILE are left unconsumed: they
+// are not variable targets, and the caller reports the leftover tokens.
+func (p *Parser) parseSelectIntoVariables() {
+	if !p.isKw("INTO") {
+		return
+	}
+	if nxt := p.l.Peek(); nxt.Kind == TOK_IDENT &&
+		(strings.EqualFold(nxt.Lit, "OUTFILE") || strings.EqualFold(nxt.Lit, "DUMPFILE")) {
+		return
+	}
+	if p.pendingInto != nil {
+		p.errorHere("duplicate INTO clause", "")
+	}
+	intoOff := p.cur.Pos.Offset
+	p.advance()
+	vars := []string{p.parseIntoVariable()}
+	for p.isPunct(",") {
+		p.advance()
+		vars = append(vars, p.parseIntoVariable())
+	}
+	p.pendingInto = vars
+	p.pendingIntoSpan = [2]int{intoOff, p.cur.Pos.Offset}
+}
+
+// parseIntoVariable reads one INTO target: `@var`, `@@scope.var` or a
+// plain (routine-local) variable name.
+func (p *Parser) parseIntoVariable() string {
+	var b strings.Builder
+	if p.isPunct("@") {
+		b.WriteByte('@')
+		p.advance()
+		if p.isPunct("@") {
+			b.WriteByte('@')
+			p.advance()
+		}
+	}
+	n, _ := p.parseIdent()
+	b.WriteString(n)
+	for p.isPunct(".") {
+		b.WriteByte('.')
+		p.advance()
+		n, _ = p.parseIdent()
+		b.WriteString(n)
+	}
+	return b.String()
+}
+
 // parseLockClause returns the trailing FOR UPDATE / LOCK IN SHARE MODE
 // clause as raw text, or "" when absent. Anything more exotic (FOR SHARE
 // OF, NOWAIT, SKIP LOCKED) is captured verbatim by walking forward to the
-// statement terminator boundary.
+// statement terminator boundary (or a trailing INTO clause).
 func (p *Parser) parseLockClause() string {
 	if p.isKw("FOR") {
 		var b strings.Builder
@@ -401,7 +473,7 @@ func (p *Parser) parseLockClause() string {
 		for !p.atStatementEnd() && p.cur.Kind != TOK_EOF {
 			// stop at the start of the next clause (UNION, etc.) or a closing
 			// paren of an enclosing subquery.
-			if p.isKw("UNION") || p.isKw("INTERSECT") || p.isKw("EXCEPT") || p.isKw("MINUS") || p.isPunct(")") {
+			if p.isKw("UNION") || p.isKw("INTERSECT") || p.isKw("EXCEPT") || p.isKw("MINUS") || p.isKw("INTO") || p.isPunct(")") {
 				break
 			}
 			b.WriteByte(' ')
@@ -415,7 +487,7 @@ func (p *Parser) parseLockClause() string {
 		b.WriteString("LOCK")
 		p.advance()
 		for !p.atStatementEnd() && p.cur.Kind != TOK_EOF {
-			if p.isKw("UNION") || p.isKw("INTERSECT") || p.isKw("EXCEPT") || p.isKw("MINUS") || p.isPunct(")") {
+			if p.isKw("UNION") || p.isKw("INTERSECT") || p.isKw("EXCEPT") || p.isKw("MINUS") || p.isKw("INTO") || p.isPunct(")") {
 				break
 			}
 			b.WriteByte(' ')
@@ -500,7 +572,7 @@ func (p *Parser) parseTableSourceItem() ast.FromItem {
 		// Distinguish `(SELECT ...)` from `(tableSources)`.
 		// We commit by advancing and inspecting the next token.
 		p.advance()
-		if p.isKw("SELECT") || p.isKw("WITH") || p.isPunct("(") {
+		if p.isKw("SELECT") || p.isKw("WITH") || (p.isPunct("(") && p.parensLeadToQuery()) {
 			inner := p.parseSelectStatement()
 			p.expectPunct(")")
 			alias := ""
@@ -568,6 +640,34 @@ func (p *Parser) parseTableSourceItem() ast.FromItem {
 		p.advance()
 	}
 	return t
+}
+
+// parensLeadToQuery reports whether the run of '(' tokens starting at
+// the current token opens a query expression (`((SELECT …) UNION …)`)
+// rather than nested table sources (`((a JOIN b) JOIN c)`, the shape
+// mysqldump emits for view bodies). The parser only has one token of
+// lookahead, so a throw-away lexer re-tokenises the source from the
+// current token: it skips the '(' run (and comments) and inspects the
+// first other token. Nothing is consumed.
+func (p *Parser) parensLeadToQuery() bool {
+	off := p.cur.Pos.Offset
+	if off < 0 || off > len(p.src) {
+		return false
+	}
+	l := NewLexer(string(p.src[off:]))
+	for {
+		t := l.Next()
+		switch {
+		case t.Kind == TOK_COMMENT:
+			continue
+		case t.Kind == TOK_PUNCT && t.Lit == "(":
+			continue
+		case t.Kind == TOK_KEYWORD && (t.Lit == "SELECT" || t.Lit == "WITH"):
+			return true
+		default:
+			return false
+		}
+	}
 }
 
 // tryParseJoinPart consumes a joinPart if the current token starts one and

@@ -408,9 +408,12 @@ func (d *Deps) listBatches(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "invalid stepID")
 		return
 	}
+	// row_count / row_count_est stay NULL until a batch is sized and
+	// copied: a pending batch reports 0 rows done, and 0 as the estimate
+	// means "unknown" (the UI then hides the progress bar).
 	rows, err := d.DB.Query(r.Context(), `
 		SELECT id, seq, range_kind, range_low, range_high,
-		       row_count_est, row_count, status, attempts,
+		       coalesce(row_count_est,0), coalesce(row_count,0), status, attempts,
 		       coalesce(started_at,'epoch'::timestamptz),
 		       coalesce(finished_at,'epoch'::timestamptz),
 		       coalesce(error,'')

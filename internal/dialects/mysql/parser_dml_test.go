@@ -156,6 +156,34 @@ func TestParseSelect_JoinUsing(t *testing.T) {
 	require.Equal(t, []string{"id"}, j.Using)
 }
 
+// TestParseSelect_NestedParenJoins covers the FROM shape mysqldump emits
+// for view bodies: several '(' in a row opening nested table sources, not
+// a parenthesised query.
+func TestParseSelect_NestedParenJoins(t *testing.T) {
+	s := parseSelectFor(t, "SELECT 1 FROM (((a x JOIN b y) JOIN c) JOIN d) WHERE x.id = y.id")
+	require.Len(t, s.From, 1)
+	top, ok := s.From[0].(*ast.FromJoin)
+	require.True(t, ok, "top FROM item: %T", s.From[0])
+	require.Equal(t, "d", top.Right.(*ast.FromTable).Name)
+	mid, ok := top.Left.(*ast.FromJoin)
+	require.True(t, ok)
+	require.Equal(t, "c", mid.Right.(*ast.FromTable).Name)
+	low, ok := mid.Left.(*ast.FromJoin)
+	require.True(t, ok)
+	require.Equal(t, "x", low.Left.(*ast.FromTable).Alias)
+	require.Equal(t, "y", low.Right.(*ast.FromTable).Alias)
+	require.NotNil(t, s.Where)
+}
+
+// TestParseSelect_NestedParenSubquery keeps `((SELECT …))` in FROM parsed
+// as a derived table.
+func TestParseSelect_NestedParenSubquery(t *testing.T) {
+	s := parseSelectFor(t, "SELECT * FROM ((SELECT id FROM t)) AS sub")
+	sub, ok := s.From[0].(*ast.FromSubquery)
+	require.True(t, ok, "FROM item: %T", s.From[0])
+	require.Equal(t, "sub", sub.Alias)
+}
+
 func TestParseSelect_FromSubquery(t *testing.T) {
 	s := parseSelectFor(t, "SELECT * FROM (SELECT id FROM t) AS sub")
 	sub, ok := s.From[0].(*ast.FromSubquery)
@@ -263,4 +291,43 @@ func TestParseDelete_MultiTargetCommaFrom(t *testing.T) {
 	del := parseDeleteFor(t, "DELETE t1, t2 FROM t1 INNER JOIN t2 ON t1.id = t2.t1_id")
 	require.Equal(t, "", del.Table.Name) // multi-target shape
 	require.NotEmpty(t, del.Using)
+}
+
+// ---------------------------------------------------------------------------
+// Constructs formerly handled by the text body rewriter
+// ---------------------------------------------------------------------------
+
+func TestParseSelect_BareJoinWithoutOn(t *testing.T) {
+	s := parseSelectFor(t, "SELECT 1 FROM a JOIN b")
+	require.Len(t, s.From, 1)
+	j, ok := s.From[0].(*ast.FromJoin)
+	require.True(t, ok, "got %T", s.From[0])
+	require.Equal(t, ast.InnerJoin, j.Kind)
+	require.Nil(t, j.On)
+	require.Empty(t, j.Using)
+}
+
+func TestParseSelect_GroupConcatAndWindowInProjection(t *testing.T) {
+	s := parseSelectFor(t, "SELECT g, GROUP_CONCAT(DISTINCT v ORDER BY v SEPARATOR '|') AS vs, "+
+		"SUM(x) OVER (PARTITION BY g) AS running FROM t GROUP BY g")
+	require.Len(t, s.Cols, 3)
+	fc, ok := s.Cols[1].Expr.(*ast.FuncCall)
+	require.True(t, ok, "got %T", s.Cols[1].Expr)
+	require.True(t, fc.Distinct)
+	require.Len(t, fc.AggOrderBy, 1)
+	require.NotNil(t, fc.AggSeparator)
+	require.Equal(t, "vs", s.Cols[1].Alias)
+	wa, ok := s.Cols[2].Expr.(*ast.WindowedAgg)
+	require.True(t, ok, "got %T", s.Cols[2].Expr)
+	require.Len(t, wa.Over.PartitionBy, 1)
+	require.Equal(t, "running", s.Cols[2].Alias)
+}
+
+func TestParseSelect_IntoVariablesAreNotPartOfTheQuery(t *testing.T) {
+	// ParseSelect ignores the procedural INTO list (the routine-body
+	// dispatcher is the consumer); the query itself must still parse.
+	s := parseSelectFor(t, "SELECT a, b INTO @x, y FROM t WHERE id = 1")
+	require.Len(t, s.Cols, 2)
+	require.Len(t, s.From, 1)
+	require.NotNil(t, s.Where)
 }

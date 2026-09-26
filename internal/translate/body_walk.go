@@ -2,13 +2,14 @@ package translate
 
 import "strings"
 
-// Helpers for byte-walking SQL source — used by routine_body and body_rewrite
-// in lieu of regular expressions. These walks honour single-quoted SQL string
-// literals (with the doubled-quote escape) and nested parentheses so they do
-// not match constructs hiding inside literals or function calls.
+// Helpers for byte-walking SQL source — used by the Oracle/DB2 legacy text
+// passes; the MySQL path is AST-only. These walks honour single-quoted SQL
+// string literals (with the doubled-quote escape) and nested parentheses so
+// they do not match constructs hiding inside literals or function calls.
 //
-// The MySQL/Oracle dialects share these primitives because the lexical rules
-// for strings and parens are identical.
+// isIdentByte, containsKeywordCI and splitTopLevelArgs were relocated here
+// verbatim from the deleted MySQL text rewriter (body_rewrite.go); their
+// remaining callers are the Oracle text passes.
 //
 // SQL comments (`-- …` line, `/* … */` block) are skipped at byte-walk time —
 // see skipSQLComment below. Without this, an apostrophe sitting inside a
@@ -254,4 +255,68 @@ func startsKeywordCI(s string, off int, kw string) bool {
 		return false
 	}
 	return true
+}
+
+// containsKeywordCI returns true when `kw` appears as a whole word in `s`,
+// case-insensitive.
+func containsKeywordCI(s, kw string) bool {
+	upper := strings.ToUpper(s)
+	kw = strings.ToUpper(kw)
+	for i := 0; ; {
+		k := strings.Index(upper[i:], kw)
+		if k < 0 {
+			return false
+		}
+		k += i
+		before := k == 0 || !isIdentByte(upper[k-1])
+		after := k+len(kw) == len(upper) || !isIdentByte(upper[k+len(kw)])
+		if before && after {
+			return true
+		}
+		i = k + len(kw)
+	}
+}
+
+// splitTopLevelArgs splits a comma-separated argument list at commas that are
+// outside of any nested parens and outside of single-quoted strings.
+func splitTopLevelArgs(s string) []string {
+	var out []string
+	depth := 0
+	inStr := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inStr = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9')
 }

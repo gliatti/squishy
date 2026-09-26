@@ -22,10 +22,25 @@ func (e *Ident) Pos() Position { return e.P }
 func (e *Ident) exprNode()     {}
 
 // FuncCall — e.g. CURRENT_TIMESTAMP(3), UUID(), JSON_EXTRACT(col, '$.x')
+//
+// The aggregate modifiers are optional and zero-valued for plain calls:
+//
+//   - Distinct is the aggregate DISTINCT quantifier: COUNT(DISTINCT x).
+//   - AggOrderBy is the ORDER BY written inside the call's parentheses:
+//     string_agg(x, ',' ORDER BY y), GROUP_CONCAT(x ORDER BY y).
+//   - AggSeparator is MySQL's GROUP_CONCAT(... SEPARATOR sep). It has no
+//     PG spelling: the MySQL → PG visitor consumes it when it rewrites
+//     GROUP_CONCAT into string_agg(..., sep ...). The PG writer
+//     deliberately ignores it, so an un-rewritten GROUP_CONCAT reaches
+//     PostgreSQL as an unknown function and fails loudly at apply time
+//     instead of silently switching to a different separator.
 type FuncCall struct {
-	Name string
-	Args []Expr
-	P    Position
+	Name         string
+	Args         []Expr
+	Distinct     bool
+	AggOrderBy   []OrderItem
+	AggSeparator Expr
+	P            Position
 }
 
 func (e *FuncCall) Pos() Position { return e.P }
@@ -224,9 +239,17 @@ func (e *OuterJoinHint) exprNode()     {}
 // IntervalLit — `INTERVAL '<value>' <unit>`. Unit captures the trailing
 // qualifier (DAY, MONTH, "YEAR TO MONTH", "DAY(2) TO SECOND(6)", …) verbatim
 // so dialects with rich precision specs round-trip correctly.
+//
+// Expr is set instead of Value when the interval quantity is not a plain
+// literal (MySQL `INTERVAL n DAY`, `INTERVAL (x + 1) DAY`,
+// `INTERVAL n * 7 DAY`); Value is "" in that case. For the MySQL parser,
+// Value only ever carries literal text (never an identifier). PG has no `INTERVAL <expr> <unit>` form, so the
+// MySQL visitor rewrites that shape (e.g. into `(<expr>) * INTERVAL '1 day'`)
+// before the writer runs.
 type IntervalLit struct {
 	Value string
 	Unit  string
+	Expr  Expr
 	P     Position
 }
 
