@@ -56,7 +56,7 @@ docker compose --profile test run --rm unit-tests go test ./internal/translate/.
 
 E2E integration tests live in `test/integration/` behind the `e2e` build tag and expect the full `docker compose --profile e2e` stack (see `scripts/run_e2e.sh` for the boot order — migrations must complete before the `e2e` container runs). `make e2e` runs in its own compose project `squishy-e2e` (overlay `docker-compose.e2e.yml`, plus `docker-compose.override.yml` when present) with **no host port published**, so it neither wipes the `make up` dev stack nor collides with other local stacks. Readiness is gated on healthchecks (`up -d --wait`, `depends_on: service_healthy`), never a polling loop. Containers are left up for inspection afterwards — tear them down with `make e2e-down`.
 
-The `make up` host ports can be moved with `SQUISHY_PG_HOST_PORT`, `SQUISHY_MYSQL_HOST_PORT`, `SQUISHY_API_HOST_PORT`, `SQUISHY_WEB_HOST_PORT` (and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,MCP}_HOST_PORT`), all read by `docker-compose.yml`.
+The `make up` host ports can be moved with `SQUISHY_PG_HOST_PORT`, `SQUISHY_MYSQL_HOST_PORT`, `SQUISHY_API_HOST_PORT`, `SQUISHY_WEB_HOST_PORT` (and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,MCP}_HOST_PORT`), all read by `docker-compose.yml` and bound to `SQUISHY_BIND_ADDR` (default `127.0.0.1`).
 
 ### App-schema migrations
 
@@ -98,7 +98,9 @@ Vue 3 + Vite + Pinia, five-step wizard (project → source → target → DDL xf
 ## Configuration
 
 All via env vars (prefix `SQUISHY_`, see `.env.example` and `internal/config`):
-`SQUISHY_PG_DSN`, `SQUISHY_HTTP_ADDR`, `SQUISHY_WORKERS`, `SQUISHY_WORKER_ID`, `SQUISHY_BATCH_SIZE`, `SQUISHY_LOG_LEVEL`.
+`SQUISHY_PG_DSN`, `SQUISHY_HTTP_ADDR`, `SQUISHY_WORKERS`, `SQUISHY_WORKER_ID`, `SQUISHY_BATCH_SIZE`, `SQUISHY_LOG_LEVEL`, `SQUISHY_API_TOKEN` (optional bearer token on `/api/v1`, forwarded by the MCP server, the e2e runner and the Vite proxy), `SQUISHY_ALLOWED_ORIGINS` (browser origins allowed for CORS and state-changing requests; others get 403). Host ports bind to `SQUISHY_BIND_ADDR` (default `127.0.0.1`).
+
+Dollar-quoted bodies (routines, trigger functions, DO blocks, pg_cron jobs) never use a fixed tag: `pgast.DollarQuote(tag, body)` picks one absent from the body, since bodies can hold source text.
 
 The app schema is `squishy.*`; the target (migrated) schema is `mig` by convention — `make reset-dest` wipes only the latter.
 

@@ -5,7 +5,7 @@ services:
       POSTGRES_USER: squishy
       POSTGRES_PASSWORD: squishy
       POSTGRES_DB: squishy
-    ports: ["${SQUISHY_PG_HOST_PORT:-5432}:5432"]
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_PG_HOST_PORT:-5432}:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +21,7 @@ services:
       MYSQL_DATABASE: sakila
       MYSQL_USER: sakila
       MYSQL_PASSWORD: sakila
-    ports: ["${SQUISHY_MYSQL_HOST_PORT:-3306}:3306"]
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_MYSQL_HOST_PORT:-3306}:3306"]
     # innodb-flush-log-at-trx-commit=0 + sync-binlog=0 : no fsync per commit.
     # The seed runs 31k single-row INSERTs via stored procedures with WHILE
     # loops (1k customers + 5k orders + 25k items); on Docker Desktop /
@@ -55,7 +55,7 @@ services:
       MARIADB_DATABASE: sakila
       MARIADB_USER: sakila
       MARIADB_PASSWORD: sakila
-    ports: ["${SQUISHY_MARIADB_HOST_PORT:-3307}:3306"]
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_MARIADB_HOST_PORT:-3307}:3306"]
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --log-bin-trust-function-creators=1
     volumes:
       - ./dumps/mariadb:/docker-entrypoint-initdb.d:ro
@@ -77,7 +77,7 @@ services:
       ORACLE_PASSWORD: oracle
       APP_USER: squishy
       APP_USER_PASSWORD: squishy
-    ports: ["${SQUISHY_ORACLE_HOST_PORT:-1522}:1521"]
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_ORACLE_HOST_PORT:-1522}:1521"]
     volumes:
       - oracle-data:/opt/oracle/oradata
       - ./test/fixtures/oracle_sample.sql:/container-entrypoint-initdb.d/01-schema.sql:ro
@@ -127,7 +127,7 @@ services:
       PERSISTENT_HOME: "false"
       BLU: "false"
       ENABLE_ORACLE_COMPATIBILITY: "false"
-    ports: ["${SQUISHY_DB2_HOST_PORT:-50000}:50000"]
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_DB2_HOST_PORT:-50000}:50000"]
     volumes:
       - db2-data:/database
       - ./test/fixtures/db2_sample.sql:/var/custom/01-schema.sql:ro
@@ -148,7 +148,7 @@ services:
       ORACLE_SID: ORCLCDB
       ORACLE_PDB: ORCLPDB1
       ORACLE_CHARACTERSET: AL32UTF8
-    ports: ["${SQUISHY_ORACLE19_HOST_PORT:-1523}:1521"]
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_ORACLE19_HOST_PORT:-1523}:1521"]
     volumes:
       - oracle19-data:/opt/oracle/oradata
       - ./test/fixtures/oracle19_init.sql:/opt/oracle/scripts/setup/01-user.sql:ro
@@ -172,12 +172,14 @@ services:
       SQUISHY_WORKER_ID: api-1
       SQUISHY_BATCH_SIZE: "1000"
       SQUISHY_LOG_LEVEL: debug
+      SQUISHY_API_TOKEN: ${SQUISHY_API_TOKEN:-}
+      SQUISHY_ALLOWED_ORIGINS: http://localhost:${SQUISHY_WEB_HOST_PORT:-5173},http://127.0.0.1:${SQUISHY_WEB_HOST_PORT:-5173}
     depends_on:
       postgres:
         condition: service_healthy
       mysql-sample:
         condition: service_healthy
-    ports: ["${SQUISHY_API_HOST_PORT:-8080}:8080"]
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_API_HOST_PORT:-8080}:8080"]
     volumes:
       - .:/app
       - gocache-debian:/root/.cache/go-build
@@ -199,6 +201,7 @@ services:
       target: dev
     environment:
       SQUISHY_API_URL: http://api:8080
+      SQUISHY_API_TOKEN: ${SQUISHY_API_TOKEN:-}
       PORT: "8000"
     depends_on:
       api:
@@ -223,10 +226,11 @@ services:
     command: sh -c "npm install --prefer-offline --no-audit && npm run dev -- --host 0.0.0.0"
     environment:
       VITE_API_BASE: http://api:8080
+      SQUISHY_API_TOKEN: ${SQUISHY_API_TOKEN:-}
     volumes:
       - ./web:/app
       - nodemods:/app/node_modules
-    ports: ["${SQUISHY_WEB_HOST_PORT:-5173}:5173"]
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_WEB_HOST_PORT:-5173}:5173"]
 
   # --- Profile: test ---
   unit-tests:
@@ -271,6 +275,7 @@ services:
     command: go test ./test/integration/... -tags=e2e -count=1 -v -timeout=10m
     environment:
       SQUISHY_API_URL: http://api:8080
+      SQUISHY_API_TOKEN: ${SQUISHY_API_TOKEN:-}
       SQUISHY_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
       SQUISHY_MYSQL_DSN: sakila:sakila@tcp(mysql-sample:3306)/sakila?parseTime=true&multiStatements=true
       TARGET_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable

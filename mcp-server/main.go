@@ -9,10 +9,14 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-var apiURL string
+var (
+	apiURL   string
+	apiToken string
+)
 
 func main() {
 	apiURL = getenv("SQUISHY_API_URL", "http://api:8080")
+	apiToken = os.Getenv("SQUISHY_API_TOKEN")
 	port := getenv("PORT", "8000")
 
 	s := server.NewMCPServer(

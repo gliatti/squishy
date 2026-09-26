@@ -217,3 +217,32 @@ func TestMySQLEvent_AtExprUnparseableWarns(t *testing.T) {
 	require.True(t, found, "post actions: %q", res.Plan.PostActions)
 	require.Contains(t, warningKinds(res, "event.ev_bad"), "event.at")
 }
+
+// Event bodies and names are source text: a body holding the dollar-quote
+// tag the emitter would use, or a name holding a quote, must not break out
+// of the pg_cron snippet.
+func TestMySQLEvent_DollarQuoteAndNameEscaping(t *testing.T) {
+	res := translateMySQL(t, "CREATE EVENT `ev'x` ON SCHEDULE EVERY 1 DAY DO INSERT INTO t VALUES ('$$');", "pg_cron")
+	var snippet string
+	for _, a := range res.Plan.PostActions {
+		if strings.Contains(a, "cron.schedule(") {
+			snippet = a
+		}
+	}
+	require.NotEmpty(t, snippet, "post actions: %q", res.Plan.PostActions)
+	require.Contains(t, snippet, "cron.schedule('ev''x', ")
+	require.Contains(t, snippet, "$_1$ INSERT INTO")
+	require.True(t, strings.HasSuffix(snippet, " $_1$);"), snippet)
+
+	res = translateMySQL(t, "CREATE EVENT ev_at ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 HOUR DO INSERT INTO t VALUES ('$job$ $do$');", "pg_cron")
+	snippet = ""
+	for _, a := range res.Plan.PostActions {
+		if strings.Contains(a, "fire_at") {
+			snippet = a
+		}
+	}
+	require.NotEmpty(t, snippet, "post actions: %q", res.Plan.PostActions)
+	require.True(t, strings.HasPrefix(snippet, "DO $do_1$\n"), snippet)
+	require.True(t, strings.HasSuffix(snippet, "$do_1$;"), snippet)
+	require.Contains(t, snippet, "$job_1$ INSERT INTO")
+}

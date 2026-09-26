@@ -62,3 +62,25 @@ func TestOraclePlainDefaultNoTrigger(t *testing.T) {
 			"plain DEFAULT must not generate a coalesce trigger")
 	}
 }
+
+// The default expression is source text copied into the trigger body; a
+// `$$` inside it must not close the body's dollar quote.
+func TestOracleDefaultOnNullDollarQuote(t *testing.T) {
+	src := `
+		CREATE TABLE "MIG"."ORDERS" (
+		  "ID" NUMBER NOT NULL,
+		  "STATUS" VARCHAR2(10) DEFAULT ON NULL '$$' NOT NULL
+		);`
+	stmts, errs := oracle.Parse(src)
+	require.Empty(t, errs)
+	res := Translate(stmts, Options{TargetSchema: "mig", SourceKind: "oracle"})
+	var fn string
+	for _, a := range res.Plan.PostActions {
+		if strings.HasPrefix(a, "CREATE OR REPLACE FUNCTION") && strings.Contains(a, "default_on_null_orders_status") {
+			fn = a
+		}
+	}
+	require.NotEmpty(t, fn)
+	require.Contains(t, fn, "LANGUAGE plpgsql AS $_1$")
+	require.True(t, strings.HasSuffix(fn, "END;$_1$;"), fn)
+}

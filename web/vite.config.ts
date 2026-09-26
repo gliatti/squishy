@@ -14,6 +14,10 @@ export default defineConfig({
       '/api': {
         target: process.env.VITE_API_BASE || 'http://api:8080',
         changeOrigin: true,
+        // The browser never holds the API token: the dev proxy adds it.
+        headers: process.env.SQUISHY_API_TOKEN
+          ? { Authorization: `Bearer ${process.env.SQUISHY_API_TOKEN}` }
+          : {},
       },
     },
   },
