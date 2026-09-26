@@ -118,6 +118,22 @@ export interface MigrationRun {
   rows_done: number
 }
 
+// A user-provided PostgreSQL generation expression for one MySQL/MariaDB
+// generated column (table exact, column case-insensitive), emitted as
+// GENERATED ALWAYS AS (<expression>) STORED on the next plan.
+export interface GeneratedOverride {
+  table: string
+  column: string
+  expression: string
+}
+
+export interface GeneratedOverridesResponse {
+  overrides: GeneratedOverride[]
+  // '<table>.<column>' of every column of the current plan an override may target.
+  overridable: string[]
+  plan_required?: boolean
+}
+
 export interface Migration {
   id: string
   instance_id: string
@@ -135,6 +151,7 @@ export interface Migration {
   warnings?: any[]
   prerequisites?: any[]
   acked_prereqs?: string[]
+  generated_overrides?: GeneratedOverride[] | null
   options?: any
   created_at: string
   updated_at: string
@@ -200,6 +217,12 @@ export const api = {
   getPrerequisites: (id: string) => req<any>('GET', `/migrations/${id}/prerequisites`),
   ackPrerequisites: (id: string, acked: string[]) =>
     req<any>('POST', `/migrations/${id}/prerequisites/ack`, { acked }),
+  getGeneratedOverrides: (id: string) =>
+    req<GeneratedOverridesResponse>('GET', `/migrations/${id}/generated-overrides`),
+  // Replaces the whole list ([] clears it); re-plan afterwards.
+  setGeneratedOverrides: (id: string, overrides: GeneratedOverride[]) =>
+    req<{ overrides: GeneratedOverride[]; validated: boolean; replan_required: boolean }>(
+      'PUT', `/migrations/${id}/generated-overrides`, { overrides }),
   startRun: (migrationID: string, mode: DispatchMode = 'auto', skipData = false) =>
     req<{ run_id: string }>('POST', `/migrations/${migrationID}/runs`, { mode, skip_data: skipData }),
   listMigrationRuns: (migrationID: string) =>

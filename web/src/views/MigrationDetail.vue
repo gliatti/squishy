@@ -67,7 +67,8 @@ onMounted(refresh)
 
       <WarningsTab v-if="tab === 'warnings' && migration"
         :migration-id="migration.id"
-        :status="migration.status" />
+        :status="migration.status"
+        @open-ddl="setTab('ddl')" />
 
       <ExecutionTab v-if="tab === 'exec' && migration"
         :migration-id="migration.id"
