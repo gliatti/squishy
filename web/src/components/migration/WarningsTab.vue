@@ -16,6 +16,7 @@ const props = defineProps<{
   migrationId: string
   status: MigrationStatus
 }>()
+const emit = defineEmits<{ (e: 'open-ddl'): void }>()
 
 const loading = ref(true)
 const err = ref('')
@@ -23,11 +24,31 @@ const prereqs = ref<Prereq[]>([])
 const acked = ref<Set<string>>(new Set())
 const saving = ref(false)
 
+// "<table>.<column>" of the generated columns the plan creates as plain
+// columns copied from the source (target_plan.tables[].copied_generated):
+// their blocking prerequisite is resolved by an override in the DDL tab.
+// Matched case-insensitively (MySQL column names are).
+const copiedGenerated = ref<Set<string>>(new Set())
+
+async function loadCopiedGenerated() {
+  const m = await api.getMigration(props.migrationId)
+  const out = new Set<string>()
+  const tables: any[] = Array.isArray(m.target_plan?.tables) ? m.target_plan.tables : []
+  for (const t of tables) {
+    for (const c of (t.copied_generated || []) as string[]) out.add(`${t.name}.${c}`.toLowerCase())
+  }
+  copiedGenerated.value = out
+}
+
+function isCopiedGenerated(p: Prereq): boolean {
+  return !!p.object && copiedGenerated.value.has(p.object.toLowerCase())
+}
+
 async function load() {
   loading.value = true
   err.value = ''
   try {
-    const data = await api.getPrerequisites(props.migrationId)
+    const [data] = await Promise.all([api.getPrerequisites(props.migrationId), loadCopiedGenerated()])
     prereqs.value = data.prerequisites || []
     acked.value = new Set<string>(data.acked || [])
   } catch (e: any) {
@@ -100,6 +121,11 @@ function categoryLabel(c: string): string {
               <strong class="err">⚠ {{ p.title }}</strong>
               &nbsp;<span class="pill">{{ categoryLabel(p.category) }}</span>
               <div v-if="p.object" style="font-size:0.8rem; color:#666;">{{ p.object }}</div>
+              <p v-if="isCopiedGenerated(p)" class="gen-override-hint">
+                Provide the generation in the
+                <a href="#" @click.prevent.stop="emit('open-ddl')">DDL tab</a>
+                (override) or ack to keep a plain column.
+              </p>
               <p style="margin-top:0.4rem">{{ p.description }}</p>
               <pre v-if="p.remediation && p.remediation.trim()" style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; max-width:100%;">{{ p.remediation }}</pre>
             </div>
@@ -122,3 +148,11 @@ function categoryLabel(c: string): string {
     </div>
   </div>
 </template>
+
+<style scoped>
+.gen-override-hint {
+  margin: 0.3rem 0 0;
+  font-size: 0.85rem;
+  color: #555;
+}
+</style>
