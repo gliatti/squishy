@@ -72,9 +72,15 @@ import (
 // way; it skips NULL arguments), and a CONCAT that is only part of the
 // generation expression (CONCAT(…) = 'x', LIKE, IN, CASE, COALESCE,
 // LENGTH, MD5, UPPER… would then run with PG's collation, encoding and
-// function semantics). A refused expression is left untouched: the DDL
-// keeps concat() / concat_ws() / CONCAT_OPERATOR_ORACLE(), so create_ddl
-// fails loudly on PG instead of storing a different value.
+// function semantics). A refused generated column loses its generation
+// expression: it is created as a plain column of its mapped type, listed
+// in PGTable.CopiedGenerated, and the copy transfers its values from the
+// source (MySQL / MariaDB compute a VIRTUAL column on SELECT; the history
+// copy of an emulated system-versioned table reads them too), so PG
+// never stores a different value. The error explanation and the blocking
+// prerequisite (table.generated_text_conversion) say the generation must
+// be provided — a PostgreSQL expression override or a trigger — for rows
+// written on PostgreSQL.
 //
 // When the source DDL had parse errors (Options.ParseError), no MySQL
 // generated column is translated at all, whether or not its parsed
@@ -84,16 +90,16 @@ import (
 // would store 'ax' where MySQL stores 1 — or drop the CONCAT entirely
 // (`binary concat(v,'x')` comes back as the identifier "binary"). Every
 // generated column then gets the same error explanation and a blocking
-// prerequisite (table.generated_parse_error), and the DDL keeps the
-// expression as parsed.
+// prerequisite (table.generated_parse_error), and becomes a plain copied
+// column like a refused one.
 //
 // A generation expression without CONCAT is kept as translated, unless
 // it converts a value to text in a way PG prints differently
 // (textConversionHazards: a hex / bit literal anywhere, a CAST / CONVERT
 // of a boolean value, a boolean value stored in a CHAR / VARCHAR / TEXT
 // generated column). That column gets the same blocking refusal
-// (table.generated_concat): PG may accept its DDL and store 41 / t /
-// true where MySQL stores 'A' / '1', so it must be rewritten by hand.
+// (table.generated_text_conversion) and becomes a plain copied column:
+// PG would store 41 / t / true where MySQL stores 'A' / '1'.
 
 // mysqlGenPending is a MySQL/MariaDB generated column waiting for
 // resolveMySQLGeneratedConcat.
@@ -133,11 +139,26 @@ func mysqlGenNeverRewritten(name string) string {
 	return ""
 }
 
+// mysqlGenLostReason ends the reason of every refused generated column:
+// what squishy does with it instead (plain copied column) and how the
+// generation can be provided.
+const mysqlGenLostReason = " The column is created as a plain column whose values are copied from the source (current rows and, for an emulated system-versioned table, history rows), so no different value is ever stored; rows inserted or updated on PostgreSQL will NOT compute it until a generation is provided: a per-column PostgreSQL expression override (API PUT /api/v1/migrations/{id}/generated-overrides, MCP set_generated_override, DDL tab) or a BEFORE INSERT OR UPDATE trigger."
+
 // resolveMySQLGeneratedConcat rewrites or refuses every pending generated
 // column. It runs after every PG column type is final (JSON promotion,
 // harmonizeFKTypes), so the whitelist sees the types PG will actually
 // apply || to, and the boolean rule sees the final BOOLEAN columns.
+//
+// A refused column loses its generation expression and becomes a plain
+// column whose source values the copy transfers (copyRefusedGenerated).
+// A column that keeps a generation expression gets the VIRTUAL → STORED
+// note when the source declared it VIRTUAL. A column with a user override
+// (Options.GeneratedOverrides, mysql_generated_override.go) takes the
+// override verbatim before any of this; overrides that match no pending
+// column are reported at the end.
 func (t *translator) resolveMySQLGeneratedConcat() {
+	usedOverride := make([]bool, len(t.opt.GeneratedOverrides))
+	defer t.reportUnusedGeneratedOverrides(usedOverride)
 	for _, p := range t.pendingGenConcat {
 		if p.tableIdx < 0 || p.tableIdx >= len(t.res.Plan.Tables) || t.res.Plan.Tables[p.tableIdx].Name != p.table {
 			continue
@@ -149,23 +170,26 @@ func (t *translator) resolveMySQLGeneratedConcat() {
 		}
 		obj := p.table + "." + p.col.Name
 		src := rawExpr(p.expr)
+		if t.takeGeneratedOverride(tbl, idx, p.table, p.col.Name, obj, src, usedOverride) {
+			// The user's PostgreSQL expression wins over every other
+			// treatment (CONCAT rewrite, text-conversion and parse-error
+			// refusals): no refusal, no copy, no VIRTUAL → STORED note
+			// (the override is STORED by construction). A duplicated or
+			// structurally unsafe override is refused (blocking) and the
+			// column falls through to its usual treatment below.
+			continue
+		}
 		if t.opt.ParseError != nil {
 			// Parser error recovery may have cut the generation
 			// expression short (`concat(v,'x') regexp 'ax'` comes back
 			// as `concat(v,'x')`) or dropped its CONCAT (`binary
 			// concat(v,'x')` comes back as "binary"): the parsed
 			// expression is not proven to be the whole source
-			// expression, so nothing is rewritten.
+			// expression, so nothing is translated.
 			msg := "generated column " + obj + " AS (" + src + "): the source DDL has parse errors (" + t.opt.ParseError.Error() +
-				"), so the parsed generation expression may be only part of the source expression, or may have lost a CONCAT / CONCAT_WS. squishy refuses to guess MySQL's text conversion and does not translate this generated column: the DDL keeps the expression as parsed."
-			t.res.Explanations = append(t.res.Explanations, Explanation{
-				Object: obj,
-				Source: "GENERATED ALWAYS AS (" + src + ")",
-				Target: "GENERATED ALWAYS AS (" + src + ") STORED (as parsed, not verified: source DDL has parse errors)",
-				Reason: msg,
-				Level:  "error",
-			})
-			t.warnSev(obj, "table.generated_parse_error", msg, SeverityBlocking)
+				"), so the parsed generation expression may be only part of the source expression, or may have lost a CONCAT / CONCAT_WS. squishy refuses to guess MySQL's text conversion and does not translate this generated column." +
+				mysqlGenLostReason
+			t.copyRefusedGenerated(tbl, idx, obj, src, "table.generated_parse_error", msg)
 			continue
 		}
 		g := &mysqlGenConcat{t: t, p: p, pgCols: tbl.Columns}
@@ -175,19 +199,14 @@ func (t *translator) resolveMySQLGeneratedConcat() {
 			// (hex / bit literal, boolean converted or stored as text).
 			hazards := g.textConversionHazards(p.expr)
 			if len(hazards) == 0 {
+				t.noteVirtualPromoted(p, obj)
 				continue
 			}
 			msg := "generated column " + obj + " AS (" + src + "): squishy refuses to guess MySQL's text conversion and does not translate it — " +
 				strings.Join(hazards, " | ") +
-				". PostgreSQL does not print these values as MySQL does: MySQL reads a hex / bit literal as a binary string (X'41' is 'A') and prints a boolean (TINYINT(1) / BIT(1) column, comparison, NOT, TRUE / FALSE) as the integer 1 / 0, where PostgreSQL has the number 41 and t / f or true / false. The DDL keeps the expression as translated; PostgreSQL may accept it and store a different text, so the column must be rewritten by hand before the run."
-			t.res.Explanations = append(t.res.Explanations, Explanation{
-				Object: obj,
-				Source: "GENERATED ALWAYS AS (" + src + ")",
-				Target: "GENERATED ALWAYS AS (" + src + ") STORED (untranslated: PostgreSQL may store a different text)",
-				Reason: msg,
-				Level:  "error",
-			})
-			t.warnSev(obj, "table.generated_concat", msg, SeverityBlocking)
+				". PostgreSQL does not print these values as MySQL does: MySQL reads a hex / bit literal as a binary string (X'41' is 'A') and prints a boolean (TINYINT(1) / BIT(1) column, comparison, NOT, TRUE / FALSE) as the integer 1 / 0, where PostgreSQL has the number 41 and t / f or true / false." +
+				mysqlGenLostReason
+			t.copyRefusedGenerated(tbl, idx, obj, src, "table.generated_text_conversion", msg)
 			continue
 		}
 		out, refusals := g.rewrite(p.expr)
@@ -200,20 +219,49 @@ func (t *translator) resolveMySQLGeneratedConcat() {
 				Reason: "PG's concat() is not immutable, so CONCAT is rewritten into ||. The generated column is VARCHAR(n) (PG raises an error where MySQL may truncate) and every argument is a same-charset VARCHAR / TEXT column, a non-boolean integer column, a string literal or an integer literal, whose text is identical in both engines; || returns NULL as soon as one operand is NULL, like MySQL's CONCAT (assuming max_allowed_packet is at least the byte size of the VARCHAR).",
 				Level:  "info",
 			})
+			t.noteVirtualPromoted(p, obj)
 			continue
 		}
 		msg := "generated column " + obj + " AS (" + src + "): squishy refuses to guess MySQL's text conversion in CONCAT / CONCAT_WS and does not translate it — " +
 			strings.Join(refusals, " | ") +
-			". Only a generation expression that is exactly CONCAT(…) into a VARCHAR(n) column, over string literals, integer literals, same-charset VARCHAR / TEXT columns, non-boolean integer columns and nested CONCAT of those, is rewritten. The DDL keeps concat() / concat_ws() / CONCAT_OPERATOR_ORACLE(), which PostgreSQL rejects in a generation expression (not immutable), so create_ddl fails instead of storing a different value."
-		t.res.Explanations = append(t.res.Explanations, Explanation{
-			Object: obj,
-			Source: "GENERATED ALWAYS AS (" + src + ")",
-			Target: "GENERATED ALWAYS AS (" + src + ") STORED (untranslated: fails at create_ddl)",
-			Reason: msg,
-			Level:  "error",
-		})
-		t.warnSev(obj, "table.generated_concat", msg, SeverityBlocking)
+			". Only a generation expression that is exactly CONCAT(…) into a VARCHAR(n) column, over string literals, integer literals, same-charset VARCHAR / TEXT columns, non-boolean integer columns and nested CONCAT of those, is rewritten (PostgreSQL's concat() / concat_ws() are not immutable and cannot appear in a generation expression)." +
+			mysqlGenLostReason
+		t.copyRefusedGenerated(tbl, idx, obj, src, "table.generated_text_conversion", msg)
 	}
+}
+
+// copyRefusedGenerated turns the refused generated column tbl.Columns[idx]
+// into a plain column of its mapped type (NOT NULL kept) whose values the
+// copy transfers from the source (PGTable.CopiedGenerated, CopyColumns),
+// and reports the lost generation: an error explanation and a blocking
+// warning of the given kind, which buildPrerequisites turns into a
+// manual-review prerequisite.
+func (t *translator) copyRefusedGenerated(tbl *PGTable, idx int, obj, src, kind, msg string) {
+	tbl.Columns[idx].Generated = nil
+	tbl.CopiedGenerated = append(tbl.CopiedGenerated, tbl.Columns[idx].Name)
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: obj,
+		Source: "GENERATED ALWAYS AS (" + src + ")",
+		Target: tbl.Columns[idx].Type + " (plain column: values copied from the source, generation NOT reproduced on PostgreSQL)",
+		Reason: msg,
+		Level:  "error",
+	})
+	t.warnSev(obj, kind, msg, SeverityBlocking)
+}
+
+// noteVirtualPromoted records that a VIRTUAL source column keeping a
+// generation expression becomes a STORED PG generated column.
+func (t *translator) noteVirtualPromoted(p mysqlGenPending, obj string) {
+	if p.col.Generated == nil || !p.col.Generated.Virtual {
+		return
+	}
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: obj,
+		Source: "GENERATED ... VIRTUAL",
+		Target: "GENERATED ALWAYS AS (...) STORED",
+		Reason: "PostgreSQL only supports STORED generated columns; VIRTUAL is promoted to STORED.",
+		Level:  "warn",
+	})
 }
 
 // mysqlGenConcat is the state of one generated-column resolution.

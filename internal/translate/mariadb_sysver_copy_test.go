@@ -42,12 +42,13 @@ func TestMariaDBSysver_GeneratedColumnsCopiedIntoHistory(t *testing.T) {
 	require.NotNil(t, sv)
 	require.NotNil(t, planColumn(t, cur, "g").Generated)
 	require.NotNil(t, planColumn(t, cur, "v").Generated)
-	require.Equal(t, []string{"id", "a", "rs", "re"}, sv.CopyColumns)
+	require.Equal(t, []string{"id", "a", "rs", "re"}, cur.CopyColumns)
+	require.Empty(t, cur.CopiedGenerated)
 	require.Equal(t, []string{"id", "a", "g", "v", "rs", "re"}, sv.HistoryCopyColumns)
 
 	// Every copied column exists in the table it is copied into, and
 	// the history table stores the generated values as plain columns.
-	for _, c := range sv.CopyColumns {
+	for _, c := range cur.CopyColumns {
 		require.Nil(t, planColumn(t, cur, c).Generated, "current-table copy column %s", c)
 	}
 	hist := planTable(t, res, sv.HistoryTable)
@@ -67,6 +68,7 @@ func TestMariaDBSysver_NotEmulatedHasNoCopyColumns(t *testing.T) {
 	tbl := planTable(t, res, "t_trx")
 	require.Nil(t, tbl.SystemVersioning)
 	require.Len(t, tbl.Columns, 2)
+	require.Nil(t, tbl.CopyColumns)
 
 	res = translateMariaDBSysver(t, mariadbFeaturesXLEmployees, "")
 	require.Nil(t, planTable(t, res, "employees").SystemVersioning)

@@ -113,6 +113,17 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
+	// Per-column generation expression overrides the user stored on the
+	// migration (kept across re-plans); the translator checks each one
+	// structurally and emits the safe ones verbatim.
+	overrides := []translate.GeneratedOverride{}
+	if len(mig.GeneratedOverrides) > 0 {
+		if err := json.Unmarshal(mig.GeneratedOverrides, &overrides); err != nil {
+			// Stored server-side state, not the request body.
+			errJSON(w, http.StatusInternalServerError, "malformed generated_overrides stored on the migration: "+err.Error())
+			return
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
@@ -184,6 +195,8 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		TargetExtensions: targetExts,
 		MariaDBRowEndMax: schema.RowEndMax,
 		ParseError:       parseErr,
+
+		GeneratedOverrides: overrides,
 	})
 	if parseErr != nil {
 		result.Warnings = append(result.Warnings, translate.Warning{
@@ -258,16 +271,17 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		Msg("plan done")
 
 	createdJSON(w, map[string]any{
-		"migration_id":    updated.ID,
-		"status":          updated.Status,
-		"ddl_script":      result.DDLScript,
-		"ddl_post_script": result.DDLPostCopy,
-		"explanations":    result.Explanations,
-		"type_mappings":   result.TypeMappings,
-		"warnings":        result.Warnings,
-		"prerequisites":   result.Prerequisites,
-		"stmts_parsed":    len(stmts),
-		"timings":         timings,
+		"migration_id":        updated.ID,
+		"status":              updated.Status,
+		"ddl_script":          result.DDLScript,
+		"ddl_post_script":     result.DDLPostCopy,
+		"explanations":        result.Explanations,
+		"type_mappings":       result.TypeMappings,
+		"warnings":            result.Warnings,
+		"prerequisites":       result.Prerequisites,
+		"generated_overrides": overrides,
+		"stmts_parsed":        len(stmts),
+		"timings":             timings,
 	})
 }
 

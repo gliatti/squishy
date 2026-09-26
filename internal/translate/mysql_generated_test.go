@@ -30,7 +30,7 @@ func genConcatTable(gen string) string {
 func requireNoGeneratedError(t *testing.T, res *Result, object string) {
 	t.Helper()
 	for _, w := range res.Warnings {
-		require.NotEqual(t, "table.generated_concat", w.Kind, "unexpected refusal: %+v", w)
+		require.NotEqual(t, "table.generated_text_conversion", w.Kind, "unexpected refusal: %+v", w)
 		require.NotEqual(t, "table.generated_parse_error", w.Kind, "unexpected refusal: %+v", w)
 	}
 	for _, e := range res.Explanations {
@@ -39,17 +39,19 @@ func requireNoGeneratedError(t *testing.T, res *Result, object string) {
 }
 
 // requireGeneratedError asserts the refusal of table.col is reported
-// everywhere: an "error" explanation, a blocking table.generated_concat
-// warning and a blocking manual-review prerequisite that name the column
-// and the source expression, and the DDL keeps the untranslated call
-// (keptCall) as the whole generation expression.
+// everywhere — an "error" explanation, a blocking
+// table.generated_text_conversion warning and a blocking manual-review
+// prerequisite that name the column and the source expression — and that
+// the column is created plain and copied from the source. keptCall, when
+// not empty, is the whole translated expression the refusal reports
+// (explanation Source), which the DDL must not carry.
 func requireGeneratedError(t *testing.T, res *Result, table, col, reason, keptCall string) {
 	t.Helper()
-	requireGeneratedRefusal(t, res, "table.generated_concat", table, col, reason, keptCall)
+	requireGeneratedRefusal(t, res, "table.generated_text_conversion", table, col, reason, keptCall)
 }
 
 // requireGeneratedRefusal is requireGeneratedError for a given warning
-// kind (table.generated_concat or table.generated_parse_error).
+// kind (table.generated_text_conversion or table.generated_parse_error).
 func requireGeneratedRefusal(t *testing.T, res *Result, kind, table, col, reason, keptCall string) {
 	t.Helper()
 	object := table + "." + col
@@ -60,6 +62,11 @@ func requireGeneratedRefusal(t *testing.T, res *Result, kind, table, col, reason
 			require.Contains(t, e.Reason, "refuses to guess MySQL's text conversion")
 			require.Contains(t, e.Reason, srcExpr)
 			require.Contains(t, e.Reason, reason)
+			require.Contains(t, e.Reason, "plain column whose values are copied from the source")
+			require.Contains(t, e.Target, "plain column: values copied from the source")
+			if keptCall != "" {
+				require.Equal(t, "GENERATED ALWAYS AS ("+keptCall+")", e.Source)
+			}
 			expl = true
 		}
 	}
@@ -79,14 +86,36 @@ func requireGeneratedRefusal(t *testing.T, res *Result, kind, table, col, reason
 			require.Contains(t, p.Title, object)
 			require.Contains(t, p.Description, srcExpr)
 			require.Contains(t, p.Description, "refuses to guess MySQL's text conversion")
-			require.Contains(t, p.Remediation, "rewrite the generation expression by hand")
-			require.Contains(t, p.Remediation, "drop the generated column")
+			require.Contains(t, p.Description, "values are copied from the source")
+			require.Contains(t, p.Remediation, "override")
+			require.Contains(t, p.Remediation, "trigger")
 			blocking = true
 		}
 	}
 	require.True(t, blocking, "no blocking prerequisite: %+v", res.Prerequisites)
-	require.Equal(t, keptCall, planColumn(t, planTable(t, res, table), col).Generated.Expr)
-	require.Contains(t, res.DDLScript, keptCall)
+	tbl := planTable(t, res, table)
+	require.Nil(t, planColumn(t, tbl, col).Generated, "refused generated column %s must be plain", object)
+	require.Contains(t, tbl.CopiedGenerated, col)
+	require.Contains(t, tbl.CopyColumns, col)
+	if keptCall != "" {
+		require.NotContains(t, res.DDLScript, "GENERATED ALWAYS AS ("+keptCall+")")
+	}
+	for _, e := range res.Explanations {
+		require.False(t, e.Object == object && e.Source == "GENERATED ... VIRTUAL", "refused column reported as promoted to STORED: %+v", e)
+	}
+}
+
+// refusedGeneratedSource returns the Source of the error explanation of
+// a refused generated column: "GENERATED ALWAYS AS (<translated expr>)".
+func refusedGeneratedSource(t *testing.T, res *Result, object string) string {
+	t.Helper()
+	for _, e := range res.Explanations {
+		if e.Object == object && e.Level == "error" {
+			return e.Source
+		}
+	}
+	t.Fatalf("no error explanation for %s: %+v", object, res.Explanations)
+	return ""
 }
 
 // Run bug (mariadb-sysver-history sample, sv_orders): a generated column
@@ -145,9 +174,9 @@ func TestMySQLGeneratedConcatSameExplicitCharset(t *testing.T) {
 // DOUBLE(M,D) losing its decimals, hex literals read in the wrong
 // charset, collation-dependent comparisons, FLOAT single precision,
 // DECIMAL scale…): anything outside the whitelist is an error, never a
-// guess. The DDL keeps concat() / concat_ws() — the whole expression is
-// left untouched — so a forced run fails at create_ddl instead of
-// storing a different value.
+// guess. The column loses its generation expression and becomes a plain
+// column whose values are copied from the source, so a forced run never
+// stores a different value.
 func TestMySQLGeneratedConcatRefused(t *testing.T) {
 	cases := []struct{ name, gen, reason, kept string }{
 		{"tinyint(1)", "concat('a=',`flag`)", "TINYINT(1) column", `concat('a=', "flag")`},
@@ -197,7 +226,7 @@ func TestMySQLGeneratedConcatRefused(t *testing.T) {
 // immutable, so PG would accept it and run the comparison / LIKE / IN /
 // CASE with its own collation (MariaDB's utf8mb4_uca1400_ai_ci is
 // case-insensitive: concat(v, 'x') = 'ABCx' is 1 for v = 'abc', PG
-// gives false). Refused, concat() kept.
+// gives false). Refused: plain column copied from the source.
 func TestMySQLGeneratedConcatInsideLargerExpressionRefused(t *testing.T) {
 	cases := []struct{ name, typ, gen, kept string }{
 		{"comparison", "tinyint(1)", "concat(`v`,'') = 'ABC'", `concat("v", '') = 'ABC'`},
@@ -210,10 +239,11 @@ func TestMySQLGeneratedConcatInsideLargerExpressionRefused(t *testing.T) {
 			res := translateMariaDBSysver(t, "CREATE TABLE `u` (\n  `id` int(11) NOT NULL,\n  `v` varchar(20) DEFAULT NULL,\n"+
 				"  `g` "+tc.typ+" GENERATED ALWAYS AS ("+tc.gen+") VIRTUAL,\n"+
 				"  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;\n", "")
-			expr := planColumn(t, planTable(t, res, "u"), "g").Generated.Expr
-			require.Contains(t, expr, tc.kept)
-			require.NotContains(t, expr, "||")
-			requireGeneratedError(t, res, "u", "g", "inside a larger expression", expr)
+			src := refusedGeneratedSource(t, res, "u.g")
+			require.Contains(t, src, tc.kept)
+			require.NotContains(t, src, "||")
+			requireGeneratedError(t, res, "u", "g", "inside a larger expression", "")
+			require.NotContains(t, res.DDLScript, src)
 		})
 	}
 }
@@ -305,7 +335,7 @@ func TestMySQLGeneratedConcatNestedRefusalReportedOnce(t *testing.T) {
 	res := translateMariaDBSysver(t, genConcatTable("concat(`v`,concat('#',`dbl`))"), "")
 	var n int
 	for _, w := range res.Warnings {
-		if w.Kind == "table.generated_concat" {
+		if w.Kind == "table.generated_text_conversion" {
 			n++
 			require.Contains(t, w.Message, "DOUBLE(10,2) column")
 		}
@@ -336,9 +366,11 @@ func TestMySQLGeneratedWithoutConcatUnchanged(t *testing.T) {
 		"  `up` varchar(20) GENERATED ALWAYS AS (upper(`id`)) VIRTUAL,\n"+
 		"  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n", "")
 	for _, w := range res.Warnings {
-		require.NotEqual(t, "table.generated_concat", w.Kind)
+		require.NotEqual(t, "table.generated_text_conversion", w.Kind)
 	}
 	tbl := planTable(t, res, "g")
+	require.Empty(t, tbl.CopiedGenerated)
+	require.Nil(t, tbl.CopyColumns, "an unrefused, non-emulated table uses the catalog default copy list")
 	require.Equal(t, `"qty" * "price"`, planColumn(t, tbl, "total").Generated.Expr)
 	require.Equal(t, `UPPER("id")`, planColumn(t, tbl, "up").Generated.Expr)
 }
@@ -386,8 +418,8 @@ func TestMySQLColumnCheckNotEnforcedParsed(t *testing.T) {
 // down to `concat(`v`,'x')`, a whitelisted CONCAT: the column was
 // rewritten into ("v" || 'x') and PG stored 'ax' where MariaDB stores 1.
 // With parse errors in the source DDL nothing is rewritten, the refusal
-// is blocking (table.generated_parse_error), and the DDL keeps concat()
-// (create_ddl fails loudly).
+// is blocking (table.generated_parse_error), and the column becomes a
+// plain column copied from the source.
 func TestMySQLGeneratedConcatRefusedOnParseErrors(t *testing.T) {
 	src := "CREATE TABLE `u` (\n  `id` int(11) NOT NULL,\n  `v` varchar(20) DEFAULT NULL,\n" +
 		"  `g1` varchar(40) AS (concat(`v`,'x') regexp 'a') STORED,\n" +
@@ -423,7 +455,7 @@ func TestMySQLGeneratedConcatCaseDistinctTables(t *testing.T) {
 	requireGeneratedError(t, res, "u", "g", "DOUBLE column", `concat("v", "dbl")`)
 	require.Equal(t, `("v" || CAST("id" AS text))`, planColumn(t, planTable(t, res, "U"), "g").Generated.Expr)
 	for _, w := range res.Warnings {
-		require.False(t, w.Kind == "table.generated_concat" && w.Object == "U.g", "unexpected refusal: %+v", w)
+		require.False(t, w.Kind == "table.generated_text_conversion" && w.Object == "U.g", "unexpected refusal: %+v", w)
 	}
 	var info bool
 	for _, e := range res.Explanations {
@@ -440,8 +472,8 @@ func TestMySQLGeneratedConcatCaseDistinctTables(t *testing.T) {
 // Review finding: parser error recovery can drop the CONCAT entirely
 // (`binary concat(v,'x')` comes back as the identifier "binary"), so no
 // CONCAT is left to trigger the refusal. With parse errors every MySQL
-// generated column is refused, CONCAT or not, and keeps its parsed
-// expression.
+// generated column is refused, CONCAT or not, and becomes a plain
+// column copied from the source.
 func TestMySQLGeneratedRefusedOnParseErrorsWithoutConcat(t *testing.T) {
 	src := "CREATE TABLE `w` (\n  `id` int(11) NOT NULL,\n  `n` int(11) DEFAULT NULL,\n" +
 		"  `d` int(11) AS (`n` * 2) VIRTUAL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n" +
@@ -451,11 +483,10 @@ func TestMySQLGeneratedRefusedOnParseErrorsWithoutConcat(t *testing.T) {
 	stmts, perr := mysqldialect.New(dialects.KindMariaDB, "MariaDB").Parse(src)
 	require.Error(t, perr)
 	res := Translate(stmts, Options{SourceKind: dialects.KindMariaDB, TargetSchema: "mig", ParseError: perr})
-	g1 := planColumn(t, planTable(t, res, "u"), "g1").Generated.Expr
-	requireGeneratedRefusal(t, res, "table.generated_parse_error", "u", "g1", "the source DDL has parse errors", g1)
+	requireGeneratedRefusal(t, res, "table.generated_parse_error", "u", "g1", "the source DDL has parse errors", "")
 	requireGeneratedRefusal(t, res, "table.generated_parse_error", "w", "d", "the source DDL has parse errors", `"n" * 2`)
 	for _, w := range res.Warnings {
-		require.NotEqual(t, "table.generated_concat", w.Kind, "parse-error refusal reported as a CONCAT refusal: %+v", w)
+		require.NotEqual(t, "table.generated_text_conversion", w.Kind, "parse-error refusal reported as a text-conversion refusal: %+v", w)
 	}
 
 	// Without parse errors a generated column without CONCAT keeps its
@@ -486,8 +517,8 @@ func genTextConvTable(typ, gen string) string {
 //     assignment cast 'true' / 'false'.
 //
 // Same treatment as a refused CONCAT: an error explanation, a blocking
-// table.generated_concat warning and a blocking manual-review
-// prerequisite; the DDL keeps the expression as translated.
+// table.generated_text_conversion warning and a blocking manual-review
+// prerequisite; the column is created plain and copied from the source.
 func TestMySQLGeneratedTextConversionRefused(t *testing.T) {
 	cases := []struct{ name, typ, gen, reason, kept string }{
 		// (a) hex / bit literals, anywhere in the expression.
@@ -516,20 +547,11 @@ func TestMySQLGeneratedTextConversionRefused(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			res := translateMariaDBSysver(t, genTextConvTable(tc.typ, tc.gen), "")
-			kept := planColumn(t, planTable(t, res, "u"), "g").Generated.Expr
-			if tc.kept != "" {
-				require.Equal(t, tc.kept, kept)
-			}
-			requireGeneratedError(t, res, "u", "g", tc.reason, kept)
-			for _, e := range res.Explanations {
-				if e.Object == "u.g" && e.Level == "error" {
-					require.Contains(t, e.Target, "PostgreSQL may store a different text")
-				}
-			}
+			requireGeneratedError(t, res, "u", "g", tc.reason, tc.kept)
 			for _, p := range res.Prerequisites {
 				if p.Object == "u.g" && p.Severity == SeverityBlocking {
 					require.Contains(t, p.Title, "MySQL text conversion not translated")
-					require.Contains(t, p.Description, "PostgreSQL may accept while storing a different text")
+					require.Contains(t, p.Description, "PostgreSQL does not compute it")
 				}
 			}
 		})
@@ -581,19 +603,336 @@ func TestMySQLGeneratedSysverOrdersSample(t *testing.T) {
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci WITH SYSTEM VERSIONING;\n", mariadb118RowEndMax)
 	tbl := planTable(t, res, "sv_orders")
 	requireGeneratedError(t, res, "sv_orders", "mark", "hex literal 41", "41")
-	requireGeneratedError(t, res, "sv_orders", "paid_c", "converts a boolean value", planColumn(t, tbl, "paid_c").Generated.Expr)
+	requireGeneratedError(t, res, "sv_orders", "paid_c", "converts a boolean value", "")
 	requireGeneratedError(t, res, "sv_orders", "paid_v", "is a boolean", `"paid"`)
-	requireGeneratedError(t, res, "sv_orders", "summary", "TINYINT(1) column", planColumn(t, tbl, "summary").Generated.Expr)
-	requireGeneratedError(t, res, "sv_orders", "tags", "CONCAT_WS is never rewritten", planColumn(t, tbl, "tags").Generated.Expr)
+	requireGeneratedError(t, res, "sv_orders", "summary", "TINYINT(1) column", "")
+	requireGeneratedError(t, res, "sv_orders", "tags", "CONCAT_WS is never rewritten", "")
 	require.Equal(t, `('order#' || CAST("id" AS text))`, planColumn(t, tbl, "label").Generated.Expr)
 	for _, col := range []string{"label", "total_v", "total_s", "total_t", "note_len"} {
 		obj := "sv_orders." + col
+		require.NotNil(t, planColumn(t, tbl, col).Generated, "%s keeps its generation", obj)
 		for _, w := range res.Warnings {
-			require.False(t, w.Object == obj && (w.Kind == "table.generated_concat" || w.Kind == "table.generated_parse_error"), "unexpected refusal: %+v", w)
+			require.False(t, w.Object == obj && (w.Kind == "table.generated_text_conversion" || w.Kind == "table.generated_parse_error"), "unexpected refusal: %+v", w)
 		}
 		for _, e := range res.Explanations {
 			require.False(t, e.Object == obj && e.Level == "error", "unexpected error explanation: %+v", e)
 		}
 	}
 	require.Equal(t, `"qty" * "unit_price"`, planColumn(t, tbl, "total_t").Generated.Expr)
+
+	// The refused columns are created plain and copied from the source
+	// (plan order); the current-table copy lists every column without a
+	// PG generation expression, the history copy every column.
+	require.Equal(t, []string{"summary", "tags", "paid_c", "paid_v", "mark"}, tbl.CopiedGenerated)
+	require.Equal(t, []string{"id", "qty", "unit_price", "paid", "code", "note",
+		"summary", "tags", "paid_c", "paid_v", "mark", "sys_start", "sys_end"}, tbl.CopyColumns)
+	require.NotNil(t, tbl.SystemVersioning)
+	require.Equal(t, []string{"id", "qty", "unit_price", "paid", "code", "note",
+		"total_v", "total_s", "label", "summary", "tags", "paid_c", "paid_v", "total_t", "mark", "note_len",
+		"sys_start", "sys_end"}, tbl.SystemVersioning.HistoryCopyColumns)
+	// VIRTUAL → STORED is noted only for the VIRTUAL columns that keep a
+	// generation expression.
+	promoted := map[string]bool{}
+	for _, e := range res.Explanations {
+		if e.Source == "GENERATED ... VIRTUAL" {
+			promoted[e.Object] = true
+		}
+	}
+	require.Equal(t, map[string]bool{"sv_orders.total_v": true, "sv_orders.label": true, "sv_orders.note_len": true}, promoted)
+}
+
+// A refused generated column in a table with a spatial column: the
+// generated column is copied from the source, the spatial column (which
+// the copier cannot transfer) stays out of the explicit copy list, like
+// the catalog default leaves it out.
+func TestMySQLGeneratedCopiedWithSpatialColumn(t *testing.T) {
+	res := translateMariaDBSysver(t, "CREATE TABLE `u` (\n  `id` int(11) NOT NULL,\n  `pos` point DEFAULT NULL,\n"+
+		"  `paid` tinyint(1) DEFAULT NULL,\n  `pv` varchar(5) GENERATED ALWAYS AS (`paid`) VIRTUAL,\n"+
+		"  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n", "")
+	requireGeneratedError(t, res, "u", "pv", "is a boolean", `"paid"`)
+	tbl := planTable(t, res, "u")
+	planColumn(t, tbl, "pos")
+	require.Equal(t, []string{"pv"}, tbl.CopiedGenerated)
+	require.Equal(t, []string{"id", "paid", "pv"}, tbl.CopyColumns)
+}
+
+// A table whose generated columns all keep their generation, and a plain
+// table, carry no explicit copy list: the catalog default applies.
+func TestMySQLGeneratedUnrefusedHasNoCopyColumns(t *testing.T) {
+	res := translateMariaDBSysver(t, "CREATE TABLE `g` (\n  `id` int(11) NOT NULL,\n  `v` varchar(20) DEFAULT NULL,\n"+
+		"  `label` varchar(40) GENERATED ALWAYS AS (concat('order#',`id`)) VIRTUAL,\n"+
+		"  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n"+
+		"CREATE TABLE `p` (\n  `id` int(11) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n", "")
+	for _, name := range []string{"g", "p"} {
+		tbl := planTable(t, res, name)
+		require.Nil(t, tbl.CopiedGenerated, name)
+		require.Nil(t, tbl.CopyColumns, name)
+	}
+	require.NotNil(t, planColumn(t, planTable(t, res, "g"), "label").Generated)
+}
+
+// translateMariaDBOverrides parses src as MariaDB and translates it with
+// the given generated-column overrides.
+func translateMariaDBOverrides(t *testing.T, src, rowEndMax string, ovs ...GeneratedOverride) *Result {
+	t.Helper()
+	stmts, errs := mysqldialect.Parse(src)
+	require.Empty(t, errs, "parse errors: %v", errs)
+	return Translate(stmts, Options{SourceKind: dialects.KindMariaDB, TargetSchema: "mig",
+		MariaDBRowEndMax: rowEndMax, GeneratedOverrides: ovs})
+}
+
+// requireGeneratedOverridden asserts table.col carries the override
+// verbatim as a STORED generation: DDL, one info explanation marked
+// "(user override)", no refusal, no VIRTUAL → STORED note, no
+// prerequisite, not copied from the source.
+func requireGeneratedOverridden(t *testing.T, res *Result, table, col, expr string) {
+	t.Helper()
+	object := table + "." + col
+	tbl := planTable(t, res, table)
+	gen := planColumn(t, tbl, col).Generated
+	require.NotNil(t, gen, "%s must keep a generation", object)
+	require.Equal(t, expr, gen.Expr)
+	require.True(t, gen.Stored)
+	require.Contains(t, res.DDLScript, "GENERATED ALWAYS AS ("+expr+") STORED")
+	requireNoGeneratedError(t, res, object)
+	var infos int
+	for _, e := range res.Explanations {
+		if e.Object != object {
+			continue
+		}
+		require.NotEqual(t, "GENERATED ... VIRTUAL", e.Source, "override reported as promoted to STORED: %+v", e)
+		if e.Level == "info" {
+			require.Contains(t, e.Target, "(user override)")
+			require.Contains(t, e.Target, expr)
+			require.Contains(t, e.Source, "GENERATED ALWAYS AS (")
+			infos++
+		}
+	}
+	require.Equal(t, 1, infos, "one override explanation expected: %+v", res.Explanations)
+	for _, w := range res.Warnings {
+		require.NotEqual(t, object, w.Object, "unexpected warning: %+v", w)
+	}
+	for _, p := range res.Prerequisites {
+		require.NotContains(t, p.Object, object, "unexpected prerequisite: %+v", p)
+	}
+	require.NotContains(t, tbl.CopiedGenerated, col)
+	require.NotContains(t, tbl.CopyColumns, col)
+}
+
+// Feature (A): a refused generated column (a boolean stored in a
+// VARCHAR, which PG would print true / false where MariaDB stores 1 / 0)
+// gets the user's PostgreSQL expression verbatim; the column name is
+// matched case-insensitively.
+func TestMySQLGeneratedOverride(t *testing.T) {
+	const expr = `CASE WHEN "paid" THEN '1' ELSE '0' END`
+	res := translateMariaDBOverrides(t, genTextConvTable("varchar(5)", "`paid`"), "",
+		GeneratedOverride{Table: "u", Column: "G", Expr: expr})
+	requireGeneratedOverridden(t, res, "u", "g", expr)
+	tbl := planTable(t, res, "u")
+	require.Nil(t, tbl.CopiedGenerated)
+	require.Nil(t, tbl.CopyColumns, "nothing is copied from the source: the catalog default applies")
+	for _, w := range res.Warnings {
+		require.NotEqual(t, "table.generated_override_unused", w.Kind, "override reported unused: %+v", w)
+	}
+
+	// An override wins over the CONCAT → || rewrite of a whitelisted
+	// column (user intent).
+	const upper = `upper("v")`
+	res = translateMariaDBOverrides(t, genConcatTable("concat(`v`,'x')"), "",
+		GeneratedOverride{Table: "u", Column: "g", Expr: upper})
+	requireGeneratedOverridden(t, res, "u", "g", upper)
+	require.NotContains(t, res.DDLScript, `"v" || 'x'`)
+
+	// It also wins over the parse-error refusal: the user states the
+	// expression, the recovered source expression is only quoted.
+	src := "CREATE TABLE `u` (\n  `id` int(11) NOT NULL,\n  `v` varchar(20) DEFAULT NULL,\n" +
+		"  `g1` varchar(40) AS (concat(`v`,'x') regexp 'a') STORED,\n" +
+		"  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n"
+	stmts, perr := mysqldialect.New(dialects.KindMariaDB, "MariaDB").Parse(src)
+	require.Error(t, perr)
+	const re = `CASE WHEN ("v" || 'x') LIKE '%a%' THEN '1' ELSE '0' END`
+	res = Translate(stmts, Options{SourceKind: dialects.KindMariaDB, TargetSchema: "mig", ParseError: perr,
+		GeneratedOverrides: []GeneratedOverride{{Table: "u", Column: "g1", Expr: re}}})
+	requireGeneratedOverridden(t, res, "u", "g1", re)
+}
+
+// An override on a generated column of an emulated system-versioned
+// table: PG computes the current rows (the column leaves the
+// current-table copy list), the history table still stores the source
+// values (history copy and archiving trigger keep the column).
+func TestMySQLGeneratedOverrideSysver(t *testing.T) {
+	const expr = `"a" + 1`
+	res := translateMariaDBOverrides(t, mariadbSysverGenerated, mariadb118RowEndMax,
+		GeneratedOverride{Table: "t_gen", Column: "v", Expr: expr})
+	requireGeneratedOverridden(t, res, "t_gen", "v", expr)
+	cur := planTable(t, res, "t_gen")
+	require.NotNil(t, cur.SystemVersioning)
+	require.Equal(t, []string{"id", "a", "rs", "re"}, cur.CopyColumns)
+	require.Equal(t, []string{"id", "a", "g", "v", "rs", "re"}, cur.SystemVersioning.HistoryCopyColumns)
+	require.Nil(t, planColumn(t, planTable(t, res, cur.SystemVersioning.HistoryTable), "v").Generated)
+	require.Contains(t, res.DDLPostCopy, `OLD."v"`)
+}
+
+// An override that matches no source generated column is reported as an
+// info warning / prerequisite and changes nothing; table names are
+// compared case-sensitively (MySQL lower_case_table_names=0).
+func TestMySQLGeneratedOverrideUnused(t *testing.T) {
+	res := translateMariaDBOverrides(t, genTextConvTable("varchar(10)", "`qty`"), "",
+		GeneratedOverride{Table: "u", Column: "missing", Expr: `'x'`},
+		GeneratedOverride{Table: "u", Column: "qty", Expr: `'y'`},
+		GeneratedOverride{Table: "U", Column: "g", Expr: `'z'`})
+	requireNoGeneratedError(t, res, "u.g")
+	require.Equal(t, `"qty"`, planColumn(t, planTable(t, res, "u"), "g").Generated.Expr)
+	require.Nil(t, planColumn(t, planTable(t, res, "u"), "qty").Generated)
+	require.NotContains(t, res.DDLScript, "'z'")
+	for _, obj := range []string{"u.missing", "u.qty", "U.g"} {
+		var warned, prereq bool
+		for _, w := range res.Warnings {
+			if w.Object == obj {
+				require.Equal(t, "table.generated_override_unused", w.Kind)
+				require.Equal(t, string(SeverityInfo), w.Severity)
+				require.Contains(t, w.Message, "matches no generated column")
+				warned = true
+			}
+		}
+		require.True(t, warned, "no unused-override warning for %s: %+v", obj, res.Warnings)
+		for _, p := range res.Prerequisites {
+			if p.Object == obj {
+				require.Equal(t, SeverityInfo, p.Severity)
+				require.Equal(t, CatManualReview, p.Category)
+				require.Contains(t, p.Title, "Review unused generated-column override")
+				prereq = true
+			}
+		}
+		require.True(t, prereq, "no unused-override prerequisite for %s: %+v", obj, res.Prerequisites)
+		for _, e := range res.Explanations {
+			require.False(t, e.Object == obj && e.Level == "error", "unexpected error explanation: %+v", e)
+		}
+	}
+	for _, p := range res.Prerequisites {
+		require.NotEqual(t, SeverityBlocking, p.Severity, "unexpected blocking prerequisite: %+v", p)
+	}
+}
+
+// requireGeneratedOverrideRefused asserts the override of table.col was
+// refused: an error explanation and a blocking
+// table.generated_override_invalid warning / prerequisite whose message
+// contains why, no "(user override)" explanation, and no unused report.
+func requireGeneratedOverrideRefused(t *testing.T, res *Result, table, col, why string) {
+	t.Helper()
+	object := table + "." + col
+	var expl, warned, prereq bool
+	for _, e := range res.Explanations {
+		require.NotContains(t, e.Target, "(user override)", "override applied: %+v", e)
+		if e.Object == object && e.Level == "error" && e.Target == "(generation expression override refused)" {
+			require.Contains(t, e.Reason, why)
+			expl = true
+		}
+	}
+	require.True(t, expl, "no override-refused explanation: %+v", res.Explanations)
+	for _, w := range res.Warnings {
+		require.NotEqual(t, "table.generated_override_unused", w.Kind, "refused override reported unused: %+v", w)
+		if w.Object == object && w.Kind == "table.generated_override_invalid" {
+			require.Equal(t, string(SeverityBlocking), w.Severity)
+			require.Contains(t, w.Message, why)
+			warned = true
+		}
+	}
+	require.True(t, warned, "no table.generated_override_invalid warning: %+v", res.Warnings)
+	for _, p := range res.Prerequisites {
+		if p.Object == object && p.Title == "Fix refused generated-column override "+object {
+			require.Equal(t, SeverityBlocking, p.Severity)
+			require.Equal(t, CatManualReview, p.Category)
+			require.Contains(t, p.Description, why)
+			prereq = true
+		}
+	}
+	require.True(t, prereq, "no refused-override prerequisite: %+v", res.Prerequisites)
+}
+
+// Security: an override is embedded verbatim in the DDL script, which
+// create_ddl runs through the simple query protocol (several statements
+// allowed). An override that would leave GENERATED ALWAYS AS (…) —
+// break-out, ';', unbalanced parentheses, unterminated string /
+// identifier, comment, dollar quote, empty — is refused as a blocking
+// error; the column keeps the plain copied-from-source path, and the text
+// never reaches the DDL.
+func TestMySQLGeneratedOverrideRefusedUnsafe(t *testing.T) {
+	for _, tc := range []struct{ expr, why string }{
+		{`'x') STORED); DROP SCHEMA squishy CASCADE; CREATE TABLE z (a text GENERATED ALWAYS AS ('x'`, "unbalanced ')'"},
+		{`CASE WHEN "paid" THEN '1' ELSE '0' END; DROP TABLE t`, "';'"},
+		{`CASE WHEN ("paid" THEN '1' ELSE '0' END`, "unclosed '('"},
+		{`"paid")`, "unbalanced ')'"},
+		{`'1' /* DROP SCHEMA squishy`, "comment"},
+		{`'1' -- DROP SCHEMA squishy`, "comment"},
+		{`'1 DROP SCHEMA squishy`, "unterminated string"},
+		{`"paid DROP SCHEMA squishy`, "unterminated quoted identifier"},
+		{`$$1$$ DROP SCHEMA squishy`, "'$'"},
+		{`E'\'); DROP SCHEMA squishy; --'`, `\'`},
+		{``, "empty"},
+		{"  \n", "empty"},
+	} {
+		res := translateMariaDBOverrides(t, genTextConvTable("varchar(5)", "`paid`"), "",
+			GeneratedOverride{Table: "u", Column: "g", Expr: tc.expr})
+		requireGeneratedOverrideRefused(t, res, "u", "g", tc.why)
+		// The column gets its usual treatment: refused text conversion,
+		// plain column copied from the source.
+		tbl := planTable(t, res, "u")
+		require.Nil(t, planColumn(t, tbl, "g").Generated, tc.expr)
+		require.Equal(t, []string{"g"}, tbl.CopiedGenerated, tc.expr)
+		require.Contains(t, tbl.CopyColumns, "g", tc.expr)
+		var textConv bool
+		for _, w := range res.Warnings {
+			if w.Object == "u.g" && w.Kind == "table.generated_text_conversion" {
+				textConv = true
+			}
+		}
+		require.True(t, textConv, "text-conversion refusal expected for %q: %+v", tc.expr, res.Warnings)
+		require.NotContains(t, res.DDLScript, "DROP SCHEMA", tc.expr)
+		require.NotContains(t, res.DDLScript, "GENERATED ALWAYS AS", tc.expr)
+		if tc.expr != "" {
+			require.NotContains(t, res.DDLScript, tc.expr, tc.expr)
+		}
+	}
+}
+
+// Two overrides of the same column (column names compared
+// case-insensitively) are ambiguous: neither applies, the column is
+// refused as a duplicate (not reported as matching no column) and keeps
+// its usual treatment — here the whitelisted CONCAT → || rewrite.
+func TestMySQLGeneratedOverrideDuplicate(t *testing.T) {
+	res := translateMariaDBOverrides(t, genConcatTable("concat(`v`,'x')"), "",
+		GeneratedOverride{Table: "u", Column: "g", Expr: `upper("v")`},
+		GeneratedOverride{Table: "u", Column: "G", Expr: `lower("v")`})
+	requireGeneratedOverrideRefused(t, res, "u", "g", "duplicate override")
+	gen := planColumn(t, planTable(t, res, "u"), "g").Generated
+	require.NotNil(t, gen)
+	require.Contains(t, res.DDLScript, `"v" || 'x'`)
+	require.NotContains(t, res.DDLScript, `upper("v")`)
+	require.NotContains(t, res.DDLScript, `lower("v")`)
+}
+
+// ValidateGeneratedOverrides is the check the PUT endpoint runs before
+// storing overrides: names required, structurally safe expression, one
+// override per table.column.
+func TestValidateGeneratedOverrides(t *testing.T) {
+	require.NoError(t, ValidateGeneratedOverrides(nil))
+	require.NoError(t, ValidateGeneratedOverrides([]GeneratedOverride{
+		{Table: "u", Column: "g", Expr: `CASE WHEN "paid" THEN '1' ELSE '0' END`},
+		{Table: "U", Column: "g", Expr: `'x'`}, // other table (case-sensitive)
+	}))
+	for _, tc := range []struct {
+		ovs []GeneratedOverride
+		why string
+	}{
+		{[]GeneratedOverride{{Table: "", Column: "g", Expr: `'x'`}}, "table and column are required"},
+		{[]GeneratedOverride{{Table: "u", Column: "", Expr: `'x'`}}, "table and column are required"},
+		{[]GeneratedOverride{{Table: "u", Column: "g", Expr: ``}}, "empty"},
+		{[]GeneratedOverride{{Table: "u", Column: "g", Expr: `'x'); DROP TABLE t; SELECT ('x'`}}, "unbalanced ')'"},
+		{[]GeneratedOverride{{Table: "u", Column: "g", Expr: `'x'`}, {Table: "u", Column: "G", Expr: `'y'`}}, "duplicate override"},
+	} {
+		err := ValidateGeneratedOverrides(tc.ovs)
+		require.Error(t, err, "%+v", tc.ovs)
+		require.Contains(t, err.Error(), tc.why)
+	}
 }

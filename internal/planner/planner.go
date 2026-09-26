@@ -112,12 +112,14 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 				"rows":          tbl.Rows,
 				"target_schema": targetSchema,
 			}
-			// An emulated MariaDB system-versioned table copies the
-			// column set of its translated table (ROW START / ROW END
-			// included), which the source catalog's default list —
-			// every non-generated column — does not give.
-			if sv := emulatedSystemVersioning(pg, tbl.Name); sv != nil && len(sv.CopyColumns) > 0 {
-				payload["columns"] = append([]string{}, sv.CopyColumns...)
+			// The translator sets an explicit copy list when the source
+			// catalog's default — every non-generated, non-spatial
+			// column — does not match the PG table: an emulated MariaDB
+			// system-versioned table (ROW START / ROW END included) or
+			// refused generated columns created plain, whose values are
+			// copied (translate.PGTable.CopyColumns).
+			if pgTbl := translatedTable(pg, tbl.Name); pgTbl != nil && len(pgTbl.CopyColumns) > 0 {
+				payload["columns"] = append([]string{}, pgTbl.CopyColumns...)
 			}
 			id := addStep("copy_table", tbl.Name, 100, payload, ddlID)
 			// Rows estimated from information_schema; actual count computed by the worker.
@@ -299,18 +301,18 @@ func assignLevels(steps []Step) {
 	}
 }
 
-// emulatedSystemVersioning returns the system-versioning emulation of
-// the translated table named table, or nil. The name is matched
-// exactly: the translator names a MySQL/MariaDB table after its SHOW
-// CREATE TABLE, like the inspector's snapshot, and two tables may differ
-// only by case on a case-sensitive source (lower_case_table_names=0).
-func emulatedSystemVersioning(pg *translate.Result, table string) *translate.PGSystemVersioning {
+// translatedTable returns the translated table named table, or nil. The
+// name is matched exactly: the translator names a MySQL/MariaDB table
+// after its SHOW CREATE TABLE, like the inspector's snapshot, and two
+// tables may differ only by case on a case-sensitive source
+// (lower_case_table_names=0).
+func translatedTable(pg *translate.Result, table string) *translate.PGTable {
 	if pg == nil {
 		return nil
 	}
 	for i := range pg.Plan.Tables {
 		if pg.Plan.Tables[i].Name == table {
-			return pg.Plan.Tables[i].SystemVersioning
+			return &pg.Plan.Tables[i]
 		}
 	}
 	return nil

@@ -77,9 +77,13 @@ type Migration struct {
 	Warnings         json.RawMessage `json:"warnings"`
 	Prerequisites    json.RawMessage `json:"prerequisites"`
 	AckedPrereqs     json.RawMessage `json:"acked_prereqs"`
-	Options          json.RawMessage `json:"options"`
-	CreatedAt        time.Time       `json:"created_at"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+	// GeneratedOverrides is the JSON array of translate.GeneratedOverride
+	// the user set on this migration. Like AckedPrereqs it is user state:
+	// UpsertPlannedMigration never touches it, so it survives re-plans.
+	GeneratedOverrides json.RawMessage `json:"generated_overrides"`
+	Options            json.RawMessage `json:"options"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
 
 	// LatestRunID / LatestRunStatus are denormalized pointers to the most
 	// recent run of this migration, populated by ListMigrationsByInstance.
@@ -334,20 +338,21 @@ func (r *Repo) CreateDraftMigration(ctx context.Context, instanceID uuid.UUID,
 		  updated_at=now()
 		RETURNING id, instance_id, source_schema_name, target_db_name, target_schema_name,
 		          status, source_schema, target_plan, ddl_script, ddl_post_script,
-		          data_plan, type_mappings, explanations, warnings, prerequisites, acked_prereqs,
+		          data_plan, type_mappings, explanations, warnings, prerequisites, acked_prereqs, generated_overrides,
 		          options, created_at, updated_at`,
 		id, instanceID, sourceSchema, targetDB, targetSchema).
 		Scan(&m.ID, &m.InstanceID, &m.SourceSchemaName, &m.TargetDBName, &m.TargetSchemaName,
 			&m.Status, &m.SourceSchema, &m.TargetPlan, &m.DDLScript, &m.DDLPostScript,
 			&m.DataPlan, &m.TypeMappings, &m.Explanations, &m.Warnings, &m.Prerequisites,
-			&m.AckedPrereqs, &m.Options, &m.CreatedAt, &m.UpdatedAt)
+			&m.AckedPrereqs, &m.GeneratedOverrides, &m.Options, &m.CreatedAt, &m.UpdatedAt)
 	return &m, err
 }
 
 // UpsertPlannedMigration replaces (or inserts) the full plan payload for an
 // existing draft migration. Acked prerequisites are preserved on update — a
 // re-plan that introduces new blocking prereqs forces the user to ack them
-// again, but acks for prereqs that survive are kept.
+// again, but acks for prereqs that survive are kept. Generated-column
+// overrides are user input too and are never written here.
 func (r *Repo) UpsertPlannedMigration(ctx context.Context, m *Migration) error {
 	if m.ID == uuid.Nil {
 		m.ID = uuid.New()
@@ -392,13 +397,13 @@ func (r *Repo) GetMigration(ctx context.Context, id uuid.UUID) (*Migration, erro
 	err := r.Pool.QueryRow(ctx, `
 		SELECT id, instance_id, source_schema_name, target_db_name, target_schema_name, status,
 		       source_schema, target_plan, ddl_script, ddl_post_script,
-		       data_plan, type_mappings, explanations, warnings, prerequisites, acked_prereqs,
+		       data_plan, type_mappings, explanations, warnings, prerequisites, acked_prereqs, generated_overrides,
 		       options, created_at, updated_at
 		  FROM squishy.migrations WHERE id=$1`, id).
 		Scan(&m.ID, &m.InstanceID, &m.SourceSchemaName, &m.TargetDBName, &m.TargetSchemaName,
 			&m.Status, &m.SourceSchema, &m.TargetPlan, &m.DDLScript, &m.DDLPostScript,
 			&m.DataPlan, &m.TypeMappings, &m.Explanations, &m.Warnings, &m.Prerequisites,
-			&m.AckedPrereqs, &m.Options, &m.CreatedAt, &m.UpdatedAt)
+			&m.AckedPrereqs, &m.GeneratedOverrides, &m.Options, &m.CreatedAt, &m.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -411,7 +416,7 @@ func (r *Repo) ListMigrationsByInstance(ctx context.Context, instanceID uuid.UUI
 	// what the UI's instance table needs to render meaningful badges.
 	rows, err := r.Pool.Query(ctx, `
 		SELECT m.id, m.instance_id, m.source_schema_name, m.target_db_name, m.target_schema_name,
-		       m.status, m.ddl_script, m.ddl_post_script, m.prerequisites, m.acked_prereqs,
+		       m.status, m.ddl_script, m.ddl_post_script, m.prerequisites, m.acked_prereqs, m.generated_overrides,
 		       m.created_at, m.updated_at,
 		       lr.id, lr.status::text
 		  FROM squishy.migrations m
@@ -434,7 +439,7 @@ func (r *Repo) ListMigrationsByInstance(ctx context.Context, instanceID uuid.UUI
 		var lrID *uuid.UUID
 		var lrStatus *string
 		if err := rows.Scan(&m.ID, &m.InstanceID, &m.SourceSchemaName, &m.TargetDBName, &m.TargetSchemaName,
-			&m.Status, &m.DDLScript, &m.DDLPostScript, &m.Prerequisites, &m.AckedPrereqs,
+			&m.Status, &m.DDLScript, &m.DDLPostScript, &m.Prerequisites, &m.AckedPrereqs, &m.GeneratedOverrides,
 			&m.CreatedAt, &m.UpdatedAt, &lrID, &lrStatus); err != nil {
 			return nil, err
 		}
@@ -456,6 +461,22 @@ func (r *Repo) SetAckedPrereqs(ctx context.Context, migrationID uuid.UUID, ids [
 		`UPDATE squishy.migrations SET acked_prereqs=$2 WHERE id=$1`,
 		migrationID, payload)
 	return err
+}
+
+// SetGeneratedOverrides replaces the per-column generation expression
+// overrides of a migration (a JSON array of translate.GeneratedOverride;
+// nil / empty stores []). The next plan consumes them; re-plans keep them.
+func (r *Repo) SetGeneratedOverrides(ctx context.Context, migrationID uuid.UUID, raw json.RawMessage) error {
+	tag, err := r.Pool.Exec(ctx,
+		`UPDATE squishy.migrations SET generated_overrides=$2, updated_at=now() WHERE id=$1`,
+		migrationID, jsonArrayOrEmpty(raw))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ErrNotFound is the canonical not-found error for repository calls.

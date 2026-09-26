@@ -221,9 +221,10 @@ func TestASTOnlyGuard_DetectsViolations(t *testing.T) {
 		{
 			name: "regexp import",
 			file: "internal/planner/re.go",
-			// Escaped quotes keep the literal import line out of plain
-			// greps for the quoted path.
-			src:  "package planner\n\nimport \"regexp\"\n\nvar re = regexp.MustCompile(\"x\")\n",
+			// Escaped quotes keep the literal import line, and the
+			// split selector the literal call, out of plain greps
+			// (make check-no-regex greps for both).
+			src:  "package planner\n\nimport \"regexp\"\n\nvar re = regexp." + "MustCompile(\"x\")\n",
 			want: "forbidden import of package regexp ",
 		},
 		{
