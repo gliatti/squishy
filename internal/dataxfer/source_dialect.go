@@ -81,9 +81,13 @@ func (d mysqlDialect) SelectOffsetQuery(schema, table string, cols []string) str
 // own (CopyOpts.Columns). Every STORED GENERATED column is skipped,
 // MariaDB system-versioning period columns (`GENERATED ALWAYS AS ROW
 // START|END`) included: the translator drops them from every table it
-// does not emulate. An emulated system-versioned table keeps them, and
-// its copies carry an explicit column list built from the translated
-// table (planner.Build, translate.PGSystemVersioning.CopyColumns).
+// does not emulate. Two cases carry an explicit column list built from
+// the translated table instead (planner.Build, translate.PGTable
+// .CopyColumns): an emulated system-versioned table, which keeps its
+// period columns, and a table with copied generated columns — MySQL /
+// MariaDB generated columns whose generation squishy refuses, created
+// as plain PG columns whose values are read from the source (MariaDB /
+// MySQL compute VIRTUAL ones on SELECT).
 func (mysqlDialect) ListColumnsQuery() string {
 	return `
 		SELECT COLUMN_NAME FROM information_schema.COLUMNS

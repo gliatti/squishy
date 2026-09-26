@@ -44,6 +44,15 @@ type Options struct {
 	// every MySQL/MariaDB generated column is refused (blocking
 	// prerequisite) while it is set.
 	ParseError error
+
+	// GeneratedOverrides are the user-provided PostgreSQL generation
+	// expressions of MySQL/MariaDB generated columns, persisted on the
+	// migration (squishy.migrations.generated_overrides). A column with
+	// an override is emitted `GENERATED ALWAYS AS (<expression>) STORED`
+	// verbatim — no translation, no refusal, an info explanation — and
+	// an override that matches no source generated column is reported
+	// (table.generated_override_unused). See mysql_generated_override.go.
+	GeneratedOverrides []GeneratedOverride
 }
 
 // hasExt reports whether opt.TargetExtensions contains ext (case-insensitive).
@@ -170,6 +179,7 @@ func Translate(stmts []ast.Stmt, opt Options) *Result {
 	}
 	t.harmonizeFKTypes()
 	t.resolveMySQLGeneratedConcat()
+	t.computeCopyColumns()
 	t.emitSystemVersioning()
 	t.buildDDL()
 	t.buildPrerequisites()
@@ -297,6 +307,51 @@ type translator struct {
 	// relation, so emitSystemVersioning keeps the history-table names it
 	// derives clear of them.
 	sequenceNames []string
+	// spatialCols maps a Plan.Tables index to the lower-cased names of
+	// its spatial source columns (*ast.SpatialType), which the data
+	// copier cannot transfer: computeCopyColumns leaves them out of an
+	// explicit copy list.
+	spatialCols map[int]map[string]bool
+}
+
+// markSpatialColumn records a spatial source column of the table at
+// Plan.Tables index tableIdx.
+func (t *translator) markSpatialColumn(tableIdx int, col string) {
+	if t.spatialCols == nil {
+		t.spatialCols = map[int]map[string]bool{}
+	}
+	if t.spatialCols[tableIdx] == nil {
+		t.spatialCols[tableIdx] = map[string]bool{}
+	}
+	t.spatialCols[tableIdx][strings.ToLower(col)] = true
+}
+
+// computeCopyColumns sets PGTable.CopyColumns on every table whose
+// current-table copy cannot use the source catalog's default column list
+// (every non-generated, non-spatial column): an emulated system-versioned
+// table (its ROW START / ROW END are GENERATED in the catalog) and a
+// table with refused generated columns created plain (CopiedGenerated).
+// The list is every translated column without a PG generation expression,
+// spatial source columns excluded, in source order. Other tables keep a
+// nil list. It runs after resolveMySQLGeneratedConcat (which turns the
+// refused generated columns plain) and before emitSystemVersioning (which
+// appends the history tables, copied through HistoryCopyColumns).
+func (t *translator) computeCopyColumns() {
+	for i := range t.res.Plan.Tables {
+		tbl := &t.res.Plan.Tables[i]
+		if tbl.SystemVersioning == nil && len(tbl.CopiedGenerated) == 0 {
+			continue
+		}
+		spatial := t.spatialCols[i]
+		cols := make([]string, 0, len(tbl.Columns))
+		for _, c := range tbl.Columns {
+			if c.Generated != nil || spatial[strings.ToLower(c.Name)] {
+				continue
+			}
+			cols = append(cols, c.Name)
+		}
+		tbl.CopyColumns = cols
+	}
 }
 
 type objectTypeInfo struct {
@@ -825,6 +880,13 @@ func (t *translator) translateTable(s *ast.CreateTable) {
 			continue
 		}
 		pgCol, expl, mappings := t.translateColumn(s.Name, c, s.Columns, s.Options)
+		if _, spatial := c.Type.(*ast.SpatialType); spatial {
+			// The data copier cannot transfer a spatial column: an
+			// explicit copy list must leave it out (computeCopyColumns).
+			// This table is appended to Plan.Tables right after its
+			// columns: its index is the current length.
+			t.markSpatialColumn(len(t.res.Plan.Tables), c.Name)
+		}
 		if sv != nil && (isColumn(c.Name, sv.RowStart) || isColumn(c.Name, sv.RowEnd)) {
 			// MariaDB period columns are implicitly NOT NULL.
 			pgCol.NotNull = true
@@ -1233,12 +1295,12 @@ FOREIGN TABLE is in place if you don't want both.`,
 	}
 
 	if sv != nil {
-		// The copied column sets follow the translated table (see
-		// PGSystemVersioning.CopyColumns / HistoryCopyColumns).
+		// The history copy transfers every column of the translated
+		// table (see PGSystemVersioning.HistoryCopyColumns). The
+		// current-table list (PGTable.CopyColumns) is computed by
+		// computeCopyColumns, once resolveMySQLGeneratedConcat has
+		// turned the refused generated columns into plain ones.
 		for _, c := range tbl.Columns {
-			if c.Generated == nil {
-				sv.CopyColumns = append(sv.CopyColumns, c.Name)
-			}
 			sv.HistoryCopyColumns = append(sv.HistoryCopyColumns, c.Name)
 		}
 	}
@@ -1863,7 +1925,10 @@ func (t *translator) translateColumn(tableName string, c *ast.ColumnDef, tableCo
 			})
 		}
 		pg.Generated = &PGGenerated{Expr: rawExpr(genExpr), Stored: true}
-		if !stored {
+		// MySQL/MariaDB: the VIRTUAL → STORED note is emitted by
+		// resolveMySQLGeneratedConcat, only for a column that keeps a
+		// generation expression (a refused one becomes a plain column).
+		if !stored && !dialects.IsMySQLFamily(t.opt.SourceKind) {
 			expls = append(expls, Explanation{
 				Object: tableName + "." + c.Name,
 				Source: "GENERATED ... VIRTUAL",

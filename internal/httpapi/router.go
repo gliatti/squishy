@@ -75,6 +75,8 @@ func Handler(d Deps) http.Handler {
 			r.Post("/plan", d.planMigration)
 			r.Get("/prerequisites", d.getPrerequisites)
 			r.Post("/prerequisites/ack", d.ackPrerequisites)
+			r.Get("/generated-overrides", d.getGeneratedOverrides)
+			r.Put("/generated-overrides", d.setGeneratedOverrides)
 			r.Get("/runs", d.listMigrationRuns)
 			r.Post("/runs", d.startRun)
 		})

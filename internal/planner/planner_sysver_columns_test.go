@@ -120,3 +120,23 @@ func TestPlan_SystemVersionedEmulatedCopyColumns(t *testing.T) {
 	require.Equal(t, []string{"id", "a", "g", "v", "rs", "re"}, hist.Payload["columns"])
 	requireColumnsInTable(t, hist.Payload["columns"].([]string), pgTable(t, res, cur.SystemVersioning.HistoryTable))
 }
+
+// A refused MySQL/MariaDB generated column (here a boolean stored as
+// text) is created as a plain PG column whose values the copy reads from
+// the source: the copy_table payload of a non-system-versioned table
+// carries the explicit list with it (the catalog default would skip it
+// and leave the column NULL). A plain table keeps the catalog default.
+func TestPlan_CopiedGeneratedColumnsUseExplicitList(t *testing.T) {
+	p, res := planSysver(t, "CREATE TABLE u (id int NOT NULL, paid tinyint(1), pv varchar(5) AS (paid) VIRTUAL, PRIMARY KEY (id));\n"+
+		"CREATE TABLE w (id int NOT NULL, n int, PRIMARY KEY (id));\n", "", "u", "w")
+	u := pgTable(t, res, "u")
+	require.Nil(t, u.SystemVersioning)
+	require.Equal(t, []string{"pv"}, u.CopiedGenerated)
+
+	cp := copyStep(t, p, "u")
+	require.Equal(t, []string{"id", "paid", "pv"}, cp.Payload["columns"])
+	requireColumnsInTable(t, cp.Payload["columns"].([]string), u)
+
+	_, has := copyStep(t, p, "w").Payload["columns"]
+	require.False(t, has, "a plain table must use the catalog default column list")
+}

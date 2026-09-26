@@ -266,49 +266,56 @@ Either:
 If your application doesn't actually rely on the historical rows, ack
 this prerequisite to migrate the current rows only.`,
 			})
-		case "table.generated_concat":
+		case "table.generated_text_conversion", "table.generated_parse_error":
 			// One prerequisite per column (the title names it): add()
 			// deduplicates by title and would otherwise keep only the
 			// first column's expression.
+			title := "Provide the generation of column " + w.Object + " (MySQL text conversion not translated)"
+			why := "The MySQL/MariaDB generated column " + w.Object + " converts a value to text — in CONCAT / CONCAT_WS, in a CAST / CONVERT, through a hex / bit literal, or by storing a boolean in a text column — in a way squishy cannot prove PostgreSQL turns into the same text as MySQL (booleans MySQL prints 1 / 0 and PostgreSQL t / f or true / false, DECIMAL / FLOAT / DOUBLE scale and notation, CHAR padding, ENUM, hex / bit literals MySQL reads as binary strings, JSON-promoted columns, charset conversions, TEXT-family targets MariaDB silently truncates, CONCAT inside a comparison or another function, CONCAT_WS, CONCAT_OPERATOR_ORACLE, expressions…). squishy refuses to guess MySQL's text conversion:"
+			if w.Kind == "table.generated_parse_error" {
+				title = "Provide the generation of column " + w.Object + " (source DDL has parse errors)"
+				why = "The source DDL has parse errors. The parser's error recovery can cut a generation expression short or drop a CONCAT from it, so the parsed expression of the MySQL/MariaDB generated column " + w.Object + " is not proven to be the source expression:"
+			}
 			add(Prerequisite{
 				Severity: SeverityBlocking,
 				Category: CatManualReview,
 				Object:   w.Object,
-				Title:    "Rewrite generated column " + w.Object + " by hand (MySQL text conversion not translated)",
-				Description: "The MySQL/MariaDB generated column " + w.Object + " converts a value to text — in CONCAT / CONCAT_WS, in a CAST / CONVERT, through a hex / bit literal, or by storing a boolean in a text column — in a way squishy cannot prove PostgreSQL turns into the same text as MySQL (booleans MySQL prints 1 / 0 and PostgreSQL t / f or true / false, DECIMAL / FLOAT / DOUBLE scale and notation, CHAR padding, ENUM, hex / bit literals MySQL reads as binary strings, JSON-promoted columns, charset conversions, TEXT-family targets MariaDB silently truncates, CONCAT inside a comparison or another function, CONCAT_WS, CONCAT_OPERATOR_ORACLE, expressions…). squishy refuses to guess MySQL's text conversion:\n\n  • " + w.Message +
-					"\n\nWith CONCAT, the emitted DDL keeps concat() / concat_ws() / CONCAT_OPERATOR_ORACLE(); PostgreSQL rejects them in a generation expression (they are not immutable), so create_ddl fails loudly if the run is forced. Without CONCAT (hex / bit literal, boolean converted or stored as text), the emitted DDL keeps the expression as translated, which PostgreSQL may accept while storing a different text (41 instead of 'A', t / true instead of 1): do not acknowledge this prerequisite before the column is rewritten.",
-				Remediation: `Open the generated DDL of the flagged column (wizard step 3) and pick one:
-  * rewrite the generation expression by hand in PostgreSQL with || and
-    explicit, immutable conversions that print exactly what MySQL prints
-    (check the result against the source rows);
-  * or drop the generated column on PG and turn it into a plain column
-    filled by the application or by a BEFORE INSERT OR UPDATE trigger;
-  * or change the column on the source so it no longer converts a value
-    to text in a way PostgreSQL prints differently (no hex / bit literal,
-    no boolean — TINYINT(1) / BIT(1) column, comparison, NOT, TRUE /
-    FALSE — cast to CHAR or stored in a text column, and any CONCAT is
-    the whole generation expression into a VARCHAR(n) column, over string
-    literals, integer literals, same-charset VARCHAR / TEXT columns (not
-    JSON) and non-boolean integer columns), and re-plan.`,
+				Title:    title,
+				Description: why + "\n\n  • " + w.Message +
+					"\n\nThe column is created on PostgreSQL as a plain column of its mapped type and its values are copied from the source (current rows and, for an emulated system-versioned table, history rows), so nothing wrong is stored. But PostgreSQL does not compute it: rows inserted or updated on PostgreSQL keep whatever the application writes (NULL by default) until a generation is provided.",
+				Remediation: `Pick one:
+  1. Set a PostgreSQL generation expression override for the column
+     (API PUT /api/v1/migrations/{id}/generated-overrides with
+     {"overrides":[{"table":"<table>","column":"<column>","expression":"<PG expression>"}]},
+     MCP set_generated_override, or the DDL tab), then re-plan. The
+     override must print exactly what MySQL prints (booleans '1' / '0',
+     X'41' is 'A', DECIMAL scale…; check it against the source rows) and
+     be immutable (no concat() / concat_ws(), use ||).
+  2. Or install a BEFORE INSERT OR UPDATE trigger on PostgreSQL that
+     fills the column.
+  3. Or acknowledge this prerequisite to keep a plain column filled by
+     the application.`,
 			})
-		case "table.generated_parse_error":
-			// One prerequisite per column, as for table.generated_concat.
+		case "table.generated_override_invalid":
+			// One prerequisite per column (the title names it).
 			add(Prerequisite{
-				Severity: SeverityBlocking,
-				Category: CatManualReview,
-				Object:   w.Object,
-				Title:    "Rewrite generated column " + w.Object + " by hand (source DDL has parse errors)",
-				Description: "The source DDL has parse errors. The parser's error recovery can cut a generation expression short or drop a CONCAT from it, so the parsed expression of the MySQL/MariaDB generated column " + w.Object + " is not proven to be the source expression:\n\n  • " + w.Message +
-					"\n\nThe emitted DDL keeps the expression as parsed. It may fail at create_ddl or, if PostgreSQL accepts it, compute something other than MySQL does: check it before forcing the run.",
-				Remediation: `Open the generated DDL of the flagged column (wizard step 3), compare it
-with the source SHOW CREATE TABLE, and pick one:
-  * rewrite the generation expression by hand in PostgreSQL (for a
-    CONCAT: || with explicit, immutable conversions that print exactly
-    what MySQL prints; check the result against the source rows);
-  * or drop the generated column on PG and turn it into a plain column
-    filled by the application or by a BEFORE INSERT OR UPDATE trigger;
-  * or make the source DDL parse cleanly (or report the parser gap) and
-    re-plan.`,
+				Severity:    SeverityBlocking,
+				Category:    CatManualReview,
+				Object:      w.Object,
+				Title:       "Fix refused generated-column override " + w.Object,
+				Description: "The PostgreSQL generation expression override set for " + w.Object + " is not applied:\n\n  • " + w.Message,
+				Remediation: "Replace the override with exactly one PostgreSQL expression (balanced parentheses, terminated strings and quoted identifiers, no ';', no comment, no dollar quote), or delete the duplicate / the override (API PUT /api/v1/migrations/{id}/generated-overrides, MCP, or the DDL tab), then re-plan.",
+			})
+		case "table.generated_override_unused":
+			// One prerequisite per override (the title names it), so
+			// each keeps its own message.
+			add(Prerequisite{
+				Severity:    SeverityInfo,
+				Category:    CatManualReview,
+				Object:      w.Object,
+				Title:       "Review unused generated-column override " + w.Object,
+				Description: "A PostgreSQL generation expression override is set for " + w.Object + ", but the column no longer exists or is not generated on the source:\n\n  • " + w.Message,
+				Remediation: "Delete the override (API PUT /api/v1/migrations/{id}/generated-overrides, MCP, or the DDL tab) or fix its table / column name (table names are case-sensitive), then re-plan.",
 			})
 		case "package.unsupported":
 			add(Prerequisite{

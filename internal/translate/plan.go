@@ -43,6 +43,23 @@ type PGTable struct {
 	// HistoryTable, and the translator's post-copy actions install the
 	// versioning triggers. See mariadb_temporal.go.
 	SystemVersioning *PGSystemVersioning `json:"system_versioning,omitempty"`
+	// CopiedGenerated lists the source generated columns whose generation
+	// squishy refuses to translate (MySQL/MariaDB text conversion, source
+	// DDL with parse errors — see mysql_generated.go). They are created
+	// as plain PG columns and the copy transfers their values from the
+	// source (MySQL / MariaDB compute a VIRTUAL column on SELECT), so no
+	// different value is ever stored.
+	CopiedGenerated []string `json:"copied_generated,omitempty"`
+	// CopyColumns is the explicit source column list of the current-table
+	// copy, in source order. It is set ONLY when the source catalog's
+	// default list — every non-generated, non-spatial column — does not
+	// match the PG table: an emulated system-versioned table (ROW START /
+	// ROW END are GENERATED in the catalog, yet copied) or a table with
+	// CopiedGenerated columns. It then holds every column of the
+	// translated table without a PG generation expression, spatial source
+	// columns excluded (the copier cannot transfer them). The planner
+	// passes it in the copy_table payload; nil means the catalog default.
+	CopyColumns []string `json:"copy_columns,omitempty"`
 }
 
 // PGSystemVersioning describes the emulation of one MariaDB
@@ -62,18 +79,12 @@ type PGSystemVersioning struct {
 	// RowStart / RowEnd are the hidden row_start / row_end columns, which
 	// become regular (visible) columns of the PG table.
 	Implicit bool `json:"implicit,omitempty"`
-	// CopyColumns are the columns the current-table copy transfers: the
-	// translated table's non-generated columns, ROW START / ROW END
-	// included (PG recomputes its generated columns). The planner passes
-	// them in the copy_table payload, so the copied column set follows
-	// the translated table rather than the source catalog (whose default
-	// column list skips every GENERATED column, period columns included).
-	CopyColumns []string `json:"copy_columns,omitempty"`
 	// HistoryCopyColumns are the columns the history copy transfers:
 	// every column of the history table, generated ones included — the
 	// history table stores them as plain columns, so their values (as
 	// the source computed them for each archived version) must be read
-	// from the source, not left NULL.
+	// from the source, not left NULL. The current-table copy list is
+	// PGTable.CopyColumns.
 	HistoryCopyColumns []string `json:"history_copy_columns,omitempty"`
 }
 

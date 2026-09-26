@@ -173,6 +173,7 @@ All routes are JSON, prefix `/api/v1`. See `internal/httpapi/router.go`.
 | POST   | `/migrations/{migrationID}/plan`                    | build DDL + explanations |
 | GET    | `/migrations/{migrationID}/prerequisites`           | list prereq checks |
 | POST   | `/migrations/{migrationID}/prerequisites/ack`       | acknowledge prereqs |
+| GET / PUT | `/migrations/{migrationID}/generated-overrides` | list / replace MySQL-MariaDB generated-column expression overrides (PUT validates each against the plan and in a rolled-back PostgreSQL probe; re-plan to apply) |
 | GET / POST | `/migrations/{migrationID}/runs`                | list / start a run |
 | GET    | `/runs/{runID}`                                     | progress snapshot |
 | GET    | `/runs/{runID}/steps`                               | steps detail |

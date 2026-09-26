@@ -217,7 +217,7 @@ func TestMariaDBSysver_ImplicitFormEmulated(t *testing.T) {
 		require.Equal(t, "TIMESTAMPTZ(6)", c.Type)
 	}
 	// Both copies read the hidden columns by name.
-	require.Equal(t, []string{"id", "name", "email", "tier", "row_start", "row_end"}, sv.CopyColumns)
+	require.Equal(t, []string{"id", "name", "email", "tier", "row_start", "row_end"}, cur.CopyColumns)
 	require.Equal(t, []string{"id", "name", "email", "tier", "row_start", "row_end"}, sv.HistoryCopyColumns)
 	hist := planTable(t, res, "sv_customers_history")
 	require.Equal(t, []string{"id", "row_end"}, hist.PK)
