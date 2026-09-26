@@ -39,7 +39,7 @@ func TestDB2E2E(t *testing.T) {
 	t.Logf("project=%s", projectID)
 
 	// Step 2: set target PG admin connection.
-	putJSON(t, fmt.Sprintf("/api/v1/projects/%s/connection", projectID), map[string]any{
+	doJSON(t, "PUT", fmt.Sprintf("/api/v1/projects/%s/connection", projectID), map[string]any{
 		"host": "postgres", "port": 5432,
 		"database": "squishy", "username": "squishy", "password": "squishy", "ssl_mode": "disable",
 	})

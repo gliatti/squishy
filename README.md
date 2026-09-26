@@ -73,7 +73,15 @@ End-to-end gate (unit tests + Compose stack + migration scenarios):
 ```bash
 make e2e             # MySQL flow by default
 SQUISHY_E2E_DB2=1 make e2e   # also runs the DB2 scenario
+make e2e-down        # tear the e2e stack down
 ```
+
+The e2e run uses its own Compose project (`squishy-e2e`, overlay
+`docker-compose.e2e.yml`) with no host port published, so it neither wipes
+the `make up` stack nor collides with ports held by other local stacks. The
+`make up` host ports can be moved with `SQUISHY_PG_HOST_PORT`,
+`SQUISHY_MYSQL_HOST_PORT`, `SQUISHY_API_HOST_PORT`, `SQUISHY_WEB_HOST_PORT`
+(and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,MCP}_HOST_PORT`).
 
 ## Architecture
 
@@ -121,7 +129,7 @@ mcp-server/           MCP-over-HTTP server wrapping the same API (port 8002)
 internal/
 ├── config/           env parsing
 ├── storage/          pgx pool + embedded migrations runner
-│   └── migrations/   golang-migrate .up/.down SQL files
+│   └── migrations/   NNNNNN_name.up/.down SQL files (one ledger: squishy_meta._migrations)
 ├── project/          domain: projects / instances / migrations
 ├── connection/       source/target pool factories + DB2 cgo build tag
 ├── discover/         source introspection (MySQL / MariaDB / Oracle / DB2)
@@ -228,7 +236,9 @@ make logs            tail API logs
 make psql            psql shell on the squishy app DB
 make mysql           mysql client on the sample source
 make reset-dest      DROP SCHEMA mig CASCADE (target only, app schema kept)
-make migrate-up      apply embedded SQL migrations
+make migrate-up      apply embedded SQL migrations (cmd/squishy-migrate, same ledger as the api)
+make migrate-down    roll back the latest migration
+make migrate-status  list migrations and whether they are applied
 make migrate-new name=add_foo   scaffold a new up/down migration pair
 make oracle-up | oracle19-up | db2-up | mariadb-sample (via compose profiles)
 make test            unit tests + check-no-regex
