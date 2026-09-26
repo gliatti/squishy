@@ -4,26 +4,26 @@ package planner
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
 
+	oracle "gitlab.com/dalibo/squishy/internal/dialects/oracle"
 	"gitlab.com/dalibo/squishy/internal/inspect"
 	"gitlab.com/dalibo/squishy/internal/translate"
 )
 
 // Step is an in-memory representation of a squishy.steps row before persistence.
 type Step struct {
-	ID         uuid.UUID
-	Seq        int
-	Kind       string // inspect|create_ddl|copy_table|create_index|create_fk|create_routine|validate
-	Target     string
-	Priority   int16
-	Payload    map[string]any
-	DependsOn  []uuid.UUID
-	RowsTotal  int64
-	Level      int
+	ID        uuid.UUID
+	Seq       int
+	Kind      string // inspect|create_ddl|copy_table|create_index|create_fk|create_routine|validate
+	Target    string
+	Priority  int16
+	Payload   map[string]any
+	DependsOn []uuid.UUID
+	RowsTotal int64
+	Level     int
 }
 
 // Plan is the full in-memory plan: steps with resolved dependencies.
@@ -45,6 +45,11 @@ type BuildOptions struct {
 	// routine creation still run in order on the existing schema).
 	SkipData bool
 }
+
+// copySourceVariantSystemTimeHistory is the copy_table payload
+// source_variant read by the worker (internal/worker, same constant name)
+// to copy the history rows of a MariaDB system-versioned table.
+const copySourceVariantSystemTimeHistory = "system_time_history"
 
 // Build produces a DAG from an inspected source schema + a translated PG plan.
 // The planner is deterministic: steps are assigned sequential seq numbers and
@@ -101,15 +106,46 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 	copyIDs := make(map[string]uuid.UUID)
 	if !opts.SkipData {
 		for _, tbl := range source.Tables {
-			id := addStep("copy_table", tbl.Name, 100, map[string]any{
+			payload := map[string]any{
 				"schema":        tbl.Database,
 				"table":         tbl.Name,
 				"rows":          tbl.Rows,
 				"target_schema": targetSchema,
-			}, ddlID)
+			}
+			// An emulated MariaDB system-versioned table copies the
+			// column set of its translated table (ROW START / ROW END
+			// included), which the source catalog's default list —
+			// every non-generated column — does not give.
+			if sv := emulatedSystemVersioning(pg, tbl.Name); sv != nil && len(sv.CopyColumns) > 0 {
+				payload["columns"] = append([]string{}, sv.CopyColumns...)
+			}
+			id := addStep("copy_table", tbl.Name, 100, payload, ddlID)
 			// Rows estimated from information_schema; actual count computed by the worker.
 			p.Steps[len(p.Steps)-1].RowsTotal = tbl.Rows
 			copyIDs[tbl.Name] = id
+		}
+		// MariaDB system-versioned tables emulated by the translator: the
+		// closed row versions (`FOR SYSTEM_TIME ALL`, ROW END in the past)
+		// go to the PG history table. Same DAG position as a table copy,
+		// so create_fk — which installs the versioning triggers — waits
+		// for it.
+		for _, tbl := range pg.Plan.Tables {
+			sv := tbl.SystemVersioning
+			if sv == nil || sv.HistoryTable == "" {
+				continue
+			}
+			id := addStep("copy_table", sv.HistoryTable, 100, map[string]any{
+				"schema":         source.Database,
+				"table":          tbl.Name,
+				"target_schema":  targetSchema,
+				"target_table":   sv.HistoryTable,
+				"source_variant": copySourceVariantSystemTimeHistory,
+				"row_end_col":    sv.RowEnd,
+				// Every history-table column, generated ones included:
+				// the history table stores their archived values.
+				"columns": append([]string{}, sv.HistoryCopyColumns...),
+			}, ddlID)
+			copyIDs[sv.HistoryTable] = id
 		}
 	}
 
@@ -173,8 +209,13 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 	}
 	// Views can reference other views (e.g. the employees sample's
 	// current_dept_emp joins dept_emp_latest_date). Wire view→view deps
-	// based on identifier references so creation order is deterministic
-	// instead of relying on job retries.
+	// so creation order is deterministic instead of relying on job
+	// retries. A view translated from a typed body (MySQL / MariaDB)
+	// carries References — the relations its SELECT reads, collected
+	// from the AST — and is matched against the other view names by
+	// set lookup. Views without References (Oracle, DB2, bodies the
+	// parser could not type) fall back to the token walk of
+	// referencesIdent over the DDL + source body.
 	for i := range p.Steps {
 		s := &p.Steps[i]
 		if s.Kind != "create_routine" || !strings.HasPrefix(s.Target, "view:") {
@@ -182,9 +223,11 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 		}
 		vname := strings.TrimPrefix(s.Target, "view:")
 		var body string
+		var refs []string
 		for _, v := range pg.Plan.Views {
 			if v.Name == vname {
 				body = v.DDL + "\n" + v.SelectBody
+				refs = v.References
 				break
 			}
 		}
@@ -192,7 +235,13 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 			if other == vname {
 				continue
 			}
-			if referencesIdent(body, other) {
+			var dep bool
+			if refs != nil {
+				dep = referencesName(refs, other)
+			} else {
+				dep = referencesIdent(body, other)
+			}
+			if dep {
 				s.DependsOn = append(s.DependsOn, otherID)
 			}
 		}
@@ -205,9 +254,10 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 		depAll = append(depAll, s.ID)
 	}
 	addStep("validate", "", 300, map[string]any{
-		"tables":        tableNames(source.Tables),
-		"source_schema": source.Database,
-		"target_schema": targetSchema,
+		"tables":         tableNames(source.Tables),
+		"history_tables": historyValidations(pg),
+		"source_schema":  source.Database,
+		"target_schema":  targetSchema,
 	}, depAll...)
 
 	assignLevels(p.Steps)
@@ -249,15 +299,96 @@ func assignLevels(steps []Step) {
 	}
 }
 
+// emulatedSystemVersioning returns the system-versioning emulation of
+// the translated table named table, or nil. The name is matched
+// exactly: the translator names a MySQL/MariaDB table after its SHOW
+// CREATE TABLE, like the inspector's snapshot, and two tables may differ
+// only by case on a case-sensitive source (lower_case_table_names=0).
+func emulatedSystemVersioning(pg *translate.Result, table string) *translate.PGSystemVersioning {
+	if pg == nil {
+		return nil
+	}
+	for i := range pg.Plan.Tables {
+		if pg.Plan.Tables[i].Name == table {
+			return pg.Plan.Tables[i].SystemVersioning
+		}
+	}
+	return nil
+}
+
+// referencesName reports whether refs (the relation names a typed view
+// body reads, see translate.PGView.References) contains name. Names are
+// single identifiers, compared case-insensitively.
+func referencesName(refs []string, name string) bool {
+	for _, r := range refs {
+		if strings.EqualFold(r, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // referencesIdent reports whether body contains ident as a standalone SQL
-// identifier (word-boundary match, case-insensitive). Used to detect
-// view→view references in view bodies.
+// identifier token (case-insensitive). Used to detect view→view and
+// routine→view references in PG-emitted DDL.
+//
+// The body is walked with the Oracle lexer, whose lexical rules match the
+// PG DDL squishy emits ("quoted idents", 'strings', -- and /* */
+// comments). A match is an IDENT, QUOTED_IDENT or KEYWORD token (an
+// identifier that happens to be an Oracle keyword, e.g. a view named
+// `level`, lexes as KEYWORD) whose literal equals ident
+// case-insensitively. Consequently a name that only appears inside a
+// string literal or a comment is NOT a reference, and a name that is
+// merely a prefix of a longer identifier (dept_emp vs
+// dept_emp_latest_date) never matches. Runes the lexer does not know
+// (e.g. the `$` of a `$body$` dollar-quote) come out as single-rune error
+// tokens, so the walk always advances and terminates.
 func referencesIdent(body, ident string) bool {
 	if body == "" || ident == "" {
 		return false
 	}
-	re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(ident) + `\b`)
-	return re.MatchString(body)
+	l := oracle.NewLexer(body)
+	for {
+		t := l.Next()
+		switch t.Kind {
+		case oracle.TOK_EOF:
+			return false
+		case oracle.TOK_IDENT, oracle.TOK_QUOTED_IDENT, oracle.TOK_KEYWORD:
+			if strings.EqualFold(t.Lit, ident) {
+				return true
+			}
+		}
+	}
+}
+
+// ValidateHistoryTable is one entry of the validate step's
+// history_tables payload: an emulated MariaDB system-versioned table
+// whose closed versions were copied into TargetTable. The worker counts
+// the source through the same `FOR SYSTEM_TIME ALL` history read as the
+// copy (row_end_col in the past) and compares it with TargetTable.
+type ValidateHistoryTable struct {
+	SourceTable string `json:"source_table"`
+	TargetTable string `json:"target_table"`
+	RowEndCol   string `json:"row_end_col"`
+}
+
+// historyValidations lists the history tables of pg's emulated
+// system-versioned tables, in plan order.
+func historyValidations(pg *translate.Result) []ValidateHistoryTable {
+	out := []ValidateHistoryTable{}
+	if pg == nil {
+		return out
+	}
+	for _, tbl := range pg.Plan.Tables {
+		sv := tbl.SystemVersioning
+		if sv == nil || sv.HistoryTable == "" {
+			continue
+		}
+		out = append(out, ValidateHistoryTable{
+			SourceTable: tbl.Name, TargetTable: sv.HistoryTable, RowEndCol: sv.RowEnd,
+		})
+	}
+	return out
 }
 
 func tableNames(ts []inspect.ObjectSnapshot) []string {

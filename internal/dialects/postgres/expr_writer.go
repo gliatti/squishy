@@ -96,6 +96,17 @@ func WriteExpr(e ast.Expr) string {
 		}
 		return "CAST(" + WriteExpr(x.Expr) + " AS " + typ + ")"
 	case *ast.IntervalLit:
+		if x.Expr != nil && x.Value == "" {
+			// MySQL `INTERVAL <expr> <unit>` — PG has no such form.
+			// The MySQL visitor rewrites this shape before the writer
+			// runs; if it survives, emit it faithfully so PG rejects
+			// it at apply time instead of guessing a meaning.
+			out := "INTERVAL (" + WriteExpr(x.Expr) + ")"
+			if x.Unit != "" {
+				out += " " + x.Unit
+			}
+			return out
+		}
 		val := x.Value
 		if !strings.HasPrefix(val, "'") {
 			val = "'" + val + "'"
@@ -168,6 +179,13 @@ func writeIdent(id *ast.Ident) string {
 	if id == nil || len(id.Parts) == 0 {
 		return ""
 	}
+	// An unquoted single-part DEFAULT is the SQL keyword (INSERT …
+	// VALUES (DEFAULT), UPDATE … SET c = DEFAULT), not a column named
+	// "DEFAULT": PG rejects the quoted form in those positions. A
+	// backtick-quoted `DEFAULT` really is an identifier and stays quoted.
+	if len(id.Parts) == 1 && !id.Backtick && strings.EqualFold(id.Parts[0], "DEFAULT") {
+		return "DEFAULT"
+	}
 	parts := make([]string, 0, len(id.Parts))
 	for _, p := range id.Parts {
 		if p == "*" {
@@ -195,6 +213,12 @@ func writeIdent(id *ast.Ident) string {
 // rejects them. Function-name remapping (mapFunction in the legacy
 // translator) is intentionally NOT performed here — that's a Phase 3
 // visitor's job.
+//
+// Aggregate modifiers render in PG order: `NAME(DISTINCT a, b ORDER BY
+// x DESC)`. AggSeparator (MySQL GROUP_CONCAT … SEPARATOR) is ignored on
+// purpose — see ast.FuncCall: the MySQL visitor must consume it, and an
+// un-rewritten GROUP_CONCAT then fails at apply time rather than
+// silently using a different separator.
 func writeFuncCall(fc *ast.FuncCall) string {
 	if fc == nil {
 		return ""
@@ -203,14 +227,33 @@ func writeFuncCall(fc *ast.FuncCall) string {
 	for _, a := range fc.Args {
 		args = append(args, WriteExpr(a))
 	}
-	if len(args) == 0 {
+	if len(args) == 0 && !fc.Distinct && len(fc.AggOrderBy) == 0 {
 		switch strings.ToUpper(fc.Name) {
 		case "SYSDATE", "SYSTIMESTAMP", "CURRENT_TIMESTAMP", "CURRENT_DATE",
-			"LOCALTIMESTAMP", "UID", "ROWNUM", "LEVEL":
+			"CURRENT_TIME", "LOCALTIME", "LOCALTIMESTAMP", "UID", "ROWNUM", "LEVEL":
 			return fc.Name
 		}
 	}
-	return fc.Name + "(" + strings.Join(args, ", ") + ")"
+	var b strings.Builder
+	b.WriteString(fc.Name)
+	b.WriteByte('(')
+	if fc.Distinct {
+		b.WriteString("DISTINCT ")
+	}
+	b.WriteString(strings.Join(args, ", "))
+	if len(fc.AggOrderBy) > 0 {
+		items := make([]string, len(fc.AggOrderBy))
+		for i, oi := range fc.AggOrderBy {
+			items[i] = writeOrderItem(oi)
+		}
+		if len(args) > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString("ORDER BY ")
+		b.WriteString(strings.Join(items, ", "))
+	}
+	b.WriteByte(')')
+	return b.String()
 }
 
 // writeCase renders simple- and searched-CASE expressions identically
@@ -343,6 +386,9 @@ func writeType(t ast.DataType) string {
 	switch x := t.(type) {
 	case *ast.UserDefinedType:
 		// User-defined Oracle type — best-effort emit the name.
+		return x.Name
+	case *ast.PGType:
+		// Built by a translation pass: already PG syntax.
 		return x.Name
 	}
 	return ""

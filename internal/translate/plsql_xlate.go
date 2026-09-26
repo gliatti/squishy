@@ -13,8 +13,8 @@ import (
 
 // TranslateRoutineBody parses a source-dialect routine body into the shared
 // PL/SQL AST, translates each statement into the PL/pgSQL AST, and renders
-// the PG body text. Falls back to the token rewriter only when the parser
-// produces no usable AST (e.g. an empty body).
+// the PG body text. When the parser produces no usable AST the body is
+// copied verbatim and reported as untranslated.
 //
 // Returns (pgBodyText, untranslated, notes). `untranslated` lists constructs
 // the translator could not handle (each becomes a blocking manual-review
@@ -51,12 +51,34 @@ func TranslateRoutineBodyExtV(body string, kind dialects.Kind, newAlias, oldAlia
 // to mint synthetic CREATE FUNCTION targets at runtime PG. Empty
 // targetSchema disables the dyn-trigger pass.
 func TranslateRoutineBodyExtVS(body string, kind dialects.Kind, newAlias, oldAlias, targetSchema string) (string, []string, []string, bool) {
+	return translateRoutineBodyWithSigs(body, kind, newAlias, oldAlias, targetSchema, nil, nil)
+}
+
+// translateRoutineBodyWithSigs is TranslateRoutineBodyExtVS plus two
+// optional typed passes:
+//
+//   - sigs, the signature table of the routines defined in the migrated
+//     MySQL / MariaDB schema: call arguments are cast to the PG type of
+//     the parameter they bind to, for every parameter type
+//     mysqlParamConv supports (integers, numeric, floats, boolean,
+//     character, temporal, bytea, jsonb, … — see mysql_call_casts.go).
+//     nil sigs disables that pass; Oracle bodies ignore it.
+//   - trigReturn, set only for trigger bodies
+//     (makeTriggerBareReturnVisitor): replaces every bare early-exit
+//     `RETURN;` with the trigger's return statement on the parsed AST,
+//     after the dialect rewrites and before the PG writer renders the
+//     body. nil for procedures and functions.
+func translateRoutineBodyWithSigs(body string, kind dialects.Kind, newAlias, oldAlias, targetSchema string, sigs *mysqlRoutineSigs, trigReturn ast.Rewriter) (string, []string, []string, bool) {
 	if strings.TrimSpace(body) == "" {
 		return "", nil, nil, false
 	}
 	stmts, errs := parseRoutineBodyByKind(body, kind)
+	var callArgDiags []string
 	if len(stmts) == 0 {
-		return rewriteMySQLBody(body), []string{"PL/SQL parser returned no statements: " + errs}, nil, false
+		// Nothing typed to translate: copy the body verbatim and surface
+		// the parser diagnostics as a blocking review entry (never a
+		// silent text rewrite claiming success).
+		return body, []string{"PL/SQL parser returned no statements: " + errs}, nil, false
 	}
 	// Phase 3.6/3.8 orchestrator: run the AST rewriters BEFORE pgast
 	// translation so substituted nodes (decode → oracle.decode,
@@ -93,9 +115,46 @@ func TranslateRoutineBodyExtVS(body string, kind dialects.Kind, newAlias, oldAli
 			extra = ast.Compose(extras...)
 		}
 		stmts = applyOracleASTRewritesWith(stmts, extra)
+	} else {
+		// MySQL / MariaDB / DB2 path: every MySQL idiom (<=>, GROUP_CONCAT,
+		// JSON_EXTRACT paths, bare JOIN, INTERVAL, DATE_ADD, CAST types,
+		// function renames) is rewritten on the typed AST; the PG writer
+		// then renders expressions and DML. No SQL text is re-lexed.
+		stmts = applyMySQLASTRewrites(stmts)
+		// Local variables are declared unquoted (PG folds them to
+		// lowercase) while the writer quotes references with their
+		// source case: fold references to declared locals so both
+		// sides name the same variable (see foldMySQLLocalVarRefs).
+		stmts = foldMySQLLocalVarRefs(stmts)
+		// MySQL converts routine arguments to the parameter types; PG
+		// resolves calls by argument type through implicit casts only.
+		stmts, callArgDiags = applyMySQLCallArgCasts(stmts, sigs)
+	}
+	if trigReturn != nil {
+		// Last AST pass: the substituted return statement is built from
+		// final PG-shaped nodes (NEW / OLD / TG_OP), so no dialect
+		// rewriter may see it afterwards.
+		stmts = applyPLRewriter(stmts, trigReturn)
 	}
 	tx := &plTranslator{kind: kind}
+	for _, d := range callArgDiags {
+		tx.warn(d)
+	}
+	if !dialects.IsOracle(kind) && errs != "" {
+		tx.note("MySQL parser reported errors while parsing the routine body (translation may be incomplete): " + errs)
+	}
 	pgStmts := tx.stmts(stmts)
+	if !dialects.IsOracle(kind) {
+		seen := map[string]bool{}
+		for _, s := range stmts {
+			for _, label := range mysqlResidualIdioms(s) {
+				if !seen[label] {
+					seen[label] = true
+					tx.warn(label)
+				}
+			}
+		}
+	}
 	var block *pgast.PLBlock
 	if b, ok := pgStmts[0].(*pgast.PLBlock); ok && len(pgStmts) == 1 {
 		block = b
@@ -125,6 +184,20 @@ func TranslateRoutineBodyExtVS(body string, kind dialects.Kind, newAlias, oldAli
 		text = rewriteOracleCollections(text, tx.collectionVars)
 	}
 	return text, tx.untranslated, tx.notes, usedAdminpack
+}
+
+// applyPLRewriter runs fn over every statement of a parsed routine body
+// (post-order, see ast.Rewrite) and returns the rewritten list.
+func applyPLRewriter(stmts []ast.PLStmt, fn ast.Rewriter) []ast.PLStmt {
+	out := make([]ast.PLStmt, len(stmts))
+	for i, st := range stmts {
+		if rs, ok := ast.Rewrite(st, fn).(ast.PLStmt); ok {
+			out[i] = rs
+		} else {
+			out[i] = st
+		}
+	}
+	return out
 }
 
 // prefixOracleDeclare wraps an Oracle routine body captured after IS/AS into
@@ -1427,6 +1500,35 @@ func (t *plTranslator) warn(msg string) { t.untranslated = append(t.untranslated
 // to be aware but no manual intervention is required.
 func (t *plTranslator) note(msg string) { t.notes = append(t.notes, msg) }
 
+// resignal translates MySQL `RESIGNAL [SQLSTATE 'x'] [SET MESSAGE_TEXT =
+// 'm']`, which re-raises the condition currently being handled
+// (optionally overriding its SQLSTATE and/or message):
+//
+//	RESIGNAL;                               → RAISE;  (re-raise as-is)
+//	RESIGNAL SQLSTATE 'x';                  → RAISE EXCEPTION USING ERRCODE = 'x', MESSAGE = SQLERRM;
+//	RESIGNAL SET MESSAGE_TEXT = 'm';        → RAISE EXCEPTION USING ERRCODE = SQLSTATE, MESSAGE = 'm';
+//	RESIGNAL SQLSTATE 'x' SET MESSAGE_TEXT… → RAISE EXCEPTION USING ERRCODE = 'x', MESSAGE = 'm';
+//
+// SQLSTATE / SQLERRM are the PL/pgSQL handler variables holding the
+// condition being handled, so the non-overridden half is carried over just
+// like RESIGNAL does. Other diagnostic items (MYSQL_ERRNO, …) are not
+// modelled by the parser and are dropped, which is recorded as a note.
+func (t *plTranslator) resignal(s *ast.SignalStmt) pgast.PLStmt {
+	if s.SQLState == "" && s.Message == "" {
+		return &pgast.PLRawSQL{Text: "RAISE"}
+	}
+	code := "SQLSTATE"
+	if s.SQLState != "" {
+		code = sqlString(s.SQLState)
+	}
+	msg := "SQLERRM"
+	if s.Message != "" {
+		msg = sqlString(s.Message)
+	}
+	t.note("RESIGNAL with overrides translated to RAISE EXCEPTION USING ERRCODE/MESSAGE inside the handler; diagnostic items other than SQLSTATE and MESSAGE_TEXT are not carried over")
+	return &pgast.PLRawSQL{Text: "RAISE EXCEPTION USING ERRCODE = " + code + ", MESSAGE = " + msg}
+}
+
 func (t *plTranslator) stmts(in []ast.PLStmt) []pgast.PLStmt {
 	out := make([]pgast.PLStmt, 0, len(in))
 	for _, s := range in {
@@ -1532,12 +1634,12 @@ func (t *plTranslator) stmt(n ast.PLStmt) pgast.PLStmt {
 			// etc.) so the SELECT runs on PG. Dynamic body: PG's EXECUTE
 			// runs the string as-is at runtime; we still apply the rewriter
 			// so common literal-string patterns (e.g. NVL embedded in a
-			// concat-built dyn-SQL) come out PG-shaped.
+			// concat-built dyn-SQL) come out PG-shaped. OPEN … FOR is an
+			// Oracle-only form (the MySQL parser never sets ForQuery), so
+			// other kinds copy the text unchanged.
 			body := s.ForQuery
 			if dialects.IsOracle(t.kind) {
 				body = rewriteOracleExpr(body)
-			} else {
-				body = rewriteMySQLBody(body)
 			}
 			op.ForQuery = body
 			op.IsDynamic = s.IsDynamic
@@ -1549,42 +1651,67 @@ func (t *plTranslator) stmt(n ast.PLStmt) pgast.PLStmt {
 	case *ast.CloseStmt:
 		return &pgast.PLCursorOp{Kind: "CLOSE", Cursor: s.Cursor}
 	case *ast.SignalStmt:
+		if s.Resignal {
+			return t.resignal(s)
+		}
 		msg := s.Message
 		if msg == "" {
 			msg = "signalled from migrated routine"
 		}
 		return &pgast.PLRaise{Level: "EXCEPTION", Msg: msg, ErrCode: s.SQLState}
 	case *ast.SelectInto:
-		// PG: SELECT INTO var FROM ... is the same syntax. Apply body rewrite
-		// to the rest so backticks/functions/JSON path are normalized.
 		vars := strings.Join(s.Vars, ", ")
-		return &pgast.PLRawSQL{Text: "SELECT " + rewriteMySQLBody(strings.TrimPrefix(strings.TrimSpace(s.RawQuery), "SELECT")) + " INTO " + vars}
+		if dialects.IsOracle(t.kind) {
+			// PG: SELECT … INTO var FROM … is the same syntax; plpgsql
+			// accepts the INTO clause at the end of the statement too. The
+			// Oracle text passes run on the whole routine output afterwards.
+			return &pgast.PLRawSQL{Text: "SELECT " + strings.TrimPrefix(strings.TrimSpace(s.RawQuery), "SELECT") + " INTO " + vars}
+		}
+		for _, v := range s.Vars {
+			if strings.HasPrefix(v, "@") {
+				t.warn("session variable " + v + " in SELECT INTO (promote to DECLARE …)")
+			}
+		}
+		if s.Stmt != nil {
+			// Typed query, already rewritten by applyMySQLASTRewrites:
+			// the PG writer places INTO right after the projection.
+			return &pgast.PLRawSQL{Text: pgast.WriteSelectInto(s.Stmt, s.Vars)}
+		}
+		// The MySQL parser could not type the query: copy the source
+		// (INTO clause re-appended, which plpgsql accepts at the end of
+		// the statement) and flag it for manual review.
+		t.warn("SELECT INTO body could not be parsed by the MySQL parser; copied verbatim: " + head(s.RawQuery))
+		return &pgast.PLRawSQL{Text: s.RawQuery + " INTO " + vars}
 	case *ast.RawSQL:
 		// Catch-all for statements the parser left as raw text — COMMIT /
 		// ROLLBACK / SAVEPOINT, MariaDB Oracle-compat package bodies, etc.
 		// Oracle MERGE used to be rewritten textually here (rewriteOracleMerge);
-		// the typed *ast.MergeStmt path now owns that translation, so this
-		// branch only normalises lexical differences (backticks, function
-		// renames) via rewriteMySQLBody.
-		return &pgast.PLRawSQL{Text: rewriteMySQLBody(s.Text)}
+		// the typed *ast.MergeStmt path now owns that translation. The text
+		// is copied as is; for non-Oracle kinds anything the MySQL parser
+		// did not recognise as PL/pgSQL-compatible (RawSQL.Verbatim) is
+		// flagged for manual review instead of passing silently.
+		if !dialects.IsOracle(t.kind) && !s.Verbatim {
+			t.warn("statement not understood by the MySQL parser, copied verbatim (manual review): " + head(s.Text))
+		}
+		return &pgast.PLRawSQL{Text: s.Text}
 	case *ast.SelectStmt:
-		// Typed SELECT — emit PG SQL via the structured DML writer, then
-		// pass through rewriteMySQLBody so MySQL-only function names that
-		// snuck into the AST (via FuncCall.Name) are normalised. For Oracle
-		// the post-pass rewriteOraclePLpgSQL covers the analogous fixes.
-		return &pgast.PLRawSQL{Text: rewriteMySQLBody(emitSelectStmt(s))}
+		// Typed DML — rendered by t.dml: the PG writer for MySQL-family
+		// kinds (idioms already rewritten on the AST by
+		// applyMySQLASTRewrites), the legacy emitter for Oracle (whose
+		// post-pass rewriteOraclePLpgSQL covers the Oracle idioms).
+		return &pgast.PLRawSQL{Text: t.dml(s)}
 	case *ast.InsertStmt:
-		return &pgast.PLRawSQL{Text: rewriteMySQLBody(emitInsertStmt(s))}
+		return &pgast.PLRawSQL{Text: t.dml(s)}
 	case *ast.UpdateStmt:
-		return &pgast.PLRawSQL{Text: rewriteMySQLBody(emitUpdateStmt(s))}
+		return &pgast.PLRawSQL{Text: t.dml(s)}
 	case *ast.DeleteStmt:
-		return &pgast.PLRawSQL{Text: rewriteMySQLBody(emitDeleteStmt(s))}
+		return &pgast.PLRawSQL{Text: t.dml(s)}
 	case *ast.MergeStmt:
 		// Typed MERGE — render directly to PG MERGE. Oracle-only trailers
 		// already absorbed by parseMergeStatement (LOG ERRORS, inline
 		// DELETE WHERE on a MATCHED branch) are surfaced as remediation
 		// warnings via flags on the AST.
-		text := rewriteMySQLBody(emitMergeStmt(s))
+		text := t.dml(s)
 		if s.HasLogErrors {
 			t.warn("MERGE … LOG ERRORS dropped — PG has no log-errors trailer; INSERT/UPDATE failures abort the MERGE")
 		}
@@ -1595,6 +1722,18 @@ func (t *plTranslator) stmt(n ast.PLStmt) pgast.PLStmt {
 			}
 		}
 		return &pgast.PLRawSQL{Text: text}
+	case *ast.TruncateTable:
+		// MySQL `TRUNCATE [TABLE] t` inside a routine body. PG accepts the
+		// same statement in PL/pgSQL; the table reference is rendered by
+		// the PG writer (quoted, case preserved, like every other table
+		// reference the routine DML emits).
+		parts := make([]string, 0, 2)
+		if s.Table.Schema != "" {
+			parts = append(parts, s.Table.Schema)
+		}
+		parts = append(parts, s.Table.Name)
+		tbl := pgast.WriteExpr(&ast.Ident{Parts: parts, Backtick: s.Table.NameBacktick})
+		return &pgast.PLRawSQL{Text: "TRUNCATE TABLE " + tbl}
 	case *ast.NullStmt:
 		// Oracle's `NULL;` is a no-op. PL/pgSQL supports `NULL;` verbatim, so
 		// emit it as-is rather than drop it (keeps empty branches valid — e.g.
@@ -1619,7 +1758,10 @@ func (t *plTranslator) stmt(n ast.PLStmt) pgast.PLStmt {
 				query = s.CursorName
 			}
 		} else {
-			query = rewriteMySQLBody(query)
+			// CursorForStmt is Oracle-only: the inline SELECT text is
+			// copied as is and the Oracle text passes run on the whole
+			// routine output afterwards.
+			//
 			// Preserve parens around the inline SELECT so post-pass rewriters
 			// (notably rewriteOracleOuterJoin) keep a clean boundary at the
 			// `)` of the FOR-IN-(SELECT). Without the parens the (+) rewriter
@@ -1683,9 +1825,9 @@ func (t *plTranslator) stmt(n ast.PLStmt) pgast.PLStmt {
 	case *ast.ExecuteImmediateStmt:
 		// Oracle EXECUTE IMMEDIATE → PL/pgSQL EXECUTE (same syntax shape:
 		// optional INTO and USING clauses). The dynamic-SQL expression is
-		// passed through rewriteOracleExpr/rewriteMySQLBody so common
-		// Oracle idioms (NVL, SYSDATE, …) inside string concatenations
-		// come out PG-shaped at runtime.
+		// rendered by t.expr; for Oracle the text passes run afterwards so
+		// common Oracle idioms (NVL, SYSDATE, …) inside string
+		// concatenations come out PG-shaped at runtime.
 		var b strings.Builder
 		b.WriteString("EXECUTE ")
 		sqlExpr := t.expr(s.SQL)
@@ -1746,11 +1888,13 @@ func (t *plTranslator) stmt(n ast.PLStmt) pgast.PLStmt {
 					"  END;\n"+
 					"END LOOP",
 				s.Var, t.expr(s.Low), t.expr(s.High),
-				rewriteMySQLBody(body))
+				body)
 			return &pgast.PLRawSQL{Text: text}
 		}
+		// FORALL is Oracle-only: the raw DML body is copied as is and the
+		// Oracle text passes run on the whole routine output afterwards.
 		return &pgast.PLRawSQL{Text: fmt.Sprintf("FOR %s IN %s..%s LOOP %s; END LOOP",
-			s.Var, t.expr(s.Low), t.expr(s.High), rewriteMySQLBody(body))}
+			s.Var, t.expr(s.Low), t.expr(s.High), body)}
 	case *ast.NumericForStmt:
 		// Oracle: `FOR i IN [REVERSE] lo..hi LOOP <body> END LOOP;`
 		// PG:     `FOR i IN [REVERSE] lo..hi LOOP <body> END LOOP;`
@@ -1898,10 +2042,11 @@ func (t *plTranslator) block(blk *ast.Block) pgast.PLStmt {
 			// Without re-emitting the param list, an Oracle
 			// `OPEN c (a, b)` (or `FOR rec IN c(a,b) LOOP`) would
 			// fail at runtime with "cursor X has no arguments".
-			cur := fmt.Sprintf(`%s CURSOR FOR %s;`, x.Name, rewriteMySQLBody(x.SelectBody))
+			query := t.cursorQuery(x)
+			cur := fmt.Sprintf(`%s CURSOR FOR %s;`, x.Name, query)
 			if strings.TrimSpace(x.Params) != "" {
 				cur = fmt.Sprintf(`%s CURSOR (%s) FOR %s;`,
-					x.Name, mapCursorParams(x.Params, t.kind), rewriteMySQLBody(x.SelectBody))
+					x.Name, mapCursorParams(x.Params, t.kind), query)
 			}
 			pgBlock.Decls = append(pgBlock.Decls, pgast.PLBlockDecl{Text: cur})
 		case *ast.DeclareHandler:
@@ -1982,7 +2127,12 @@ func (t *plTranslator) block(blk *ast.Block) pgast.PLStmt {
 	// (see parser_plsql.go:parsePLBlock). Extract it from the body list and
 	// lift it into PLBlock.Exception so the writer emits a proper PG
 	// `EXCEPTION WHEN … THEN …` tail, not a stray WHEN in the body.
-	pgBlock.Body, pgBlock.Exception = extractExceptionHandlers(pgBlock.Body, t.userExceptions)
+	// Only the Oracle parser emits that marker: on the MySQL-family path a
+	// raw statement is never scanned as text (a source comment spelling
+	// the marker must not be turned into an EXCEPTION section).
+	if dialects.IsOracle(t.kind) {
+		pgBlock.Body, pgBlock.Exception = extractExceptionHandlers(pgBlock.Body, t.userExceptions)
+	}
 	return pgBlock
 }
 
@@ -2422,7 +2572,7 @@ func mapCursorParams(params string, kind dialects.Kind) string {
 // replaceWholeWordFold replaces case-insensitive whole-word occurrences
 // of from with to, where "whole word" means the match is not adjacent to
 // an ident byte (alphanumeric or underscore) on either side. Reuses the
-// existing isIdentByte helper from body_rewrite.go.
+// package's shared isIdentByte text helper (Oracle text passes only).
 func replaceWholeWordFold(s, from, to string) string {
 	if from == "" {
 		return s
@@ -3035,10 +3185,12 @@ func (t *plTranslator) translateCursorBody(blk *ast.Block, cursor *ast.DeclareCu
 		case *ast.LoopStmt:
 			// replace with FOR row IN <select> LOOP
 			body := t.stmts(filterCursorLoopBody(x.Body, cursor.Name))
+			// Parenthesised like the CursorForStmt branch so the
+			// `FOR _row IN (SELECT …) LOOP` boundary stays well-delimited.
 			out = append(out, &pgast.PLForQuery{
 				Label: x.Label,
 				Vars:  []string{"_row"},
-				Query: rewriteMySQLBody(cursor.SelectBody),
+				Query: "(" + t.cursorQuery(cursor) + ")",
 				Body:  body,
 			})
 		default:
@@ -3078,7 +3230,8 @@ func filterCursorLoopBody(body []ast.PLStmt, cursorName string) []ast.PLStmt {
 
 // target rewrites an assignment target: NEW.col / OLD.col are kept, @var is
 // flagged (untranslated) and emitted as-is so the user can fix it, plain
-// identifiers pass through.
+// identifiers pass through unquoted (PG folds them exactly like the
+// unquoted DECLARE of the same local).
 func (t *plTranslator) target(tgt string) string {
 	if strings.HasPrefix(tgt, "@") {
 		t.warn("session variable " + tgt + " (promote to DECLARE …)")
@@ -3087,10 +3240,69 @@ func (t *plTranslator) target(tgt string) string {
 	return tgt
 }
 
-// expr renders an expression node as PG text. Delegates to the DML body
-// rewriter so function names and identifiers are translated consistently.
+// expr renders an expression node as PG text (see exprFor).
 func (t *plTranslator) expr(e ast.Expr) string {
-	return rewriteMySQLBody(rawExpr(e))
+	return exprFor(t.kind, e)
+}
+
+// exprFor renders an expression for the given source kind. Oracle keeps
+// the legacy rawExpr renderer (its text passes run on the routine output
+// afterwards); every other kind has already been rewritten on the AST by
+// RewriteMySQLAST and is rendered by the PG writer.
+func exprFor(kind dialects.Kind, e ast.Expr) string {
+	if dialects.IsOracle(kind) {
+		return rawExpr(e)
+	}
+	return pgast.WriteExpr(e)
+}
+
+// dml renders a typed DML statement. Oracle keeps the legacy emitters of
+// dml_emit.go (they render through rawExpr, which knows the Oracle-only
+// nodes such as CursorAttr / SequenceRef); every other kind is rendered by
+// the PG writer, the MySQL idioms having been rewritten on the AST.
+func (t *plTranslator) dml(s ast.Stmt) string {
+	if !dialects.IsOracle(t.kind) {
+		return pgast.WriteStmt(s)
+	}
+	switch x := s.(type) {
+	case *ast.SelectStmt:
+		return emitSelectStmt(x)
+	case *ast.InsertStmt:
+		return emitInsertStmt(x)
+	case *ast.UpdateStmt:
+		return emitUpdateStmt(x)
+	case *ast.DeleteStmt:
+		return emitDeleteStmt(x)
+	case *ast.MergeStmt:
+		return emitMergeStmt(x)
+	}
+	return ""
+}
+
+// cursorQuery renders the query of a DECLARE CURSOR. Oracle copies the
+// captured SELECT text (the Oracle text passes run afterwards). Other kinds
+// render the typed query — already rewritten by applyMySQLASTRewrites,
+// since ast.Rewrite descends DeclareCursor.Stmt — with the PG writer; a
+// query the MySQL parser could not type is copied verbatim and flagged.
+func (t *plTranslator) cursorQuery(c *ast.DeclareCursor) string {
+	if dialects.IsOracle(t.kind) {
+		return c.SelectBody
+	}
+	if c.Stmt != nil {
+		return pgast.WriteSelectStmt(c.Stmt)
+	}
+	t.warn("cursor " + c.Name + " body could not be parsed; copied verbatim")
+	return c.SelectBody
+}
+
+// head returns the first 60 runes of a statement text, for diagnostics
+// only (warning messages); it never feeds generated SQL.
+func head(text string) string {
+	r := []rune(text)
+	if len(r) <= 60 {
+		return text
+	}
+	return string(r[:60]) + "…"
 }
 
 // declareVarText produces the `name type [DEFAULT expr];` form for PG's
@@ -3176,9 +3388,12 @@ func declareVarText(v *ast.DeclareVar, kind dialects.Kind, oracleTypes map[strin
 	if arrayUsedVars != nil && arrayUsedVars[strings.ToLower(v.Name)] && !strings.HasSuffix(typ, "[]") {
 		typ = typ + "[]"
 	}
+	// The name stays unquoted, so PG folds it to lowercase; on the
+	// MySQL / DB2 path foldMySQLLocalVarRefs has already folded every
+	// reference the writer quotes, so declaration and uses agree.
 	out := fmt.Sprintf("%s %s", v.Name, typ)
 	if v.Default != nil {
-		out += " DEFAULT " + rewriteMySQLBody(rawExpr(v.Default))
+		out += " DEFAULT " + exprFor(kind, v.Default)
 	}
 	out += ";"
 	return out

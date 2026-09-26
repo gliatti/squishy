@@ -11,17 +11,20 @@ squishy is a web UI + Go API for piloting **MySQL/MariaDB/Oracle/IBM DB2 → Pos
 Development is fully dockerized — no local Go or Node toolchain is required.
 
 ```bash
-make up              # postgres + mysql-sample + api + web (http://localhost:5173)
+make up              # postgres + mysql-sample + api + web + squishy-mcp (http://localhost:5173)
 make down            # tear down + wipe volumes
 make logs            # tail API logs
 make restart         # down + up
-make test            # unit tests (dockerized: go test ./... -race -count=1)
-make e2e             # full scripts/run_e2e.sh: unit + migrations + API + integration
+make test            # check-no-regex guard, then unit tests (dockerized: go test ./... -race -count=1)
+make e2e             # full scripts/run_e2e.sh in compose project squishy-e2e: unit + migrations + API + integration
+make e2e-down        # tear down the squishy-e2e stack + its volumes
 make psql            # psql on the app DB
 make mysql           # mysql client on the sample source
 make reset-dest      # DROP SCHEMA mig CASCADE (wipe migrated target, keep app schema)
-make migrate-up      # apply SQL migrations in internal/storage/migrations
-make migrate-new name=add_foo   # scaffold a new up/down migration pair
+make migrate-up      # apply SQL migrations (cmd/squishy-migrate up, same ledger as the api)
+make migrate-down    # roll back one migration step (cmd/squishy-migrate down 1)
+make migrate-status  # list migrations and whether they are applied
+make migrate-new name=add_foo   # scaffold a new up/down migration pair (migrate/migrate image, 6-digit -seq names)
 make oracle-up       # start the Oracle 23ai sample source (profile: oracle)
 make db2-up          # start the IBM DB2 11.5 LUW sample source (profile: db2 — boot ~4-5 min, EULA accepted)
 make db2-cli         # DB2 CLP shell on the sample (su to db2inst1, connect to SAMPLE)
@@ -51,7 +54,13 @@ Single-test runs go through the dockerized `unit-tests` service:
 docker compose --profile test run --rm unit-tests go test ./internal/translate/... -run TestEnum -v
 ```
 
-E2E integration tests live in `test/integration/` behind the `e2e` build tag and expect the full `docker compose --profile e2e` stack (see `scripts/run_e2e.sh` for the boot order — migrations must complete before the `e2e` container runs).
+E2E integration tests live in `test/integration/` behind the `e2e` build tag and expect the full `docker compose --profile e2e` stack (see `scripts/run_e2e.sh` for the boot order — migrations must complete before the `e2e` container runs). `make e2e` runs in its own compose project `squishy-e2e` (overlay `docker-compose.e2e.yml`, plus `docker-compose.override.yml` when present) with **no host port published**, so it neither wipes the `make up` dev stack nor collides with other local stacks. Readiness is gated on healthchecks (`up -d --wait`, `depends_on: service_healthy`), never a polling loop. Containers are left up for inspection afterwards — tear them down with `make e2e-down`.
+
+The `make up` host ports can be moved with `SQUISHY_PG_HOST_PORT`, `SQUISHY_MYSQL_HOST_PORT`, `SQUISHY_API_HOST_PORT`, `SQUISHY_WEB_HOST_PORT` (and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,MCP}_HOST_PORT`), all read by `docker-compose.yml`.
+
+### App-schema migrations
+
+SQL files live in `internal/storage/migrations/` as `NNNNNN_name.up.sql` / `.down.sql` (6-digit numbering; ordered by number, not by string). The api applies them at boot and the `migrate` compose service (profile `e2e`) runs `cmd/squishy-migrate` (`up` / `down N` / `status`); both share the same runner and the single ledger `squishy_meta._migrations`, serialised by a Postgres advisory lock, so they always agree on what is applied.
 
 ## Architecture
 
@@ -78,7 +87,9 @@ The worker registers handlers for a fixed set of kinds, all declared in `main.go
 
 Each source dialect is its own subpackage with a vendored `.g4` under `reference/` (MIT from grammars-v4 where available), a hand-rolled `lexer.go` / `parser.go` / `token.go`, and a `dialect.go` whose `init()` registers with the central registry. **No ANTLR runtime.** The grammar is spec, not generated code. See `internal/dialects/README.md` for the full procedure when adding a dialect — it must also be added to the HTTP connection-kind enum and the Vue wizard dropdown.
 
-Translation flow: source parser → `internal/sqlparse/ast` (dialect-agnostic AST) → `internal/translate` (emits a Postgres `SchemaPlan` + DDL + human explanations) → `internal/planner` (orders into a step DAG) → queued jobs.
+Translation flow: source parser → `internal/sqlparse/ast` (dialect-agnostic AST) → `internal/translate` (emits a Postgres `SchemaPlan` + DDL + human explanations) → `internal/planner` (orders into a step DAG) → queued jobs. On the MySQL/MariaDB path the source is parsed once and rewritten on the AST by the visitors in `internal/translate/mysql_visitors.go` (`ast.Rewrite(node, RewriteMySQLAST)`), then written by the `internal/dialects/postgres` writer; a body the parser rejects is kept verbatim with a warning, never re-lexed.
+
+**Generated columns (MySQL/MariaDB).** PG's `concat()` is not immutable, so a generation expression that is exactly `CONCAT(...)` is rewritten to an `a || b || ...` chain **only when provably identical** to MySQL (VARCHAR(n) target, whitelisted text/integer columns and literals, same charset, NULL semantics preserved — see `internal/translate/mysql_generated.go`). Anything else (CONCAT_WS, CONCAT inside a larger expression, other types, text-conversion hazards, source DDL with parse errors) is left untouched with an error-level explanation and a blocking prerequisite (`table.generated_concat` / `table.generated_parse_error`), so it fails loudly rather than store a different value.
 
 ### Frontend (`web/`)
 
@@ -100,39 +111,66 @@ The `api` and `squishy-mcp` dev containers run `go run` directly — there is no
 
 The Go build cache is mounted as a named volume (`gocache`, `mcp-gocache`), so restarts are fast after the first compile.
 
-## No regex on SQL — AST only
+## No regex anywhere — AST only
 
-**Forbidden** : tout traitement de SQL (Oracle, MySQL, MariaDB, DB2, PG)
-par regex, scan textuel, `strings.Index/Contains`-driven rewrites,
-substitution de placeholders dans des strings, ou tout équivalent
-opérant sur le texte brut de SQL.
+**Forbidden, partout dans ce repo, sans exception métier** :
 
-Toute transformation SQL passe **exclusivement** par l'AST :
+- **Côté Go** : aucune utilisation de `regexp.MustCompile`,
+  `regexp.Compile`, `regexp.MatchString`, ni des paquets équivalents
+  (`regexp/syntax`, etc.). Aucun `strings.Index*` /
+  `strings.Contains*` / `strings.Replace*` / `strings.Split*` /
+  `strings.HasPrefix*` / `strings.HasSuffix*` appliqué à du contenu
+  SQL ou à un fragment multi-token.
+- **Côté SQL généré** : aucun `regexp_replace`, `regexp_match`,
+  `regexp_matches`, `regexp_split_to_array`, `regexp_substr`,
+  opérateur `~` / `!~` / `~*` / `!~*`, ni `SIMILAR TO`. Aucun
+  `replace()` à plusieurs niveaux destiné à faire l'équivalent
+  texte-level d'un parser.
+- **Côté shims PG** (`postgres-init/*.sql`) : pas non plus. Quand un
+  helper runtime est nécessaire, il s'écrit en PL/pgSQL avec des
+  boucles caractère-par-caractère typées, le lexer Oracle/PG, ou en
+  passant par un AST côté Go avant émission.
+- **Côté templates de découverte** (`internal/discover/*.go`,
+  `internal/inspect/*.go`) : pas de regex sur les noms d'objets ou
+  les types. Filtrage via map/set ou via une requête SQL avec `=`,
+  `IN`, `LIKE` (le LIKE des catalogues PG/Oracle n'est PAS un regex).
 
-- Le texte source entre via le parser hand-roll (`internal/dialects/<kind>/`)
-  qui produit des nœuds `internal/sqlparse/ast/` typés.
-- Les passes de translation (`internal/translate/`) consomment et produisent
-  des nœuds AST. Elles n'inspectent jamais le texte SQL avec des regex
-  ou des fonctions de string-matching.
-- Si un nœud arrive en `*ast.RawExpr` (texte brut conservé par le parser),
-  il faut **soit étendre le parser** pour produire des nœuds typés,
-  **soit appeler le parser d'expression** sur ce texte pour obtenir un
-  AST manipulable. Pas de découpage textuel manuel.
-- Les fonctions de réécriture qui produisent du SQL pour PG passent par
-  les builders de `internal/dialects/postgres` ou par `pgast.Write`.
+Toute transformation passe **exclusivement** par l'AST :
 
-Exceptions strictes :
+- Le texte source entre via le parser hand-roll
+  (`internal/dialects/<kind>/`) qui produit des nœuds
+  `internal/sqlparse/ast/` typés.
+- Les passes de translation (`internal/translate/`) consomment et
+  produisent des nœuds AST. Elles n'inspectent jamais le texte SQL
+  avec des regex ou des fonctions de string-matching.
+- Si un nœud arrive en `*ast.RawExpr` ou `*pgast.PLRawSQL` (texte
+  brut conservé par le parser), il faut **soit étendre le parser**
+  pour produire des nœuds typés, **soit appeler le parser
+  d'expression / de body** sur ce texte pour obtenir un AST
+  manipulable. Pas de découpage textuel manuel, même temporaire.
+- Les fonctions de réécriture qui produisent du SQL pour PG passent
+  par les builders de `internal/dialects/postgres` ou par
+  `pgast.Write`. Quand le runtime PG doit faire un découpage non
+  trivial (séparer une liste de colonnes en respectant les parens
+  par exemple), on émet un appel à un helper PL/pgSQL caractère-par-
+  caractère défini dans `postgres-init/`, jamais un `regexp_replace`.
 
-- Le **lexer** lui-même (déjà écrit, non régénéré) reste le seul endroit
-  où l'on lit du texte caractère par caractère.
+Exceptions strictes (et seulement celles-ci) :
+
+- Le **lexer** hand-roll lui-même (déjà écrit, non régénéré) reste
+  le seul endroit où l'on lit du texte caractère par caractère.
 - Les vrais comments / dollar-quote markers handled by the lexer.
-- Identifier-name lower/uppercase folding (string ops on un seul ident,
-  pas sur du SQL) — tolérable mais à éviter quand un AST node existe.
+- Identifier-name lower/uppercase folding (string ops sur un seul
+  ident, pas sur du SQL ni sur un fragment multi-token) — tolérable
+  mais à éviter quand un AST node existe.
 
-Tout PR qui contient `regexp.MustCompile`, `regexp.Compile`,
-`strings.Index*`/`strings.Contains*`/`strings.Replace*` appliqué à du
-contenu SQL (vs un identifiant scalaire) est à rejeter — il faut
-remonter au parser pour exposer le nœud AST manquant.
+Tout PR qui contient `regexp.*`, ou un `strings.*` appliqué à du
+contenu SQL (vs un identifiant scalaire), ou un `regexp_replace` /
+`regexp_match` / `~` dans le SQL généré ou dans un shim PG, est à
+rejeter — il faut remonter au parser pour exposer le nœud AST
+manquant, ou écrire un helper PL/pgSQL sans regex côté shim.
+
+Garde-fou : `internal/translate/ast_only_guard_test.go` (go/parser + go/ast) fait échouer `make test` si un paquet importe `regexp`, si `internal/translate` appelle le lexer MySQL, ou si les anciens réécrivains texte réapparaissent.
 
 ## Bash style
 

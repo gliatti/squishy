@@ -165,3 +165,25 @@ func TestWritePLStmt_NilSafe(t *testing.T) {
 		t.Errorf("WriteBlock(nil) = %q", got)
 	}
 }
+
+// Embedded DML in a PL block renders through the statement writer (it
+// used to fall through to the "unsupported AST PLStmt" comment).
+func TestWritePLStmt_InsertInBlock(t *testing.T) {
+	got := WriteBlock(&ast.Block{Stmts: []ast.PLStmt{
+		&ast.InsertStmt{
+			Table: ast.TableRef{Schema: "mig", Name: "h"},
+			Cols:  []string{"id", "v"},
+			Values: [][]ast.Expr{{
+				&ast.Ident{Parts: []string{"OLD", "id"}},
+				&ast.FuncCall{Name: "statement_timestamp"},
+			}},
+		},
+	}})
+	want := "BEGIN\n  INSERT INTO \"mig\".\"h\" (\"id\", \"v\") VALUES (OLD.\"id\", statement_timestamp());\nEND;\n"
+	if got != want {
+		t.Errorf("Insert: got %q, want %q", got, want)
+	}
+	if strings.Contains(got, "unsupported") {
+		t.Errorf("Insert fell through to the unsupported branch: %q", got)
+	}
+}

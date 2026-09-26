@@ -9,9 +9,12 @@ package ast
 // The AST is intentionally a narrow procedural core (block, declare,
 // assign, if, while, for, case, return, call, cursor ops, signal). SQL DML
 // statements that appear inside a body (SELECT/INSERT/UPDATE/DELETE) are
-// captured as RawSQL so we don't re-parse a full DML grammar in v2 — the
-// body rewriter takes care of the intra-SQL lexical differences (backticks,
-// function renames, JSON paths).
+// parsed into the typed DML nodes (SelectStmt, InsertStmt, …) when the
+// dialect's DML parser accepts them; the translator rewrites those nodes
+// with ast.Rewrite passes and renders them with the dialects/postgres
+// writer. RawSQL only carries what could not be typed, and the translator
+// reports it rather than passing it through silently (the Oracle path
+// still runs its legacy text passes on RawSQL).
 // ---------------------------------------------------------------------------
 
 // PLStmt is a procedural statement inside a routine body.
@@ -59,7 +62,10 @@ type DeclareCursor struct {
 	Name       string
 	Params     string // raw text of the parenthesized param list, e.g. "p_lot VARCHAR2, p_tra NUMBER"; empty for parameterless cursors. Oracle's `CURSOR c (p1 t1, p2 t2) IS SELECT …` maps to PG's `c CURSOR (p1 t1, p2 t2) FOR SELECT …`.
 	SelectBody string // raw SELECT text (SQL passthrough)
-	P          Position
+	// Stmt is the typed cursor query when the dialect parser could parse
+	// it; nil otherwise. SelectBody keeps the raw text.
+	Stmt *SelectStmt
+	P    Position
 }
 
 func (d *DeclareCursor) Pos() Position { return d.P }
@@ -241,17 +247,22 @@ func (c *CloseStmt) plStmtNode()   {}
 
 // SignalStmt — SIGNAL SQLSTATE 'XXXXX' [SET MESSAGE_TEXT = '...'];
 type SignalStmt struct {
-	SQLState   string
-	Message    string
-	P          Position
+	SQLState string
+	Message  string
+	// Resignal is true for MySQL's RESIGNAL [SQLSTATE …] [SET …], which
+	// re-raises the condition being handled (optionally overriding its
+	// SQLSTATE / message) instead of raising a fresh one.
+	Resignal bool
+	P        Position
 }
 
 func (s *SignalStmt) Pos() Position { return s.P }
 func (s *SignalStmt) plStmtNode()   {}
 
 // SelectInto — SELECT <select list> INTO var1[,var2,...] FROM ...;
-// The select text is captured as raw SQL; the translator passes it through
-// the DML body rewriter before emission.
+// The typed SELECT (Stmt) is rewritten on the AST and rendered by the PG
+// writer; RawQuery is the text fallback used when Stmt is nil (reported as
+// untranslated on the MySQL path, legacy text passes on the Oracle path).
 type SelectInto struct {
 	Vars     []string // target variables
 	// RawQuery is the legacy text-level capture of the reassembled
@@ -271,11 +282,20 @@ type SelectInto struct {
 func (s *SelectInto) Pos() Position { return s.P }
 func (s *SelectInto) plStmtNode()   {}
 
-// RawSQL — any DML / DDL statement we pass through to PG verbatim (after the
-// body rewriter has normalized identifiers and function names).
+// RawSQL — a statement the parser could not type. Only Verbatim ones are
+// copied to PG as-is; the others are reported by the translator (the Oracle
+// path still feeds them to its legacy text passes).
 type RawSQL struct {
 	Text string // statement without trailing ';'
-	P    Position
+	// Verbatim is true when the parser recognised the statement as a
+	// PL/pgSQL-compatible one to copy as-is: bare COMMIT / ROLLBACK and
+	// GET [CURRENT] DIAGNOSTICS v = ROW_COUNT [, …]. SAVEPOINT, RELEASE
+	// SAVEPOINT, ROLLBACK TO SAVEPOINT, START TRANSACTION and GET
+	// DIAGNOSTICS CONDITION n / @var targets are not (PL/pgSQL rejects
+	// them). False means "not understood": the translator must warn
+	// rather than claim a successful translation.
+	Verbatim bool
+	P        Position
 }
 
 func (r *RawSQL) Pos() Position { return r.P }
@@ -382,7 +402,7 @@ func (p *PragmaStmt) plDeclNode()   {}
 func (p *PragmaStmt) plStmtNode()   {}
 
 // BulkCollectInto — SELECT ... BULK COLLECT INTO vars FROM ...;
-// Stored as a marker; the raw query is kept for the body rewriter.
+// Stored as a marker; the raw query is kept for the Oracle text passes.
 type BulkCollectInto struct {
 	Vars     []string
 	RawQuery string

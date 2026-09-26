@@ -402,6 +402,23 @@ func (t *UserDefinedType) TypeName() string {
 	return t.Name
 }
 
+// PGType is a data type already written in PostgreSQL syntax (`integer`,
+// `double precision`, `varchar(10)`, …). Source-dialect parsers never
+// produce it: translation passes build it as the target of the CASTs
+// they synthesise, so the type mapper and the PG writers emit Name
+// verbatim instead of mapping it again as a source-dialect type. Keeping
+// it distinct from UserDefinedType means a source type whose name
+// happens to match a PG built-in (a quoted Oracle "date" type, …) still
+// goes through the dialect type mapper.
+type PGType struct {
+	Name string
+	P    Position
+}
+
+func (t *PGType) Pos() Position    { return t.P }
+func (t *PGType) dataTypeNode()    {}
+func (t *PGType) TypeName() string { return t.Name }
+
 // ---------------------------------------------------------------------------
 // DB2-specific data types (LUW + z/OS)
 // ---------------------------------------------------------------------------

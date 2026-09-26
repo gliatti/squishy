@@ -76,6 +76,14 @@ func (d mysqlDialect) SelectOffsetQuery(schema, table string, cols []string) str
 
 // ListColumnsQuery — skip generated columns and spatial types that the
 // copier doesn't know how to coerce into PG binary format.
+//
+// This is the default column list, used when a copy does not carry its
+// own (CopyOpts.Columns). Every STORED GENERATED column is skipped,
+// MariaDB system-versioning period columns (`GENERATED ALWAYS AS ROW
+// START|END`) included: the translator drops them from every table it
+// does not emulate. An emulated system-versioned table keeps them, and
+// its copies carry an explicit column list built from the translated
+// table (planner.Build, translate.PGSystemVersioning.CopyColumns).
 func (mysqlDialect) ListColumnsQuery() string {
 	return `
 		SELECT COLUMN_NAME FROM information_schema.COLUMNS
@@ -91,11 +99,69 @@ func (mysqlDialect) ColumnDataTypeQuery() string {
 	return `SELECT DATA_TYPE FROM information_schema.COLUMNS
 	         WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=?`
 }
+
+// PKColumnsQuery lists the primary-key columns used to partition the
+// copy. The ROW END column MariaDB appends to the primary key of a
+// system-versioned table is left out: among current rows it is the same
+// sentinel everywhere, so the remaining key already orders and splits
+// the rows — keeping it would turn a single numeric key into a
+// composite one and force the slow OFFSET/LIMIT fallback.
 func (mysqlDialect) PKColumnsQuery() string {
-	return `SELECT COLUMN_NAME
-	          FROM information_schema.KEY_COLUMN_USAGE
-	         WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND CONSTRAINT_NAME='PRIMARY'
-	         ORDER BY ORDINAL_POSITION`
+	return `SELECT k.COLUMN_NAME
+	          FROM information_schema.KEY_COLUMN_USAGE k
+	          JOIN information_schema.COLUMNS c
+	            ON c.TABLE_SCHEMA = k.TABLE_SCHEMA
+	           AND c.TABLE_NAME = k.TABLE_NAME
+	           AND c.COLUMN_NAME = k.COLUMN_NAME
+	         WHERE k.TABLE_SCHEMA=? AND k.TABLE_NAME=? AND k.CONSTRAINT_NAME='PRIMARY'
+	           AND IFNULL(c.GENERATION_EXPRESSION,'') <> 'ROW END'
+	         ORDER BY k.ORDINAL_POSITION`
+}
+
+// ---------------------------------------------------------------------------
+// MariaDB system-versioning history (FOR SYSTEM_TIME ALL, closed rows)
+// ---------------------------------------------------------------------------
+
+// mysqlHistoryDialect reads the closed row versions of a MariaDB
+// system-versioned table: `FOR SYSTEM_TIME ALL` rows whose ROW END lies
+// in the past (current rows carry the far-future ROW END sentinel). The
+// catalog lookups are the base table's; only the row source changes.
+type mysqlHistoryDialect struct {
+	mysqlDialect
+	rowEnd string
+}
+
+// MySQLSystemTimeHistorySource returns the MariaDB dialect variant that
+// selects the history rows of a system-versioned table whose ROW END
+// column is rowEndCol.
+func MySQLSystemTimeHistorySource(rowEndCol string) SourceDialect {
+	return mysqlHistoryDialect{rowEnd: rowEndCol}
+}
+
+// historyFrom renders `<table> FOR SYSTEM_TIME ALL WHERE <row_end> <= NOW(6)`.
+func (d mysqlHistoryDialect) historyFrom(schema, table string) string {
+	return fmt.Sprintf("%s FOR SYSTEM_TIME ALL WHERE %s <= NOW(6)",
+		d.Qualify(schema, table), d.Quote(d.rowEnd))
+}
+
+func (d mysqlHistoryDialect) CountQuery(schema, table string) string {
+	return "SELECT COUNT(*) FROM " + d.historyFrom(schema, table)
+}
+func (d mysqlHistoryDialect) MinMaxQuery(schema, table, pkCol string) string {
+	return fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s",
+		d.Quote(pkCol), d.Quote(pkCol), d.historyFrom(schema, table))
+}
+func (d mysqlHistoryDialect) SelectRangeQuery(schema, table string, cols []string, rangeCol string) string {
+	return fmt.Sprintf("SELECT %s FROM %s AND %s BETWEEN %s AND %s ORDER BY %s",
+		joinQuoted(d, cols), d.historyFrom(schema, table),
+		d.Quote(rangeCol), d.PlaceholderAt(1), d.PlaceholderAt(2), d.Quote(rangeCol))
+}
+func (d mysqlHistoryDialect) SelectOffsetQuery(schema, table string, cols []string) string {
+	// Deterministic paging: order by every copied column (the history
+	// has no single-column key).
+	return fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT %s OFFSET %s",
+		joinQuoted(d, cols), d.historyFrom(schema, table), joinQuoted(d, cols),
+		d.PlaceholderAt(1), d.PlaceholderAt(2))
 }
 func (mysqlDialect) IsNumericDataType(dt string) bool {
 	switch strings.ToLower(dt) {
