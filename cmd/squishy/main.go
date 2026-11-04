@@ -414,14 +414,16 @@ func (c *connCache) forRun(ctx context.Context, runID uuid.UUID) (*migConns, err
 		}
 	}
 
-	// MySQL/MariaDB: scope the source pool to the migration's source database.
+	// MySQL/MariaDB/SQL Server: scope the source pool to the migration's
+	// source database (for SQL Server the discovered database; the copy
+	// payloads then carry the T-SQL schema of each table).
 	// Oracle: USER/CURRENT_SCHEMA is set per-query by the introspector/copy
 	// code, so the pool stays at the service-name level.
 	// DB2: pool stays at the database level; SET CURRENT SCHEMA is issued
 	// per-session via Extra["CurrentSchema"] so go_ibm_db propagates it on
 	// every check-out.
 	srcDatabase := srcDB
-	if srcKind == "mysql" || srcKind == "mariadb" {
+	if srcKind == "mysql" || srcKind == "mariadb" || srcKind == "sqlserver" {
 		srcDatabase = sourceSchema
 	}
 	if srcKind == "db2" || srcKind == "db2zos" {
@@ -454,6 +456,9 @@ func (c *connCache) forRun(ctx context.Context, runID uuid.UUID) (*migConns, err
 	case "db2zos":
 		src, err = connection.OpenDB2(ctx, srcParams)
 		dia = dataxfer.DB2zOSSource()
+	case "sqlserver":
+		src, err = connection.OpenSQLServer(ctx, srcParams)
+		dia = dataxfer.SQLServerSource()
 	default:
 		return nil, fmt.Errorf("unsupported source kind: %s", srcKind)
 	}

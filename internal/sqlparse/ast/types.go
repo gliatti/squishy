@@ -59,12 +59,15 @@ func (t *BitType) TypeName() string { return "BIT" }
 // ---------------------------------------------------------------------------
 
 type CharType struct {
-	Name      string // CHAR|VARCHAR
+	Name      string // CHAR|VARCHAR (T-SQL also NCHAR|NVARCHAR)
 	Length    int
 	HasLength bool
 	Charset   string
 	Collation string
-	P         Position
+	// Max is T-SQL's `(MAX)` length (VARCHAR(MAX), NVARCHAR(MAX));
+	// Length is 0 then.
+	Max bool
+	P   Position
 }
 
 func (t *CharType) Pos() Position    { return t.P }
@@ -96,7 +99,9 @@ func (t *BlobType) TypeName() string { return t.Name }
 type BinaryType struct {
 	Name   string // BINARY|VARBINARY
 	Length int
-	P      Position
+	// Max is T-SQL's VARBINARY(MAX); Length is 0 then.
+	Max bool
+	P   Position
 }
 
 func (t *BinaryType) Pos() Position    { return t.P }
@@ -500,3 +505,50 @@ type DB2XmlType struct{ P Position }
 func (t *DB2XmlType) Pos() Position    { return t.P }
 func (t *DB2XmlType) dataTypeNode()    {}
 func (t *DB2XmlType) TypeName() string { return "XML" }
+
+// ---------------------------------------------------------------------------
+// Microsoft SQL Server (T-SQL) data types
+//
+// The T-SQL parser reuses the generic nodes where the semantics match
+// (IntType for INT/BIGINT/SMALLINT/TINYINT, DecimalType, FloatType for
+// FLOAT(n)/REAL, CharType for CHAR/VARCHAR/NCHAR/NVARCHAR, BinaryType,
+// TextType for TEXT, DateType, TimeType) and uses TSQLType for the types
+// that have no generic counterpart.
+// ---------------------------------------------------------------------------
+
+// TSQLType is a T-SQL built-in type without a generic AST node. Name is
+// the upper-cased canonical type name:
+//
+//	BIT, MONEY, SMALLMONEY, DATETIME, SMALLDATETIME,
+//	DATETIME2 (Precision = fractional seconds 0-7, HasPrecision),
+//	DATETIMEOFFSET (same), UNIQUEIDENTIFIER, ROWVERSION, TIMESTAMP
+//	(the T-SQL synonym of ROWVERSION, not a date type), HIERARCHYID,
+//	SQL_VARIANT, GEOGRAPHY, GEOMETRY, IMAGE, NTEXT, XML (XMLSchema is the
+//	optional typed-XML schema collection, XMLDocument the DOCUMENT
+//	facet), SYSNAME (nvarchar(128) NOT NULL alias), CURSOR (a cursor
+//	variable's type).
+type TSQLType struct {
+	Name         string
+	Precision    int
+	HasPrecision bool
+	XMLSchema    string
+	XMLDocument  bool
+	P            Position
+}
+
+func (t *TSQLType) Pos() Position    { return t.P }
+func (t *TSQLType) dataTypeNode()    {}
+func (t *TSQLType) TypeName() string { return t.Name }
+
+// TSQLTableType is the shape of a T-SQL table variable
+// (`DECLARE @t TABLE (…)`) or of the return table of a multi-statement
+// table-valued function.
+type TSQLTableType struct {
+	Columns     []*ColumnDef
+	Constraints []TableConstraint
+	P           Position
+}
+
+func (t *TSQLTableType) Pos() Position    { return t.P }
+func (t *TSQLTableType) dataTypeNode()    {}
+func (t *TSQLTableType) TypeName() string { return "TABLE" }

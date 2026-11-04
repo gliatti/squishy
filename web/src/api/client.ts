@@ -48,7 +48,7 @@ export interface Project {
   updated_at: string
 }
 
-export type SourceKind = 'mysql' | 'mariadb' | 'oracle' | 'oracle19' | 'db2' | 'db2zos'
+export type SourceKind = 'mysql' | 'mariadb' | 'oracle' | 'oracle19' | 'db2' | 'db2zos' | 'sqlserver'
 export type TargetStrategy = 'dedicated_db' | 'dedicated_schema'
 
 export interface Instance {

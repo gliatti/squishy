@@ -719,7 +719,15 @@ func (d *Deps) copySourceDialect(variant, rowEndCol string) (dataxfer.SourceDial
 // identifiers get lowercased so they match the PG side emitted unquoted,
 // while mixed-case ("t_Case_sensitive") round-trips verbatim. Applied to
 // destination table + column names before COPY FROM.
+//
+// SQL Server identifiers are folded whole to lowercase (default CI
+// collation: `[SalesOrderHeader]` and `salesorderheader` name the same
+// table) through dataxfer.FoldSQLServerIdent, the one fold the copier
+// uses too, so the worker and the copier cannot drift apart.
 func pgNormalizeIdent(kind, s string) string {
+	if kind == "sqlserver" {
+		return dataxfer.FoldSQLServerIdent(s)
+	}
 	if kind != "oracle" || s == "" {
 		return s
 	}

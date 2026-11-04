@@ -53,3 +53,19 @@ var db2SystemSchemas = map[string]bool{
 	// dataq / replication / federation appliances.
 	"DB2QREP": true, "ASN": true, "DB2OSC": true, "DB2INST1_CONNECT": true,
 }
+
+// sqlserverSystemDatabases lists, lowercased, the databases shipped by SQL
+// Server and its services. master/tempdb/model/msdb are already excluded
+// by `database_id > 4`; they stay here as a safety net (a restored copy
+// of msdb, for instance, gets a higher id).
+var sqlserverSystemDatabases = map[string]bool{
+	"master": true, "tempdb": true, "model": true, "msdb": true,
+	// Reporting Services catalogs.
+	"reportserver": true, "reportservertempdb": true,
+	// Replication distributor.
+	"distribution": true,
+	// Integration Services catalog.
+	"ssisdb": true,
+	// PolyBase / Analytics Platform System scale-out databases.
+	"dwconfiguration": true, "dwdiagnostics": true, "dwqueue": true,
+}

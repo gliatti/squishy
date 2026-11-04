@@ -41,6 +41,7 @@ func Rewrite(n Node, fn Rewriter) Node {
 	case *BinaryExpr:
 		x.Lhs = rewriteExpr(x.Lhs, fn)
 		x.Rhs = rewriteExpr(x.Rhs, fn)
+		x.Escape = rewriteExpr(x.Escape, fn)
 		return fn(x)
 	case *UnaryExpr:
 		x.Rhs = rewriteExpr(x.Rhs, fn)
@@ -114,6 +115,19 @@ func Rewrite(n Node, fn Rewriter) Node {
 		return fn(x)
 	case *CastExpr:
 		x.Expr = rewriteExpr(x.Expr, fn)
+		x.ConvertStyle = rewriteExpr(x.ConvertStyle, fn)
+		return fn(x)
+	case *CollateExpr:
+		x.Expr = rewriteExpr(x.Expr, fn)
+		return fn(x)
+	case *MethodCall:
+		x.Target = rewriteExpr(x.Target, fn)
+		for i, a := range x.Args {
+			x.Args[i] = rewriteExpr(a, fn)
+		}
+		return fn(x)
+	case *NamedArg:
+		x.Value = rewriteExpr(x.Value, fn)
 		return fn(x)
 	case *IntervalLit:
 		x.Expr = rewriteExpr(x.Expr, fn)
@@ -127,6 +141,7 @@ func Rewrite(n Node, fn Rewriter) Node {
 				x.With.CTEs[i].Body = rewriteSelect(x.With.CTEs[i].Body, fn)
 			}
 		}
+		x.Top = rewriteExpr(x.Top, fn)
 		for i := range x.Cols {
 			x.Cols[i].Expr = rewriteExpr(x.Cols[i].Expr, fn)
 		}
@@ -167,7 +182,27 @@ func Rewrite(n Node, fn Rewriter) Node {
 		}
 		x.On = rewriteExpr(x.On, fn)
 		return fn(x)
+	case *FromFunc:
+		x.Func = rewriteExpr(x.Func, fn)
+		return fn(x)
+	case *FromPivot:
+		if x.Source != nil {
+			if rs, ok := Rewrite(x.Source, fn).(FromItem); ok {
+				x.Source = rs
+			}
+		}
+		x.Agg = rewriteExpr(x.Agg, fn)
+		return fn(x)
+	case *FromValues:
+		for i, row := range x.Rows {
+			for j, e := range row {
+				x.Rows[i][j] = rewriteExpr(e, fn)
+			}
+		}
+		return fn(x)
 	case *InsertStmt:
+		rewriteWith(x.With, fn)
+		x.Top = rewriteExpr(x.Top, fn)
 		for i, row := range x.Values {
 			for j, e := range row {
 				x.Values[i][j] = rewriteExpr(e, fn)
@@ -185,8 +220,15 @@ func Rewrite(n Node, fn Rewriter) Node {
 			x.OnConflict.Where = rewriteExpr(x.OnConflict.Where, fn)
 		}
 		rewriteSelectItems(x.Returning, fn)
+		if x.Exec != nil {
+			if rs, ok := Rewrite(x.Exec, fn).(PLStmt); ok {
+				x.Exec = rs
+			}
+		}
 		return fn(x)
 	case *UpdateStmt:
+		rewriteWith(x.With, fn)
+		x.Top = rewriteExpr(x.Top, fn)
 		for i, a := range x.Sets {
 			x.Sets[i].Expr = rewriteExpr(a.Expr, fn)
 		}
@@ -195,17 +237,24 @@ func Rewrite(n Node, fn Rewriter) Node {
 		rewriteSelectItems(x.Returning, fn)
 		return fn(x)
 	case *DeleteStmt:
+		rewriteWith(x.With, fn)
+		x.Top = rewriteExpr(x.Top, fn)
 		rewriteFromItems(x.Using, fn)
 		x.Where = rewriteExpr(x.Where, fn)
 		rewriteSelectItems(x.Returning, fn)
 		return fn(x)
 	case *MergeStmt:
+		rewriteWith(x.With, fn)
+		x.Top = rewriteExpr(x.Top, fn)
 		if x.Source != nil {
 			if rs, ok := Rewrite(x.Source, fn).(FromItem); ok {
 				x.Source = rs
 			}
 		}
 		x.On = rewriteExpr(x.On, fn)
+		rewriteMergeActions(x.WhenMatched, fn)
+		rewriteMergeActions(x.WhenNotMatched, fn)
+		rewriteMergeActions(x.WhenNotMatchedBySource, fn)
 		return fn(x)
 
 	// -- PL/SQL statements (just the ones whose expression slots Phase
@@ -334,6 +383,33 @@ func Rewrite(n Node, fn Rewriter) Node {
 		for i, e := range x.Using {
 			x.Using[i] = rewriteExpr(e, fn)
 		}
+		x.ParamDecl = rewriteExpr(x.ParamDecl, fn)
+		return fn(x)
+	case *RaiseStmt:
+		x.Message = rewriteExpr(x.Message, fn)
+		x.ErrNumber = rewriteExpr(x.ErrNumber, fn)
+		x.Severity = rewriteExpr(x.Severity, fn)
+		x.State = rewriteExpr(x.State, fn)
+		for i, e := range x.Args {
+			x.Args[i] = rewriteExpr(e, fn)
+		}
+		return fn(x)
+	case *FetchStmt:
+		x.Offset = rewriteExpr(x.Offset, fn)
+		return fn(x)
+	case *DeclareStmt:
+		for i, d := range x.Decls {
+			if rd, ok := Rewrite(d, fn).(PLDecl); ok {
+				x.Decls[i] = rd
+			}
+		}
+		return fn(x)
+	case *EmbeddedDDL:
+		if x.Stmt != nil {
+			if rs, ok := Rewrite(x.Stmt, fn).(Stmt); ok {
+				x.Stmt = rs
+			}
+		}
 		return fn(x)
 	case *SelectInto:
 		if x.Stmt != nil {
@@ -350,6 +426,20 @@ func Rewrite(n Node, fn Rewriter) Node {
 		return fn(x)
 	case *CreateEvent:
 		x.AtExpr = rewriteExpr(x.AtExpr, fn)
+		return fn(x)
+	case *CreateFunction:
+		// The typed query of a T-SQL inline table-valued function.
+		x.Select = rewriteSelect(x.Select, fn)
+		return fn(x)
+	case *CreateIndex:
+		// T-SQL filtered-index predicate.
+		x.Where = rewriteExpr(x.Where, fn)
+		return fn(x)
+	case *AlterTable:
+		// Typed T-SQL `ADD DEFAULT (expr) FOR col` expressions.
+		for i := range x.Actions {
+			x.Actions[i].Default = rewriteExpr(x.Actions[i].Default, fn)
+		}
 		return fn(x)
 	}
 
@@ -394,6 +484,30 @@ func rewriteFromItems(items []FromItem, fn Rewriter) {
 		}
 		if rf, ok := Rewrite(f, fn).(FromItem); ok {
 			items[i] = rf
+		}
+	}
+}
+
+// rewriteWith rewrites the CTE bodies of a WITH prelude in place.
+func rewriteWith(w *WithClause, fn Rewriter) {
+	if w == nil {
+		return
+	}
+	for i := range w.CTEs {
+		w.CTEs[i].Body = rewriteSelect(w.CTEs[i].Body, fn)
+	}
+}
+
+// rewriteMergeActions rewrites the condition, SET expressions and INSERT
+// values of every MERGE branch in place (MergeAction is a value struct).
+func rewriteMergeActions(actions []MergeAction, fn Rewriter) {
+	for i := range actions {
+		actions[i].Cond = rewriteExpr(actions[i].Cond, fn)
+		for j := range actions[i].Sets {
+			actions[i].Sets[j].Expr = rewriteExpr(actions[i].Sets[j].Expr, fn)
+		}
+		for j, e := range actions[i].InsertValues {
+			actions[i].InsertValues[j] = rewriteExpr(e, fn)
 		}
 	}
 }

@@ -45,6 +45,11 @@ const dialects: DialectMeta[] = [
     defaults: { host: '', port: 446, database: '', username: '', password: '' },
     dbHint: 'subsystem location name (DSN, DB2A, …)',
   },
+  {
+    value: 'sqlserver', label: 'Microsoft SQL Server 2016–2022',
+    defaults: { host: 'sqlserver-sample', port: 1433, database: 'master', username: 'sa', password: 'Squishy_2026x' },
+    dbHint: 'any database of the instance (databases are discovered)',
+  },
 ]
 
 const form = reactive<InstanceCreateReq>({

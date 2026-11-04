@@ -18,6 +18,7 @@ import (
 	_ "gitlab.com/dalibo/squishy/internal/dialects/mysql"    // registers mysql + mariadb
 	_ "gitlab.com/dalibo/squishy/internal/dialects/oracle"   // registers oracle
 	_ "gitlab.com/dalibo/squishy/internal/dialects/postgres" // registers postgres (target)
+	_ "gitlab.com/dalibo/squishy/internal/dialects/tsql"     // registers sqlserver
 	"gitlab.com/dalibo/squishy/internal/inspect"
 	"gitlab.com/dalibo/squishy/internal/planner"
 	"gitlab.com/dalibo/squishy/internal/project"
@@ -36,6 +37,10 @@ func inspectSourceForSchema(ctx context.Context, db *sql.DB, kind, sourceSchema 
 		return inspect.InspectOracle(ctx, db, sourceSchema, log)
 	case "db2", "db2zos":
 		return inspect.InspectDB2(ctx, db, sourceSchema, log)
+	case "sqlserver":
+		// The migration's source "schema" is a SQL Server database; its
+		// T-SQL schemas come back on each snapshot (ObjectSnapshot.Schema).
+		return inspect.InspectSQLServer(ctx, db, sourceSchema, log)
 	}
 	return nil, nil, errors.New("unsupported source kind: " + kind)
 }
@@ -176,13 +181,21 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	parseStart := time.Now()
+	// T-SQL modules (views, procedures, functions, triggers) need no `;` and
+	// their body runs to the next GO batch separator, so a `;` between two
+	// snapshots would silently fold every following object into the first
+	// module's body. SQL Server snapshots are separated by GO instead.
+	snapSep := []byte(";\n\n")
+	if dialects.IsSQLServer(dialects.Kind(inst.Kind)) {
+		snapSep = []byte("\nGO\n\n")
+	}
 	var allDDL []byte
 	for _, snaps := range [][]inspect.ObjectSnapshot{
 		schema.Tables, schema.Views, schema.Triggers, schema.Procedures, schema.Functions, schema.Events,
 	} {
 		for _, s := range snaps {
 			allDDL = append(allDDL, s.DDL...)
-			allDDL = append(allDDL, ';', '\n', '\n')
+			allDDL = append(allDDL, snapSep...)
 		}
 	}
 	stmts, parseErr := dia.Parse(string(allDDL))

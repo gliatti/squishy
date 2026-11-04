@@ -1,0 +1,4 @@
+# Exclude bulk test-data dumps (18+ GB of generated SQL) and skill defs
+dumps/
+.claude/
+graphify-out/

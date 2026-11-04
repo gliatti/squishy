@@ -66,6 +66,38 @@ db2-cli: ## Open the DB2 CLP shell on the sample (su to db2inst1 + connect to SA
 db2-down: ## Stop the DB2 sample container + wipe its volume
 	$(COMPOSE) --profile db2 down -v db2-sample
 
+# SQL Server: sqlserver-init loads test/fixtures/sqlserver_{sample,seed}.sql
+# into squishy_sample and only turns healthy once the load succeeded, so
+# `up --wait` returns with the fixture in place (or fails on a SQL error).
+SQLSERVER_SA_PASSWORD ?= Squishy_2026x
+SQLCMD = /opt/mssql-tools18/bin/sqlcmd -C -b -I -S localhost -U sa -P $(SQLSERVER_SA_PASSWORD)
+
+sqlserver-up: ## Start SQL Server 2022 (profile sqlserver) and load the squishy_sample fixture
+	$(COMPOSE) --profile sqlserver up -d --wait sqlserver-sample sqlserver-init
+
+sqlserver-reload: ## Drop and reload the squishy_sample fixture database
+	$(COMPOSE) --profile sqlserver up -d --wait --force-recreate sqlserver-init
+
+sqlserver-load-dumps: ## Load Northwind, pubs and AdventureWorks (dumps/sqlserver/, see dumps/README.md)
+	$(COMPOSE) cp dumps/sqlserver/instnwnd.sql sqlserver-sample:/tmp/instnwnd.sql
+	$(COMPOSE) cp dumps/sqlserver/instpubs.sql sqlserver-sample:/tmp/instpubs.sql
+	$(COMPOSE) exec -T sqlserver-sample $(SQLCMD) -Q "IF DB_ID(N'Northwind') IS NOT NULL BEGIN ALTER DATABASE Northwind SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE Northwind; END; CREATE DATABASE Northwind;"
+	$(COMPOSE) exec -T sqlserver-sample $(SQLCMD) -d Northwind -i /tmp/instnwnd.sql
+	$(COMPOSE) exec -T sqlserver-sample $(SQLCMD) -i /tmp/instpubs.sql
+	$(COMPOSE) exec -T -u 0 sqlserver-sample rm -rf /tmp/aw
+	$(COMPOSE) cp dumps/sqlserver/adventureworks sqlserver-sample:/tmp/aw
+	$(COMPOSE) exec -T -u 0 sqlserver-sample bash /tmp/aw/prep-linux.sh
+	$(COMPOSE) exec -T sqlserver-sample $(SQLCMD) -i /tmp/aw/instawdb.linux.sql
+
+sqlserver-logs: ## Tail sqlserver-sample and sqlserver-init logs
+	$(COMPOSE) --profile sqlserver logs -f sqlserver-sample sqlserver-init
+
+sqlserver-cli: ## Open sqlcmd on the SQL Server sample (sa, database squishy_sample)
+	$(COMPOSE) exec sqlserver-sample /opt/mssql-tools18/bin/sqlcmd -C -I -S localhost -U sa -P $(SQLSERVER_SA_PASSWORD) -d squishy_sample
+
+sqlserver-down: ## Stop the SQL Server sample containers + wipe their volume
+	$(COMPOSE) --profile sqlserver down -v sqlserver-sample sqlserver-init
+
 # ---- schema migrations ----
 
 # migrate-up / migrate-down / migrate-status run cmd/squishy-migrate, which

@@ -42,6 +42,26 @@ type SelectStmt struct {
 	// the clause grammar and a structured model is out of scope for v1.
 	ForUpdate string
 
+	// T-SQL `TOP (n) [PERCENT] [WITH TIES]`. Top is nil when absent.
+	Top         Expr
+	TopPercent  bool
+	TopWithTies bool
+
+	// IntoTable is the target of T-SQL `SELECT … INTO new_table FROM …`
+	// (creates and fills a table, typically a #temp table); nil otherwise.
+	IntoTable *TableRef
+
+	// ForXML is the raw text of a T-SQL `FOR XML …` / `FOR JSON …` /
+	// `FOR BROWSE` clause ("" when absent) and ForXMLKind its family
+	// ("XML" | "JSON" | "BROWSE"). PG has no equivalent clause, so
+	// translators must report it rather than drop it.
+	ForXML     string
+	ForXMLKind string
+
+	// OptionClause is the raw text of a T-SQL query-hint clause such as
+	// `OPTION (MAXRECURSION 25)` ("" when absent).
+	OptionClause string
+
 	P Position
 }
 
@@ -162,6 +182,11 @@ const (
 	RightJoin
 	FullJoin
 	CrossJoin
+	// CrossApply / OuterApply are T-SQL's `CROSS APPLY` / `OUTER APPLY`
+	// (PG: `CROSS JOIN LATERAL` / `LEFT JOIN LATERAL … ON true`). Right is
+	// the applied source (subquery or table-valued function); On is nil.
+	CrossApply
+	OuterApply
 )
 
 func (k JoinKind) String() string {
@@ -176,6 +201,10 @@ func (k JoinKind) String() string {
 		return "FULL JOIN"
 	case CrossJoin:
 		return "CROSS JOIN"
+	case CrossApply:
+		return "CROSS APPLY"
+	case OuterApply:
+		return "OUTER APPLY"
 	}
 	return "JOIN"
 }
@@ -193,7 +222,18 @@ type InsertStmt struct {
 	Select  *SelectStmt // populated for INSERT ... SELECT
 	OnConflict *OnConflict
 	Returning  []SelectItem // PG/Oracle RETURNING; empty when absent
-	P         Position
+
+	// T-SQL extensions. DefaultValues is `INSERT … DEFAULT VALUES`. Exec is
+	// the source of `INSERT … EXEC …` (a *CallStmt or an
+	// *ExecuteImmediateStmt; nil otherwise). Output is the raw text of an
+	// `OUTPUT … [INTO …]` clause ("" when absent). With is a CTE prelude
+	// (`WITH c AS (…) INSERT …`) and Top `INSERT TOP (n)`; nil otherwise.
+	DefaultValues bool
+	Exec          PLStmt
+	Output        string
+	With          *WithClause
+	Top           Expr
+	P             Position
 }
 
 func (s *InsertStmt) Pos() Position { return s.P }
@@ -219,7 +259,15 @@ type UpdateStmt struct {
 	From  []FromItem // PG-style multi-table update; MySQL's comma-list maps here
 	Where Expr
 	Returning []SelectItem
-	P     Position
+	// T-SQL extensions: With is a CTE prelude (nil when absent), Top is
+	// `UPDATE TOP (n)` (nil when absent), Output / OptionClause the raw
+	// text of an `OUTPUT …` clause and of an `OPTION (…)` query-hint
+	// clause.
+	With         *WithClause
+	Top          Expr
+	Output       string
+	OptionClause string
+	P            Position
 }
 
 func (s *UpdateStmt) Pos() Position { return s.P }
@@ -235,6 +283,10 @@ type Assign struct {
 	Col       string
 	TupleCols []string
 	Expr      Expr
+	// ColQualifier holds the leading parts of a qualified T-SQL SET target
+	// (`SET [Sales].[T].[Col] = …` → ["Sales", "T"], Col "Col"); empty for
+	// a bare column.
+	ColQualifier []string
 }
 
 // DeleteStmt — DELETE FROM t [WHERE ...].
@@ -244,7 +296,13 @@ type DeleteStmt struct {
 	Using []FromItem // PG `USING` / MySQL multi-table delete sources
 	Where Expr
 	Returning []SelectItem
-	P     Position
+	// T-SQL extensions (see UpdateStmt). The second FROM list of
+	// `DELETE t FROM t JOIN …` lands in Using.
+	With         *WithClause
+	Top          Expr
+	Output       string
+	OptionClause string
+	P            Position
 }
 
 func (s *DeleteStmt) Pos() Position { return s.P }
@@ -265,6 +323,15 @@ type MergeStmt struct {
 	// (PG has no equivalent); this flag lets the translator surface a
 	// remediation warning.
 	HasLogErrors bool
+
+	// WhenNotMatchedBySource holds T-SQL's `WHEN NOT MATCHED BY SOURCE
+	// [AND cond] THEN UPDATE … | DELETE` branches (PG 17 spells them the
+	// same way). Output is the raw text of a T-SQL `OUTPUT …` clause, With
+	// a T-SQL CTE prelude (nil when absent) and Top `MERGE TOP (n)`.
+	WhenNotMatchedBySource []MergeAction
+	Output                 string
+	With                   *WithClause
+	Top                    Expr
 
 	P            Position
 }

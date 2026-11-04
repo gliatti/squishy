@@ -12,12 +12,13 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/microsoft/go-mssqldb"
 	_ "github.com/sijms/go-ora/v2"
 )
 
 // Params is the canonical connection spec persisted in squishy.connections.
 type Params struct {
-	Kind     string // mysql|mariadb|oracle|oracle19|db2|db2zos|postgres
+	Kind     string // mysql|mariadb|oracle|oracle19|db2|db2zos|sqlserver|postgres
 	Host     string
 	Port     int
 	Database string // schema/db/service name depending on Kind
@@ -137,6 +138,67 @@ func OpenDB2(ctx context.Context, p Params) (*sql.DB, error) {
 	if err := db.PingContext(pingCtx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping db2: %w", err)
+	}
+	return db, nil
+}
+
+// SQLServerDSN returns a sqlserver:// URL accepted by
+// github.com/microsoft/go-mssqldb.
+//
+//	sqlserver://user:pass@host:port?database=X&encrypt=disable
+//
+// url.UserPassword escapes the credentials (SA passwords routinely carry
+// `@`, `#`, `%`). SSLMode maps onto the driver's TLS knobs: "disable"
+// turns TLS off, "require" asks for an encrypted, verified channel, and
+// anything else (empty included) keeps the driver's default negotiation
+// but trusts the server certificate — the sample containers and most
+// on-premise instances present a self-signed one. Extra entries are
+// passed through as query parameters and win over the SSLMode mapping,
+// so a connection can still set e.g. `encrypt=strict` or a
+// `hostNameInCertificate` explicitly.
+func (p Params) SQLServerDSN() string {
+	q := url.Values{}
+	if p.Database != "" {
+		q.Set("database", p.Database)
+	}
+	switch p.SSLMode {
+	case "disable":
+		q.Set("encrypt", "disable")
+	case "require":
+		q.Set("encrypt", "true")
+	default:
+		q.Set("TrustServerCertificate", "true")
+	}
+	for k, v := range p.Extra {
+		q.Set(k, v)
+	}
+	u := url.URL{
+		Scheme:   "sqlserver",
+		User:     url.UserPassword(p.Username, p.Password),
+		Host:     fmt.Sprintf("%s:%d", p.Host, p.Port),
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+// OpenSQLServer returns a pooled *sql.DB backed by microsoft/go-mssqldb
+// (pure Go, no ODBC driver needed — the alpine `dev` image is enough).
+func OpenSQLServer(ctx context.Context, p Params) (*sql.DB, error) {
+	db, err := sql.Open("sqlserver", p.SQLServerDSN())
+	if err != nil {
+		return nil, fmt.Errorf("open sqlserver: %w", err)
+	}
+	// Pool sized for parallel introspection (the sys.* catalog walks fan
+	// out to inspectSQLServerConcurrency workers, each holding a
+	// *sql.Conn). Idle == Max keeps connections hot across sections to
+	// avoid the TDS login overhead of reopening every section.
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(16)
+	pingCtx, cancel := contextWithTimeout(ctx)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping sqlserver: %w", err)
 	}
 	return db, nil
 }
@@ -263,6 +325,17 @@ func Test(ctx context.Context, p Params) TestResult {
 		var v string
 		if err := db.QueryRowContext(ctx,
 			"SELECT GETVARIABLE('SYSIBM.VERSION') FROM SYSIBM.SYSDUMMY1").Scan(&v); err != nil {
+			return TestResult{OK: false, Message: "ping OK but version failed: " + err.Error()}
+		}
+		return TestResult{OK: true, Version: v, Message: "connected"}
+	case "sqlserver":
+		db, err := OpenSQLServer(ctx, p)
+		if err != nil {
+			return TestResult{OK: false, Message: err.Error()}
+		}
+		defer db.Close()
+		var v string
+		if err := db.QueryRowContext(ctx, "SELECT @@VERSION").Scan(&v); err != nil {
 			return TestResult{OK: false, Message: "ping OK but version failed: " + err.Error()}
 		}
 		return TestResult{OK: true, Version: v, Message: "connected"}

@@ -50,8 +50,12 @@ func (o *CopyOpts) dialect() SourceDialect {
 // replaced with `_` here so the COPY target name agrees with what the
 // DDL translator emits for the same table — must stay in lockstep with
 // translate.normalizeOracleIdent.
-// Non-Oracle sources get the identifier untouched.
+// SQL Server sources fold the whole identifier to lowercase (see
+// FoldSQLServerIdent). Other sources get the identifier untouched.
 func normalizeDstIdent(kind, s string) string {
+	if kind == "sqlserver" {
+		return FoldSQLServerIdent(s)
+	}
 	if kind != "oracle" || s == "" {
 		return s
 	}
@@ -81,6 +85,18 @@ func normalizeDstIdent(kind, s string) string {
 	return out
 }
 
+// FoldSQLServerIdent maps one SQL Server identifier onto the PG name the
+// translator gives it: the whole identifier lowercased (the default SQL
+// Server collation is case-insensitive, so `[SalesOrderHeader]` and
+// `salesorderheader` are the same object), spaces and other characters
+// kept — `[Order Details]` becomes the quoted PG name "order details".
+// The translator's identifier fold for the sqlserver kind must stay in
+// lockstep with this (strings.ToLower, i.e. Unicode simple case
+// mapping). It applies to a single identifier, never to SQL text.
+func FoldSQLServerIdent(s string) string {
+	return strings.ToLower(s)
+}
+
 // CopyBatch streams the rows matching the given range from MySQL into PG.
 // It introspects the PG target column types, DELETEs the target range first
 // (idempotency), then COPY FROM STDIN with coerced values.
@@ -91,6 +107,13 @@ func CopyBatch(ctx context.Context, o CopyOpts) (int64, error) {
 			return 0, err
 		}
 		o.Columns = cols
+	}
+	if sd, ok := o.dialect().(selectExprDialect); ok {
+		d, err := sd.ForColumns(ctx, o.SourceDB, o.SrcSchema, o.SrcTable, o.Columns)
+		if err != nil {
+			return 0, err
+		}
+		o.SourceDialect = d
 	}
 
 	// Source-side columns (used in the Oracle/MySQL SELECT) keep their
@@ -117,7 +140,7 @@ func CopyBatch(ctx context.Context, o CopyOpts) (int64, error) {
 	}
 	defer rows.Close()
 
-	src := &sqlRowSource{rows: rows, cols: o.Columns, targetTypes: targetTypes}
+	src := &sqlRowSource{rows: rows, cols: o.Columns, targetTypes: targetTypes, kind: o.dialect().Kind()}
 	n, err := o.TargetPool.CopyFrom(ctx,
 		pgx.Identifier{o.DstSchema, o.DstTable}, pgCols, src)
 	if err != nil {
@@ -156,17 +179,56 @@ func (o *CopyOpts) selectSource(ctx context.Context) (*sql.Rows, error) {
 	case "offset":
 		off := o.Low["offset"]
 		lim := o.High["limit"]
-		q := d.SelectOffsetQuery(o.SrcSchema, o.SrcTable, o.Columns)
+		q, err := o.offsetQuery(ctx, d)
+		if err != nil {
+			return nil, err
+		}
 		// Argument order is dialect-specific: MySQL's LIMIT ? OFFSET ? wants
-		// (limit, offset); Oracle's OFFSET :1 ROWS FETCH NEXT :2 ROWS wants
-		// (offset, limit). Encode this once in the dialect and let the
-		// caller see a consistent (offset, limit) pair.
-		if d.Kind() == "oracle" {
+		// (limit, offset); Oracle's and SQL Server's OFFSET … ROWS FETCH
+		// NEXT … ROWS want (offset, limit). Encode this once in the dialect
+		// and let the caller see a consistent (offset, limit) pair.
+		switch d.Kind() {
+		case "oracle", "sqlserver":
 			return o.SourceDB.QueryContext(ctx, q, off, lim)
 		}
 		return o.SourceDB.QueryContext(ctx, q, lim, off)
 	}
 	return nil, fmt.Errorf("unknown RangeKind %q", o.RangeKind)
+}
+
+// selectExprDialect is implemented by dialects that convert some column
+// types server-side in the batch SELECT (SQL Server CLR types). The
+// returned dialect renders those columns converted; quoting, kind and
+// catalog queries are unchanged.
+type selectExprDialect interface {
+	ForColumns(ctx context.Context, db *sql.DB, schema, table string, cols []string) (SourceDialect, error)
+}
+
+// keyedOffsetDialect is implemented by dialects whose OFFSET paging is
+// only deterministic with an explicit sort key. SQL Server makes ORDER BY
+// mandatory with OFFSET/FETCH, and without a unique key the order of two
+// independent batch SELECTs is not guaranteed — rows could be copied
+// twice or skipped.
+type keyedOffsetDialect interface {
+	SelectOffsetOrderedQuery(schema, table string, cols, orderBy []string) string
+}
+
+// offsetQuery returns the OFFSET batch SELECT: ordered by the primary key
+// when the dialect supports it and the table has one, the dialect's plain
+// SelectOffsetQuery otherwise.
+func (o *CopyOpts) offsetQuery(ctx context.Context, d SourceDialect) (string, error) {
+	kd, ok := d.(keyedOffsetDialect)
+	if !ok {
+		return d.SelectOffsetQuery(o.SrcSchema, o.SrcTable, o.Columns), nil
+	}
+	pk, err := sourcePKColumns(ctx, o.SourceDB, d, o.SrcSchema, o.SrcTable)
+	if err != nil {
+		return "", fmt.Errorf("pk cols: %w", err)
+	}
+	if len(pk) == 0 {
+		return d.SelectOffsetQuery(o.SrcSchema, o.SrcTable, o.Columns), nil
+	}
+	return kd.SelectOffsetOrderedQuery(o.SrcSchema, o.SrcTable, o.Columns, pk), nil
 }
 
 // listTargetTypes returns the PG udt_name of each column in the same order as
@@ -202,6 +264,7 @@ type sqlRowSource struct {
 	rows        *sql.Rows
 	cols        []string
 	targetTypes []string
+	kind        string // source dialect Kind(), for source-specific value fixes
 
 	cur []any
 	err error
@@ -225,7 +288,7 @@ func (s *sqlRowSource) Next() bool {
 		if i < len(s.targetTypes) {
 			udt = s.targetTypes[i]
 		}
-		vals[i] = coerce(v, udt)
+		vals[i] = coerceFrom(s.kind, v, udt)
 	}
 	s.cur = vals
 	return true

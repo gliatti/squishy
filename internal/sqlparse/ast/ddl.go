@@ -35,6 +35,10 @@ type CreateTable struct {
 	// an application-time period. PG has no native PERIOD FOR clause.
 	Periods []PeriodDef
 
+	// HistoryTable is the T-SQL `WITH (SYSTEM_VERSIONING = ON
+	// (HISTORY_TABLE = s.t))` history table; nil when not given.
+	HistoryTable *TableRef
+
 	P Position
 }
 
@@ -144,7 +148,30 @@ type ColumnDef struct {
 	// ones) WithoutSystemVersioning, as MariaDB's SHOW CREATE TABLE does.
 	WithSystemVersioning    bool
 	WithoutSystemVersioning bool
-	P                       Position
+
+	// T-SQL column attributes.
+	//   - IDENTITY [(seed, increment)] sets AutoInc; HasIdentityArgs is
+	//     true when the seed / increment were written (defaults 1, 1).
+	//   - NotForReplication: IDENTITY … NOT FOR REPLICATION (no PG
+	//     analogue, informational).
+	//   - RowGUIDCol / Sparse / FileStream: ROWGUIDCOL, SPARSE, FILESTREAM.
+	//   - DefaultName: the name of a named default constraint
+	//     (`CONSTRAINT DF_x DEFAULT (…)`); "" when unnamed.
+	//   - PeriodRow: "START" / "END" for a system-time period column
+	//     (`GENERATED ALWAYS AS ROW START|END [HIDDEN]`, SystemVersioning
+	//     is set too); "" otherwise.
+	// A T-SQL computed column (`c AS expr [PERSISTED]`) has a nil Type and
+	// Generated set (Virtual = !PERSISTED, HasVirtual = true).
+	IdentitySeed      int64
+	IdentityIncrement int64
+	HasIdentityArgs   bool
+	NotForReplication bool
+	RowGUIDCol        bool
+	Sparse            bool
+	FileStream        bool
+	DefaultName       string
+	PeriodRow         string
+	P                 Position
 }
 
 func (c *ColumnDef) Pos() Position { return c.P }
@@ -187,7 +214,10 @@ type PKConstraint struct {
 	Name    string // may be empty
 	Columns []IndexedCol
 	State   ConstraintState
-	P       Position
+	// Clustered records T-SQL's CLUSTERED / NONCLUSTERED ("" when
+	// unspecified). Physical layout only: no semantic effect.
+	Clustered string
+	P         Position
 }
 
 func (c *PKConstraint) Pos() Position         { return c.P }
@@ -197,7 +227,9 @@ type UQConstraint struct {
 	Name    string
 	Columns []IndexedCol
 	State   ConstraintState
-	P       Position
+	// Clustered: see PKConstraint.Clustered.
+	Clustered string
+	P         Position
 }
 
 func (c *UQConstraint) Pos() Position        { return c.P }
@@ -212,7 +244,10 @@ type FKConstraint struct {
 	OnDelete   string // RESTRICT|CASCADE|SET NULL|NO ACTION|SET DEFAULT|"" (unspecified)
 	OnUpdate   string
 	State      ConstraintState
-	P          Position
+	// NotForReplication records T-SQL's NOT FOR REPLICATION (no PG
+	// analogue, informational).
+	NotForReplication bool
+	P                 Position
 }
 
 func (c *FKConstraint) Pos() Position        { return c.P }
@@ -223,7 +258,9 @@ type CheckConstraint struct {
 	Expr     Expr
 	Enforced bool
 	State    ConstraintState
-	P        Position
+	// NotForReplication: see FKConstraint.NotForReplication.
+	NotForReplication bool
+	P                 Position
 }
 
 func (c *CheckConstraint) Pos() Position        { return c.P }
@@ -480,7 +517,16 @@ type CreateIndex struct {
 	Table    TableRef
 	Columns  []IndexedCol
 	Using    string
-	P        Position
+	// T-SQL extensions: Include is the `INCLUDE (cols)` list, Where the
+	// filtered-index predicate (nil when absent), Clustered the
+	// CLUSTERED / NONCLUSTERED keyword ("" when unspecified; physical
+	// layout only), Options the raw `WITH (…)` / `ON filegroup` storage
+	// options (dropped on PG).
+	Include   []string
+	Where     Expr
+	Clustered string
+	Options   []string
+	P         Position
 }
 
 func (s *CreateIndex) Pos() Position { return s.P }
@@ -522,6 +568,12 @@ type AlterAction struct {
 	// is set internally by the parser and consumed at statement-build
 	// time, so the translator never sees a non-empty Following slice.
 	Following []AlterAction
+	// Default is the typed default expression of a SET_DEFAULT action
+	// (T-SQL `ADD [CONSTRAINT name] DEFAULT (expr) FOR col`: DropName is
+	// the column, DefaultExpr the raw text); ConstraintName is the named
+	// default constraint ("" when unnamed).
+	Default        Expr
+	ConstraintName string
 }
 
 // ---------------------------------------------------------------------------
@@ -555,7 +607,13 @@ type CreateView struct {
 	// or was not attempted). Translators surface it as an explicit
 	// warning instead of passing the raw text through silently.
 	SelectParseError string
-	P                Position
+	// SchemaBinding is T-SQL's `WITH SCHEMABINDING`; ViewOptions the other
+	// view attributes (ENCRYPTION, VIEW_METADATA). OrAlter is
+	// `CREATE OR ALTER VIEW`.
+	SchemaBinding bool
+	ViewOptions   []string
+	OrAlter       bool
+	P             Position
 }
 
 func (s *CreateView) Pos() Position { return s.P }
@@ -612,7 +670,19 @@ type CreateTrigger struct {
 	// ALTER TRIGGER statements.
 	NestedTableTrigger bool
 	Body               string // raw
-	P                  Position
+	// T-SQL extensions. Schema is the trigger's own schema
+	// (`CREATE TRIGGER s.t ON s.tbl`). OnView is set when the target is a
+	// view created earlier in the same script (INSTEAD OF triggers on
+	// views); the parser cannot know it otherwise. NotForReplication and
+	// Options (ENCRYPTION, EXECUTE AS …) are informational. OrAlter is
+	// `CREATE OR ALTER TRIGGER`. A T-SQL DML trigger is statement-level:
+	// ForEachRow false, HasForEach true; FOR is folded into Time "AFTER".
+	Schema            string
+	OnView            bool
+	NotForReplication bool
+	Options           []string
+	OrAlter           bool
+	P                 Position
 }
 
 func (s *CreateTrigger) Pos() Position { return s.P }
@@ -622,7 +692,12 @@ type Param struct {
 	Direction string // IN|OUT|INOUT (for procedures); "" for functions
 	Name      string
 	Type      DataType
-	Default   Expr // nil if no DEFAULT/:= clause; populated by Oracle parser only today
+	Default   Expr // nil if no DEFAULT/:= clause; populated by the Oracle and T-SQL parsers
+	// Output is T-SQL's OUTPUT / OUT marker (Direction is "INOUT" too: a
+	// T-SQL OUTPUT parameter also passes its value in). ReadOnly is the
+	// READONLY marker of a table-valued parameter. Name keeps the @.
+	Output   bool
+	ReadOnly bool
 }
 
 type RoutineCharacteristics struct {
@@ -640,7 +715,15 @@ type CreateProcedure struct {
 	Params          []Param
 	Characteristics RoutineCharacteristics
 	Body            string // raw (BEGIN ... END or single stmt)
-	P               Position
+	// T-SQL extensions: Schema of the procedure, Options (`WITH EXECUTE
+	// AS CALLER`, RECOMPILE, ENCRYPTION, … raw), ForReplication and
+	// OrAlter (`CREATE OR ALTER`). Body is the source text after AS up to
+	// the batch end (GO); parse it with the dialect's ParseRoutineBody.
+	Schema         string
+	Options        []string
+	ForReplication bool
+	OrAlter        bool
+	P              Position
 }
 
 func (s *CreateProcedure) Pos() Position { return s.P }
@@ -653,7 +736,27 @@ type CreateFunction struct {
 	Returns         DataType
 	Characteristics RoutineCharacteristics
 	Body            string
-	P               Position
+	// T-SQL extensions.
+	//   - Schema / Options (`WITH SCHEMABINDING`, RETURNS NULL ON NULL
+	//     INPUT, EXECUTE AS …, raw) / OrAlter as for CreateProcedure.
+	//   - Multi-statement table-valued function
+	//     (`RETURNS @t TABLE (…) AS BEGIN … END`): ReturnsTableVar is the
+	//     variable name (with its @), ReturnsTableCols / ReturnsTableConstraints
+	//     its declared shape; Returns is nil.
+	//   - Inline table-valued function (`RETURNS TABLE AS RETURN (SELECT …)`):
+	//     ReturnsInlineTable is true, Body is the `RETURN …` text and Select
+	//     the typed query (nil with SelectParseError set when it does not
+	//     parse); Returns is nil.
+	Schema                  string
+	Options                 []string
+	OrAlter                 bool
+	ReturnsTableVar         string
+	ReturnsTableCols        []*ColumnDef
+	ReturnsTableConstraints []TableConstraint
+	ReturnsInlineTable      bool
+	Select                  *SelectStmt
+	SelectParseError        string
+	P                       Position
 }
 
 func (s *CreateFunction) Pos() Position { return s.P }
@@ -723,7 +826,10 @@ type CreateSequence struct {
 	// counterparts (ORDER/NOORDER/KEEP/NOKEEP/SCALE/NOSCALE/EXTEND/SHARD/
 	// NOSHARD/SHARING/SESSION). Surfaced as a single info-level explanation.
 	IgnoredOptions []string
-	P              Position
+	// AsType is the T-SQL `AS <integer type>` clause (nil when absent;
+	// T-SQL's default is bigint).
+	AsType DataType
+	P      Position
 }
 
 func (s *CreateSequence) Pos() Position { return s.P }
@@ -898,7 +1004,17 @@ type CreateType struct {
 	// inheritance — the translator surfaces a manual-review note and
 	// flattens the subtype into a standalone composite when possible.
 	ParentType string
-	P          Position
+	// T-SQL kinds (lower-case, distinct from Oracle's upper-case ones):
+	//   - "alias": `CREATE TYPE t FROM base [NULL|NOT NULL]` — BaseType is
+	//     the base data type, NotNull / HasNullable the nullability.
+	//   - "table": `CREATE TYPE t AS TABLE (…)` — TableCols /
+	//     TableConstraints carry the declared shape.
+	BaseType         DataType
+	NotNull          bool
+	HasNullable      bool
+	TableCols        []*ColumnDef
+	TableConstraints []TableConstraint
+	P                Position
 }
 
 func (s *CreateType) Pos() Position { return s.P }

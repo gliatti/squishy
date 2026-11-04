@@ -3,9 +3,13 @@ package ast
 // Literal covers number/string/bool/null literals. Kind is informational; the raw
 // token is kept in Text for verbatim emission in generated SQL.
 type Literal struct {
-	Kind string // "number"|"string"|"null"|"bool"|"hex"|"bit"
+	Kind string // "number"|"string"|"null"|"bool"|"hex"|"bit"|"money"|"default"
 	Text string
-	P    Position
+	// NString is true for a T-SQL national string literal (N'...'). Text
+	// carries the same payload; PG strings are always Unicode, so the flag
+	// is informational.
+	NString bool
+	P       Position
 }
 
 func (e *Literal) Pos() Position { return e.P }
@@ -15,6 +19,10 @@ func (e *Literal) exprNode()     {}
 type Ident struct {
 	Parts    []string // e.g. ["db","t","c"]
 	Backtick bool
+	// Variable is true for a T-SQL local variable (@name) or system
+	// variable (@@ROWCOUNT). Parts then holds the single name with its
+	// @ / @@ prefix kept, as written.
+	Variable bool
 	P        Position
 }
 
@@ -50,7 +58,10 @@ func (e *FuncCall) exprNode()     {}
 type BinaryExpr struct {
 	Op       string
 	Lhs, Rhs Expr
-	P        Position
+	// Escape is the optional `ESCAPE <expr>` of a LIKE / NOT LIKE
+	// predicate (T-SQL); nil otherwise.
+	Escape Expr
+	P      Position
 }
 
 func (e *BinaryExpr) Pos() Position { return e.P }
@@ -84,6 +95,11 @@ func (e *ParenExpr) exprNode()     {}
 // removed once every parser produces a fully-typed expression tree.
 type RawExpr struct {
 	Text string
+	// Kind classifies a RawExpr that a parser produced on purpose for a
+	// construct it deliberately keeps opaque (T-SQL: "XML_METHOD" for
+	// xml.value() / query() / exist() / nodes() / modify(), whose
+	// arguments are XQuery text). "" for the legacy untyped fallback.
+	Kind string
 	P    Position
 }
 
@@ -262,7 +278,14 @@ func (e *IntervalLit) exprNode()     {}
 type CastExpr struct {
 	Expr Expr
 	Type DataType
-	P    Position
+	// IsConvert is true when the source spelled the cast T-SQL style,
+	// CONVERT(type, expr [, style]); ConvertStyle is the optional style
+	// argument (nil when absent). Try marks TRY_CAST / TRY_CONVERT, which
+	// yield NULL instead of raising on a failed conversion.
+	IsConvert    bool
+	ConvertStyle Expr
+	Try          bool
+	P            Position
 }
 
 func (e *CastExpr) Pos() Position { return e.P }
