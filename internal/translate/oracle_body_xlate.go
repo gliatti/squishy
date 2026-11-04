@@ -743,8 +743,8 @@ func rewriteOracleRownumLimit(s string) string {
 // identifiers when procedures build DDL via string concatenation.
 //
 // Tradeoff: tables originally named `HIST#ORDERS` in Oracle migrate to PG
-// as `mvt#abt` (quoted). After this rewrite the procedure body will
-// reference `mvt_abt`. The user must either rename existing tables
+// as `hist#orders` (quoted). After this rewrite the procedure body will
+// reference `hist_orders`. The user must either rename existing tables
 // (`ALTER TABLE … RENAME TO …`) or re-run squishy with a similar
 // `# → _` rule on data-migration identifiers.
 func rewriteOracleHashInIdentLiterals(s string) string {
@@ -798,7 +798,7 @@ func rewriteOracleHashInIdentLiterals(s string) string {
 // part of an identifier rather than free text. The rule: both adjacent
 // bytes must be non-whitespace, AND at least one must be
 // identifier-class (alphanumeric or another `#`). This catches
-// `'MVT#'` (T then closing quote), `'#NAME'`, `'A#B'`, `'IDX#HIST#'`
+// `'HIST#'` (T then closing quote), `'#NAME'`, `'A#B'`, `'IDX#HIST#'`
 // while leaving `'priority #1 task'` (space before #) untouched.
 func hashIsBetweenIdentBytes(src string, at int) bool {
 	prev := byte(0)
@@ -1233,7 +1233,7 @@ func trimOracleDbmsSqlParseLanguageArg(s string) string {
 // PG's FOUND / NOT FOUND are special booleans set by the most recent
 // FETCH or `EXECUTE … INTO`; they don't carry a cursor name. The mapping
 // preserves the per-routine semantic Oracle code expects when only one
-// cursor is active at a time (the dominant pattern in PRC_*-style
+// cursor is active at a time (the dominant pattern in legacy maintenance-style
 // procedures). Multi-cursor routines that read attributes between FETCHes
 // of different cursors will need manual review.
 //

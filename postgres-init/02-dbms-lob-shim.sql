@@ -85,7 +85,7 @@ BEGIN
 END;
 $$;
 
--- Numeric-cursor overloads: APP-style code declares the cursor handle
+-- Numeric-cursor overloads: legacy maintenance-style code declares the cursor handle
 -- as NUMBER (mapped to NUMERIC) but orafce expects integer. Cast and
 -- forward.
 CREATE OR REPLACE PROCEDURE dbms_sql.parse(c numeric, stmt text)
@@ -121,7 +121,7 @@ GRANT EXECUTE ON ALL ROUTINES IN SCHEMA dbms_sql TO PUBLIC;
 
 -- ---------------------------------------------------------------------------
 -- sys_context shim: orafce ships dbms_session.set_context but no
--- top-level sys_context function. APP-style routines call
+-- top-level sys_context function. Legacy maintenance-style routines call
 -- `SYS_CONTEXT('USERENV', '<param>')` from inside trigger bodies built
 -- at runtime; we map the common USERENV parameters to PG-native
 -- equivalents and return '' for unknown ones so the trigger body

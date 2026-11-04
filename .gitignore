@@ -36,3 +36,6 @@ test.log
 
 # graphify code map (see CLAUDE.md "Code map"): local, regenerated with /graphify.
 /graphify-out/
+
+# MCP server binary built by `go build` in mcp-server/.
+mcp-server/squishy-mcp

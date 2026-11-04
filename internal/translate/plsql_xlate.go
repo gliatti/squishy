@@ -411,7 +411,7 @@ func rewriteOraclePLpgSQLWithFlags(body string) (string, bool) {
 // REGEXP_SUBSTR + LEVEL pattern is rewritten; arbitrary CONNECT BY
 // hierarchical queries land on a TODO comment so the user can review.
 //
-// INSERT_WEB_FUNCTION in APP used this idiom to split a
+// A client routine used this idiom to split a
 // comma-separated list parameter; PG raised `syntax error at or near
 // "BY"` because CONNECT isn't a PG keyword.
 func rewriteConnectByLevelSplit(body string) string {
@@ -1426,7 +1426,7 @@ type oracleTypeInfo struct {
 	// fields is set for kind=="record" — maps lowercased field name to
 	// the raw type-text for the field. Used by the body rewriter to
 	// detect record fields that are themselves collection-typed
-	// (BULK_LOAD-style `record.field(i)` element access).
+	// (bulk-fetch-style `record.field(i)` element access).
 	fields map[string]string
 }
 
@@ -1791,8 +1791,8 @@ func (t *plTranslator) stmt(n ast.PLStmt) pgast.PLStmt {
 			// `)` of the FOR-IN-(SELECT). Without the parens the (+) rewriter
 			// walks past the SELECT into the LOOP body looking for a
 			// terminator and ends up treating the body's `WHERE` (e.g. an
-			// UPDATE WHERE) as the SELECT's clause-end. CHECK_RECONCILE landed
-			// in production with the SELECT WHERE displaced AFTER the UPDATE
+			// UPDATE WHERE) as the SELECT's clause-end. A control procedure landed
+			// with the SELECT WHERE displaced AFTER the UPDATE
 			// (two `WHERE` clauses on the same UPDATE) — PG raised
 			// `syntax error at or near "WHERE"`. PG plpgsql accepts both
 			// forms `FOR rec IN SELECT …` and `FOR rec IN (SELECT …)`, so
@@ -2017,9 +2017,9 @@ func (t *plTranslator) block(blk *ast.Block) pgast.PLStmt {
 				// Record-typed variable: register every field that is
 				// itself a collection so the rewriter turns
 				// `<rec_var>.<coll_field>(i)` into `<rec_var>.<coll_field>[i]`.
-				// BULK_LOAD has `t_TRN ot_TRN` where ot_TRN is RECORD with
-				// fields like NUM_TRN ovt_NUM_TRN (TABLE OF). Without this,
-				// every `t_TRN.NUM_TRN(i)` access in the body stayed as a
+				// A bulk-fetch procedure has `r_batch t_batch` where t_batch is RECORD with
+				// fields like order_id t_id_list (TABLE OF). Without this,
+				// every `r_batch.order_id(i)` access in the body stayed as a
 				// function call and PG raised `syntax error at or near "."`.
 				if info, hit := t.oracleTypes[strings.ToLower(udt.Name)]; hit && info.kind == "record" {
 					for fName, fType := range info.fields {
@@ -2170,7 +2170,7 @@ func (t *plTranslator) block(blk *ast.Block) pgast.PLStmt {
 //
 // The collectionVars map is the gate: only variables we know are
 // arrays get the (idx)→[idx] rewrite, otherwise a regular function call
-// like `app_util.fn_report_log` would be mangled. Method dispatch (.COUNT,
+// like `app_util.fn_log_dir` would be mangled. Method dispatch (.COUNT,
 // .NEXT, …) is name-blind because Oracle reserves those identifiers as
 // collection methods exclusively in the .METHOD position.
 func rewriteOracleCollections(body string, collectionVars map[string]string) string {
@@ -2340,7 +2340,7 @@ func rewriteCollectionElementAccess(body string, collectionVars map[string]strin
 		}
 		if k < len(body) && body[k] == '(' {
 			// Try to match the FULL dotted path first (record-field
-			// collection access like `t_TRN.NUM_TRN`), then fall back
+			// collection access like `r_batch.order_id`), then fall back
 			// to the bare ident (top-level collection var).
 			lower := strings.ToLower(ident)
 			matched := false
@@ -2496,7 +2496,7 @@ func arrayElemFallback(elem string) string {
 }
 
 // mapOracleScalar coerces an Oracle scalar type fragment (e.g.
-// "NUMBER(10,2)", "VARCHAR2(20)", "trn.num_trn%TYPE") to its closest PG
+// "NUMBER(10,2)", "VARCHAR2(20)", "orders.order_id%TYPE") to its closest PG
 // counterpart. Composite / unrecognised types fall through unchanged so
 // PG's own resolution (or %TYPE) handles them. Used by parseOracleTypeDecl
 // when synthesising the substitution string for TABLE OF / VARRAY / SUBTYPE.

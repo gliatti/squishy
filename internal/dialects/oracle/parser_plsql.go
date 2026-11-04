@@ -259,9 +259,9 @@ func (p *Parser) parsePLDecl() ast.PLDecl {
 	// note + emit a `-- TODO` line in the PG body. Without this branch
 	// the unknown-token fallback below truncates one token at a time and
 	// the rest of the declaration leaks into the next loop iteration as
-	// a chain of bogus `name TEXT;` decls (e.g. `TYPE ovt IS TABLE OF
-	// trn.num_trn%TYPE INDEX BY BINARY_INTEGER;` becomes
-	// `OVT TEXT; TRN TEXT; NUM_TRN TEXT; BINARY_INTEGER TEXT;`).
+	// a chain of bogus `name TEXT;` decls (e.g. `TYPE t_ids IS TABLE OF
+	// orders.order_id%TYPE INDEX BY BINARY_INTEGER;` becomes
+	// `T_IDS TEXT; ORDERS TEXT; ORDER_ID TEXT; BINARY_INTEGER TEXT;`).
 	if p.isKw("TYPE") || p.isKw("SUBTYPE") {
 		kind := strings.ToUpper(p.cur.Lit)
 		p.advance()
@@ -387,8 +387,8 @@ func (p *Parser) parsePLStmt() ast.PLStmt {
 		// these inside any IF/LOOP/etc. body. Without this case, the
 		// dispatcher fell through to parseAssignOrCall and emitted phantom
 		// `CALL "P_ACCOUNT_NO"()` statements for each declared variable
-		// — see APP#WRITE_CUSTOMER which had `if … then DECLARE p_account_no
-		// customer.account_no%TYPE; … BEGIN SELECT … INTO p_account_no`
+		// — e.g. a BEFORE INSERT trigger with `if … then DECLARE p_account_no
+		// accounts.account_no%TYPE; … BEGIN SELECT … INTO p_account_no`
 		// and the SELECT body referenced an undeclared variable in PG.
 		return p.parsePLBlock(label)
 	case p.isKw("IF"):
@@ -587,7 +587,7 @@ func (p *Parser) parseIfStmt() *ast.IfStmt {
 	// inside the IF body, mismatching the real END LOOP that came
 	// later). Soft-fail here: leave END in place so the outer block
 	// reaper closes its enclosing structure correctly. Without this,
-	// REFRESH_AUDIT ended up with an extra `END IF;` and the next
+	// a long procedure with deep IF nesting ended up with an extra `END IF;` and the next
 	// statement (a LOOP) got mis-parsed as a new top-level loop.
 	if p.isKw("END") && p.peek().Kind == TOK_KEYWORD && p.peek().Lit == "IF" {
 		p.expectKw("END") // consume END
@@ -890,9 +890,9 @@ func (p *Parser) parseFetchStmt() *ast.FetchStmt {
 		p.expectKw("INTO")
 		for {
 			// Allow dotted idents (record-of-collection fields, e.g.
-			// `t_TRN.NUM_TRN`). Without this, the parser stopped at the
-			// first `.` and BULK_LOAD ended up with vars=[t_TRN] only,
-			// then the trailing `.NUM_TRN, t_TRN.ANN_TRN, …` leaked
+			// `r_batch.order_id`). Without this, the parser stopped at the
+			// first `.` and a bulk-fetch procedure ended up with vars=[r_batch] only,
+			// then the trailing `.order_id, r_batch.amount, …` leaked
 			// onto the next statement.
 			parts := []string{}
 			v, _ := p.parseIdent()
@@ -910,8 +910,8 @@ func (p *Parser) parseFetchStmt() *ast.FetchStmt {
 		}
 		// Optional `LIMIT <expr>` clause. PG plpgsql FETCH has no
 		// LIMIT counterpart — we just consume and discard the clause
-		// so it doesn't leak as phantom CallStmts (`CALL "L_I_TAILLE"()`
-		// in BULK_LOAD). Semantic equivalence requires reshaping the
+		// so it doesn't leak as phantom CallStmts (`CALL "L_BATCH_SIZE"()`
+		// in a bulk-fetch procedure). Semantic equivalence requires reshaping the
 		// surrounding LOOP, which we don't do here; downstream is the
 		// best place for that. For now we drop LIMIT to keep the FETCH
 		// statement parse-clean.
@@ -985,7 +985,7 @@ func (p *Parser) parseSelectOrRawDML(start Position) ast.PLStmt {
 	// writer, the trailing newline that protected the `--` comment is
 	// trimmed, so the comment swallows the rest of the joined statement
 	// — including the `INTO target FROM …`. PG raised
-	// `syntax error at or near "IF"` on BIR#CAR_ART_CLC$ID_CAR_ART_CLC
+	// `syntax error at or near "IF"` on a BEFORE INSERT
 	// trigger because the SELECT had no `;` (the `;` was inside the
 	// `--` comment) so the next plpgsql token was an unmatched `END IF`.
 	// Block comments (`/* … */`) are line-safe and stay; only `--` is

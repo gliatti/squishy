@@ -51,7 +51,7 @@ import (
 // body so the loop-built fragments get fixed too.
 //
 // Risk: a Literal that happens to be a user-facing error message
-// containing `varchar2` would be mutated. In practice APP-class
+// containing `varchar2` would be mutated. In practice legacy maintenance-style
 // procedures don't carry such messages — and the substitution is
 // reversible at human review.
 func VisitOracleLiteralTypeMap(n ast.Node) ast.Node {

@@ -15,8 +15,8 @@ import "strings"
 // see skipSQLComment below. Without this, an apostrophe sitting inside a
 // `--` comment (e.g. French `d'un`) would be treated as the opening quote
 // of a string literal, latch `inStr=true` for the rest of the input, and
-// silently disable every keyword/replace pass downstream. CLOSE_ACCOUNTS
-// landed in production with two `dbms_output.*` calls and a stray
+// silently disable every keyword/replace pass downstream. A cursor-loop
+// maintenance procedure landed with two `dbms_output.*` calls and a stray
 // `ADD_MONTHS(SYSDATE,-3)` after such an apostrophe-bearing comment;
 // `rewriteOraclePLpgSQLWithFlags` ran but every rewrite scanned past the
 // match because the walker thought it was inside a string.

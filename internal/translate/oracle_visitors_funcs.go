@@ -468,7 +468,7 @@ func VisitOracleDictionaryViews(n ast.Node) ast.Node {
 // VisitOracleHashInIdentLiterals rewrites embedded `#` characters
 // inside string-typed Literals when the `#` sits between identifier-
 // class bytes. Oracle code routinely builds SQL by concatenation
-// (`'MVT#' || var || '#X'`) using `#` as a separator — Oracle accepts
+// (`'HIST#' || var || '#X'`) using `#` as a separator — Oracle accepts
 // `#` in unquoted identifiers, PG rejects it outside double-quoted
 // names. The visitor flips every such `#` to `_` so the runtime
 // EXECUTE produces a PG-valid identifier.
@@ -674,7 +674,7 @@ func VisitOracleTranslateUsing(n ast.Node) ast.Node {
 // the PG-native `substr(lob, off::int, len::int)` — note the arg
 // order swap (PG: start, then length) and the integer casts (PG's
 // substr(text, integer, integer) doesn't accept numeric directly,
-// and APP-style routines declare offset/length variables as
+// and legacy maintenance-style routines declare offset/length variables as
 // NUMBER → NUMERIC).
 //
 // Other dbms_lob functions (read, write, instr, …) are NOT mapped

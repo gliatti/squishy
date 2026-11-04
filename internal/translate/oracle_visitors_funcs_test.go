@@ -291,12 +291,12 @@ func TestVisitOracleDictionaryViews(t *testing.T) {
 }
 
 func TestVisitOracleHashInIdentLiterals(t *testing.T) {
-	// `HIST#X` → `MVT_X` (between identifier-class bytes).
+	// `HIST#X` → `HIST_X` (between identifier-class bytes).
 	in := &ast.Literal{Kind: "string", Text: "HIST#X"}
 	out := VisitOracleHashInIdentLiterals(in)
 	rep, ok := out.(*ast.Literal)
-	if !ok || rep.Text != "MVT_X" {
-		t.Errorf("HIST#X: want MVT_X, got %#v", out)
+	if !ok || rep.Text != "HIST_X" {
+		t.Errorf("HIST#X: want HIST_X, got %#v", out)
 	}
 	// `priority #1 task` — # surrounded by space, NOT rewritten.
 	free := &ast.Literal{Kind: "string", Text: "priority #1 task"}
