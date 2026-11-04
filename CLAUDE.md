@@ -84,6 +84,18 @@ lowercase** (default case-insensitive collation: `[SalesOrderHeader]` →
 `SHOW CREATE`: the table DDL is synthesized from the `sys.*` catalog and fed to
 the same parser as the real scripts.
 
+Folded names are cut to 63 bytes like PG does (`normalizeTSQLIdent` ≡
+`dataxfer.FoldSQLServerIdent`); two source tables or columns that fold to one
+PG name (a `_CS_` collation, or a 64+-byte prefix) are a blocking
+`name.fold_collision`, never an info duplicate. A table with neither primary
+key nor unique index is copied in **one** batch (no key orders OFFSET pages
+reliably); a unique index pages a key-less table. `ssl_mode` for SQL Server:
+`disable` = no TLS, `prefer`/`allow` = trust any certificate (explicit
+opt-in), anything else verifies the certificate. Inspection fails (naming
+the objects) when the login lacks VIEW DEFINITION instead of reading NULL
+definitions as empty. Results and known limitations: the "Résultat" section
+of `PLAN-sqlserver-dialect.md`.
+
 Sample: service `sqlserver-sample` (profiles `sqlserver`, `e2e`;
 `sa` / `Squishy_2026x`, port 1433) plus `sqlserver-init`, which loads
 `test/fixtures/sqlserver_{sample,seed}.sql` into `squishy_sample` and only

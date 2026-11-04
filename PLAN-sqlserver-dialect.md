@@ -202,3 +202,64 @@ Critères de fin : `plan_migration` sans warning (hors `info`) et run
 `succeeded` avec `rows_done == rows_total` sur Northwind et AdventureWorks ;
 `make test` vert ; garde AST-only verte ; aucun `regexp`/`strings.*`-sur-SQL
 dans le nouveau code. Commits locaux sur `feat/sqlserver-dialect`, pas de push.
+
+## Résultat (2026-11-04)
+
+**Livré** (branche `feat/sqlserver-dialect`) : dialecte `sqlserver`
+(`internal/dialects/tsql`, parser hand-roll, aucune regex), traduction AST-only
+(`internal/translate/tsql_*.go` + hooks de `dialect_hooks.go`, shim PL/pgSQL
+`tsql.*` sans regex), plomberie complète (connexion go-mssqldb, discover,
+inspect synthétisant le DDL depuis `sys.*`, dataxfer, worker, httpapi, MCP,
+web), schémas T-SQL préservés et identifiants pliés en minuscules (coupés à
+63 octets comme PG), tables temporelles émulées (historique copié),
+`UPDATE(col)` exact (marque par trigger), INSTEAD OF sur table émulé avec
+garde de récursion, TVF inline / multi-instructions, curseurs, `@@ROWCOUNT`,
+`sp_executesql` constant inliné (arguments convertis au type déclaré), jeux
+de résultats via refcursors, méthodes XML / hierarchyid, PIVOT. Northwind,
+la fixture `squishy_sample` et AdventureWorks se planifient et se copient
+(`rows_done == rows_total`).
+
+**Revue adverse (R1–R3) appliquée** : MERGE `WHEN NOT MATCHED BY SOURCE`
+émis (PG 17), `INSERT … DEFAULT VALUES`, préludes `WITH` des DML, FOR XML /
+TOP PERCENT signalés à toute profondeur, `~bit` → `NOT`, `CONVERT(varbinary,
+s, 1|2)` → `decode`, `ROUND` sur float via numeric, ISNULL typé comme son
+premier argument, preuve décimale des colonnes calculées (division et money
+refusées, produit au-delà de la précision 38 arrondi par `CAST(… AS
+numeric(38,s))` comme SQL Server), collisions de noms pliés bloquantes,
+tables sans clé copiées en un seul lot (ou paginées sur un index unique),
+`sql_variant` lu sans perte selon son type de base, définitions invisibles
+(sans VIEW DEFINITION) → échec explicite de l'inspection, tables
+temporaires de variables table préfixées par le schéma, `%` échappé dans les
+`RAISE` générés, `ssl_mode` vide qui vérifie le certificat, garde regex
+étendue à tout le dépôt (`internal/`, `cmd/`, `mcp-server/`).
+
+**Limites connues (prérequis signalés au plan)** :
+- XML DML (`.modify()`) : remplacé par une garde qui lève une erreur
+  (AdventureWorks `iuPerson`, `iduSalesOrderDetail`).
+- Full-text (`CONTAINSTABLE`, `FREETEXTTABLE`), CLR, triggers DDL / LOGON :
+  non migrés.
+- `geography` / `geometry` sans PostGIS sur la cible : colonne texte (EWKT).
+- Colonnes calculées non prouvées identiques (division décimale, money ×
+  money, conversions vers money, fonctions non déterministes) : colonne plate
+  copiée depuis la source + prérequis (fournir l'expression PG ou un
+  trigger).
+- `BEGIN TRY` avec plusieurs écritures hors transaction explicite : PG annule
+  tout le bloc, SQL Server garde les instructions réussies (avertissement).
+- Collation sensible à la casse : les objets qui ne diffèrent que par la
+  casse sont signalés (bloquant), pas renommés.
+- Un lot `offset` relancé après échec ne supprime pas ses lignes déjà
+  copiées (comme pour les autres dialectes) ; une table sans clé est copiée
+  en un seul lot.
+- `MERGE … WHEN NOT MATCHED BY SOURCE` exige PostgreSQL 17.
+
+**Rejouer la campagne** :
+
+```bash
+make up && make sqlserver-up && make sqlserver-load-dumps
+make test                                # garde regex + tests unitaires
+SQUISHY_E2E_SQLSERVER=1 make e2e && make e2e-down
+# puis /squishy-migrate sqlserver <squishy_sample|northwind|adventureworks>
+# (MCP squishy : plan_migration → start_run → get_run)
+docker compose --profile test run --rm unit-tests \
+  go test -tags sqlserver_live ./internal/dataxfer/ ./internal/inspect/  # tests live
+```
