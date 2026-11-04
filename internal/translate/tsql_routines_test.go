@@ -575,7 +575,7 @@ END;
 GO
 `)
 	ddl := tsqlRoutineDDL(t, res, "procedure", "dbo", "odd")
-	require.Contains(t, ddl, `PERFORM * FROM (SELECT "orderid" FROM "dbo"."orders") AS "_rs";`)
+	require.Contains(t, ddl, `OPEN "_result" FOR SELECT "orderid" FROM "dbo"."orders";`)
 	ws := strings.Join(tsqlObjectWarnings(res, "procedure.dbo.odd", "routine.untranslated_construct"), "\n")
 	require.Contains(t, ws, "GOTO")
 	require.Contains(t, ws, "WAITFOR")
@@ -759,4 +759,91 @@ GO
 	for _, w := range ws {
 		require.NotContains(t, w, "parameter c not translated")
 	}
+}
+
+// A procedure's result-set SELECTs are opened on INOUT refcursor
+// parameters, one per SELECT in source order; a SELECT in a loop keeps
+// the blocking warning (one cursor cannot carry a result set per
+// iteration).
+func TestTSQLRoutines_ResultSetCursors(t *testing.T) {
+	res := tsqlRoutinesTranslate(t, tsqlOrdersSchema+`
+CREATE PROCEDURE dbo.Two @cust int AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT OrderID, Total FROM dbo.Orders WHERE CustomerID = @cust ORDER BY OrderID;
+    IF @cust > 0
+        SELECT COUNT(*) AS n FROM dbo.Orders;
+END;
+GO
+CREATE PROCEDURE dbo.Looping AS
+BEGIN
+    DECLARE @i int = 0;
+    WHILE @i < 3
+    BEGIN
+        SELECT @i AS i;
+        SET @i += 1;
+    END
+END;
+GO
+`)
+	two := tsqlRoutineDDL(t, res, "procedure", "dbo", "two")
+	for _, frag := range []string{
+		`(IN "cust" integer, INOUT "_result1" refcursor DEFAULT NULL, INOUT "_result2" refcursor DEFAULT NULL)`,
+		`OPEN "_result1" FOR SELECT "orderid", "total" FROM "dbo"."orders" WHERE "customerid" = "two"."cust" ORDER BY "orderid";`,
+		`OPEN "_result2" FOR SELECT count(*) AS "n" FROM "dbo"."orders";`,
+	} {
+		require.Contains(t, two, frag)
+	}
+	require.NotContains(t, two, "PERFORM")
+	require.Len(t, tsqlObjectWarnings(res, "procedure.dbo.two", "routine.procedure_result_cursor"), 1)
+	require.Empty(t, tsqlObjectWarnings(res, "procedure.dbo.two", "routine.procedure_returns_resultset"))
+
+	loop := tsqlRoutineDDL(t, res, "procedure", "dbo", "looping")
+	require.NotContains(t, loop, "refcursor")
+	require.Len(t, tsqlObjectWarnings(res, "procedure.dbo.looping", "routine.procedure_returns_resultset"), 1)
+}
+
+// SET ROWCOUNT n limits the SELECTs that follow (TOP n → LIMIT n, the
+// smaller one when the SELECT has its own TOP) until SET ROWCOUNT 0. A
+// body where the limit would reach an UPDATE (no PG row limit), or a
+// SET ROWCOUNT inside IF, keeps the warning and is left unchanged.
+func TestTSQLRoutines_SetRowcount(t *testing.T) {
+	res := tsqlRoutinesTranslate(t, tsqlOrdersSchema+`
+CREATE PROCEDURE dbo.TopTen AS
+SET ROWCOUNT 10
+SELECT OrderID, Total FROM dbo.Orders ORDER BY Total DESC
+SELECT TOP 3 OrderID FROM dbo.Orders ORDER BY OrderID
+SET ROWCOUNT 0
+SELECT CustomerID FROM dbo.Orders
+GO
+CREATE PROCEDURE dbo.Capped AS
+BEGIN
+    SET ROWCOUNT 5;
+    UPDATE dbo.Orders SET Shipped = 1;
+END;
+GO
+CREATE PROCEDURE dbo.Branchy @x int AS
+BEGIN
+    IF @x > 0 SET ROWCOUNT 5;
+    SELECT OrderID FROM dbo.Orders;
+END;
+GO
+`)
+	top := tsqlRoutineDDL(t, res, "procedure", "dbo", "topten")
+	for _, frag := range []string{
+		`OPEN "_result1" FOR SELECT "orderid", "total" FROM "dbo"."orders" ORDER BY "total" DESC LIMIT 10;`,
+		`OPEN "_result2" FOR SELECT "orderid" FROM "dbo"."orders" ORDER BY "orderid" LIMIT 3;`,
+		`OPEN "_result3" FOR SELECT "customerid" FROM "dbo"."orders";`,
+	} {
+		require.Contains(t, top, frag)
+	}
+	require.Empty(t, tsqlObjectWarnings(res, "procedure.dbo.topten", "routine.untranslated_construct"))
+
+	capped := tsqlObjectWarnings(res, "procedure.dbo.capped", "routine.untranslated_construct")
+	require.Len(t, capped, 1)
+	require.Contains(t, capped[0], "UPDATE / DELETE / MERGE under SET ROWCOUNT")
+	branchy := tsqlObjectWarnings(res, "procedure.dbo.branchy", "routine.untranslated_construct")
+	require.Len(t, branchy, 1)
+	require.Contains(t, branchy[0], "inside IF")
+	require.NotContains(t, tsqlRoutineDDL(t, res, "procedure", "dbo", "branchy"), "LIMIT")
 }

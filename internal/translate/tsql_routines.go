@@ -117,6 +117,11 @@ type tsqlBody struct {
 	scrollUse  map[string]bool // cursors fetched in another direction than NEXT
 	savepoints map[string]bool
 
+	resultSets  int      // result-set SELECTs opened on ctx.ResultCursors so far
+	// rowcountDone lists the SET ROWCOUNT statements applySetRowcount
+	// translated; rowcountWhy says why the others are not.
+	rowcountDone map[*ast.SetRowcountStmt]bool
+	rowcountWhy  string
 	rowcount    *tsqlVar // _rowcount, when @@ROWCOUNT is read after DML
 	fetchStatus *tsqlVar // _fetch_status, when @@FETCH_STATUS is read
 	// updated maps a column tested by UPDATE(col) in a statement-level
@@ -153,6 +158,7 @@ func translateTSQLRoutineBody(ctx *RoutineCtx) (string, []string, []string) {
 	// Constant dynamic SQL is source text like the body: inlined before
 	// the rewrites (tsql_dynamic.go).
 	stmts = b.inlineConstantDynamicSQL(stmts)
+	b.applySetRowcount(stmts)
 	stmts, labels := b.dialectPass(stmts)
 	b.collect(stmts)
 	text := b.render(stmts)
@@ -171,6 +177,9 @@ func newTSQLBody(ctx *RoutineCtx) *tsqlBody {
 		vars: map[string]*tsqlVar{}, taken: map[string]bool{},
 		tables: map[string]*tsqlTableVar{}, tempNames: map[string]bool{},
 		cursors: map[string]*tsqlCursor{}, scrollUse: map[string]bool{}, savepoints: map[string]bool{},
+	}
+	for _, c := range ctx.ResultCursors {
+		b.taken[c] = true
 	}
 	for _, p := range ctx.Params {
 		// Keyed by the folded source spelling (what references fold to):
@@ -1114,6 +1123,11 @@ func (b *tsqlBody) stmt(n ast.PLStmt, next ast.PLStmt) []pgast.PLStmt {
 			return nil
 		}
 		return []pgast.PLStmt{tsqlRaw("CLOSE " + quoteIdent(b.cursorName(x.Cursor)))}
+	case *ast.SetRowcountStmt:
+		if !b.rowcountDone[x] {
+			b.warn("SET ROWCOUNT not translated: " + b.rowcountWhy)
+		}
+		return nil
 	case *ast.NullStmt:
 		if x.Warn {
 			b.warn("statement dropped (no PostgreSQL counterpart): " + head(x.Source))
@@ -1228,6 +1242,17 @@ func (b *tsqlBody) selectStmt(x *ast.SelectStmt) []pgast.PLStmt {
 		return b.withRowcount(tsqlRaw("CREATE TABLE " + pgast.WriteExpr(tsqlRefIdent(ref)) + " AS " + text))
 	}
 	text := b.dml(x)
+	if b.ctx.Kind == RoutineProcedure && b.resultSets < len(b.ctx.ResultCursors) {
+		// The result set is returned through the next INOUT refcursor
+		// parameter: OPEN on a NULL refcursor names a new portal and
+		// stores its name in the parameter, which the caller receives.
+		c := b.ctx.ResultCursors[b.resultSets]
+		b.resultSets++
+		if b.rowcount != nil {
+			b.warn("@@ROWCOUNT after a result-set SELECT returned through a refcursor reads 0: the caller fetches the rows later")
+		}
+		return b.withRowcount(tsqlRaw("OPEN " + quoteIdent(c) + " FOR " + text))
+	}
 	if b.ctx.Kind == RoutineProcedure {
 		b.note("a SELECT returning rows to the caller is run with PERFORM and its rows are discarded (a PostgreSQL procedure returns no result set)")
 	} else {

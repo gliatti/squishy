@@ -367,6 +367,11 @@ type RoutineCtx struct {
 	TableCols []RoutineColumn
 	// Trigger is set for RoutineTrigger.
 	Trigger *TriggerInfo
+	// ResultCursors (procedures) are the PG names of the INOUT refcursor
+	// parameters the procedure returns its result sets through, one per
+	// result-set SELECT in source order: the body opens the i-th one for
+	// the i-th such SELECT (see translateTSQLProcedure).
+	ResultCursors []string
 }
 
 // Expr returns the ExprCtx of a rewrite inside this routine.

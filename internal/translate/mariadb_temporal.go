@@ -522,7 +522,7 @@ func (t *translator) sysverTakenNames() sysverTaken {
 	}
 	// Index names as buildDDL will emit them: dedupeIndexNames is
 	// idempotent, so running it here leaves buildDDL's pass a no-op.
-	dedupeIndexNames(plan.Indexes)
+	dedupeIndexNames(plan.Indexes, t.planRelationKeys())
 	for _, idx := range plan.Indexes {
 		add(s.relations, idx.Name)
 	}

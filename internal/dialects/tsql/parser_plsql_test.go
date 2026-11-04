@@ -47,12 +47,14 @@ END`)
 	as[*ast.AssignStmt](t, blk.Stmts[4])
 }
 
+// SET ROWCOUNT is typed (TestBody_SetRowcount); the other options stay
+// NullStmt.
 func TestBody_SetOptions(t *testing.T) {
 	stmts := mustBody(t, `SET NOCOUNT ON;
 SET XACT_ABORT ON
 SET XACT_ABORT OFF
 SET ANSI_WARNINGS OFF
-SET ROWCOUNT 10
+SET DATEFORMAT dmy
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`)
 	wantWarn := []bool{false, false, true, true, true, true}
 	if len(stmts) != len(wantWarn) {
@@ -351,5 +353,28 @@ func TestParseParamDecls(t *testing.T) {
 	}
 	if _, errs := ParseParamDecls("@a int @b int"); len(errs) == 0 {
 		t.Error("a missing comma is an error")
+	}
+}
+
+func TestBody_SetRowcount(t *testing.T) {
+	stmts, errs := ParseRoutineBody("SET ROWCOUNT 10\nSELECT a FROM t\nSET ROWCOUNT @n\nSET NOCOUNT ON")
+	if len(errs) > 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	if len(stmts) != 4 {
+		t.Fatalf("statements: %d", len(stmts))
+	}
+	rc, ok := stmts[0].(*ast.SetRowcountStmt)
+	if !ok {
+		t.Fatalf("SET ROWCOUNT: %T", stmts[0])
+	}
+	if lit, ok := rc.Count.(*ast.Literal); !ok || lit.Text != "10" {
+		t.Errorf("count: %#v", rc.Count)
+	}
+	if v, ok := stmts[2].(*ast.SetRowcountStmt).Count.(*ast.Ident); !ok || !v.Variable {
+		t.Errorf("variable count: %#v", stmts[2])
+	}
+	if _, ok := stmts[3].(*ast.NullStmt); !ok {
+		t.Errorf("other SET options stay NullStmt: %T", stmts[3])
 	}
 }

@@ -620,6 +620,15 @@ func tsqlPrerequisite(w Warning) (Prerequisite, bool) {
 			Description: w.Message,
 			Remediation: "Routines receiving a table-valued parameter get an array of the composite: read it with unnest(param) instead of selecting from the parameter.",
 		}, true
+	case "routine.procedure_result_cursor":
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "SQL Server result sets returned through refcursors",
+			Description: w.Message,
+			Remediation: "Callers read the rows with, in one transaction:\n  BEGIN;\n  CALL schema.proc(args…);          -- returns the cursor name(s)\n  FETCH ALL FROM \"<returned name>\";\n  COMMIT;\nor pass their own cursor name: CALL schema.proc(args…, 'c1'); FETCH ALL FROM c1;",
+		}, true
 	case "trigger.instead_of_table":
 		return Prerequisite{
 			Severity:    SeverityInfo,

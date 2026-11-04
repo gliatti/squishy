@@ -19,6 +19,7 @@ import (
 //	DECLARE c CURSOR … FOR select    → *ast.DeclareStmt{*ast.DeclareCursor}
 //	SET @v = e / SET @v += e         → *ast.AssignStmt (compound expanded)
 //	SET NOCOUNT ON, SET … options    → *ast.NullStmt{Source, Warn}
+//	SET ROWCOUNT n                   → *ast.SetRowcountStmt
 //	SELECT @a = x, @b = y …          → *ast.SelectInto (other SELECTs stay typed)
 //	IF c s [ELSE s]                  → *ast.IfStmt (ELSE IF chains flattened)
 //	WHILE c s                        → *ast.WhileStmt
@@ -465,6 +466,11 @@ func (p *Parser) parseSetStmt() ast.PLStmt {
 			e = &ast.BinaryExpr{Op: bop, Lhs: &ast.Ident{Parts: []string{v.Lit}, Variable: true, P: astPos(v.Pos)}, Rhs: e, P: astPos(v.Pos)}
 		}
 		return &ast.AssignStmt{Target: v.Lit, Expr: e, P: pos}
+	}
+	if nt := p.peek(1); (nt.Kind == TOK_IDENT || nt.Kind == TOK_KEYWORD) && strings.EqualFold(nt.Lit, "ROWCOUNT") {
+		p.advance() // SET
+		p.advance() // ROWCOUNT
+		return &ast.SetRowcountStmt{Count: p.parseExpr(), P: pos}
 	}
 	optIdx := p.i + 1
 	text := p.parseSetOption()

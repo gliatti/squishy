@@ -202,7 +202,8 @@ GO
 	require.Contains(t, ddl, `"s" "dbo"."small" CHECK ("s" BETWEEN 0 AND 255)`)
 	p := tsqlRoutine(res, "procedure", "p")
 	require.NotNil(t, p)
-	require.Equal(t, `IN "lines" "dbo"."idlist"[]`, p.Signature)
+	// Its SELECT returns a result set: an INOUT refcursor follows.
+	require.Equal(t, `IN "lines" "dbo"."idlist"[], INOUT "_result" refcursor DEFAULT NULL`, p.Signature)
 	require.NotEmpty(t, tsqlWarnings(res, tsqlWarnTableType))
 }
 
@@ -581,11 +582,14 @@ CREATE FUNCTION dbo.Unresolved () RETURNS TABLE AS RETURN (SELECT COUNT(*) AS n 
 GO
 `, preserved())
 	get := tsqlRoutine(res, "procedure", "getorders")
-	require.Equal(t, `IN "cust" integer, IN "limit" integer DEFAULT 10, IN "x" integer DEFAULT NULL`, get.Signature)
-	rs := tsqlWarnings(res, "routine.procedure_returns_resultset")
+	// The result set is returned through an INOUT refcursor parameter.
+	require.Equal(t, `IN "cust" integer, IN "limit" integer DEFAULT 10, IN "x" integer DEFAULT NULL, INOUT "_result" refcursor DEFAULT NULL`, get.Signature)
+	require.Empty(t, tsqlWarnings(res, "routine.procedure_returns_resultset"))
+	rs := tsqlWarnings(res, "routine.procedure_result_cursor")
 	require.Len(t, rs, 1, "only GetOrders returns rows: SELECT @n = … assigns")
 	require.Equal(t, "procedure.dbo.getorders", rs[0].Object)
-	require.NotNil(t, tsqlPrereq(res, "procedures that return result sets"))
+	require.Equal(t, string(SeverityInfo), rs[0].Severity)
+	require.NotNil(t, tsqlPrereq(res, "result sets returned through refcursors"))
 
 	of := tsqlRoutine(res, "function", "ordersof")
 	// @cust is renamed: the result has a column "cust" (tsqlRenameClashingParams).
@@ -824,4 +828,23 @@ GO
 	require.Len(t, tsqlWarnings(res, "table.temporal_not_emulated"), 1)
 	require.Nil(t, tsqlTableOf(res, "dbo", "emp").TSQLTemporal)
 	require.Equal(t, "9999-12-31 23:59:59.99", tsqlPeriodEndMax(2))
+}
+
+// PostgreSQL indexes share the relation namespace of their schema:
+// Northwind's index "Region" on Customers(Region) would clash with the
+// table Region, so it is renamed like a duplicate index name.
+func TestTSQL_IndexNamedLikeATable(t *testing.T) {
+	res := tsqlTranslate(t, `
+CREATE TABLE dbo.Region (RegionID int NOT NULL CONSTRAINT PK_Region PRIMARY KEY, RegionDescription nchar(50) NOT NULL);
+GO
+CREATE TABLE dbo.Customers (CustomerID nchar(5) NOT NULL PRIMARY KEY, Region nvarchar(15) NULL);
+GO
+CREATE INDEX Region ON dbo.Customers (Region);
+GO
+CREATE INDEX PK_Region ON dbo.Customers (CustomerID);
+GO
+`, preserved())
+	require.Contains(t, res.DDLPostCopy, `CREATE INDEX "customers_region" ON "dbo"."customers" ("region");`)
+	require.Contains(t, res.DDLPostCopy, `CREATE INDEX "customers_pk_region" ON "dbo"."customers" ("customerid");`)
+	require.NotContains(t, res.DDLPostCopy, `CREATE INDEX "region"`)
 }

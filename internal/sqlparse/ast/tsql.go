@@ -203,3 +203,15 @@ type EmbeddedDDL struct {
 
 func (s *EmbeddedDDL) Pos() Position { return s.P }
 func (s *EmbeddedDDL) plStmtNode()   {}
+
+// SetRowcountStmt — T-SQL `SET ROWCOUNT n`: the statements that follow
+// in the session stop after n rows (SELECT returns at most n rows,
+// INSERT / UPDATE / DELETE touch at most n); `SET ROWCOUNT 0` lifts the
+// limit. Count is the parsed count (a number literal or a @variable).
+type SetRowcountStmt struct {
+	Count Expr
+	P     Position
+}
+
+func (s *SetRowcountStmt) Pos() Position { return s.P }
+func (s *SetRowcountStmt) plStmtNode()   {}

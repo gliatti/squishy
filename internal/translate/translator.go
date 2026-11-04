@@ -3,6 +3,7 @@ package translate
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gitlab.com/dalibo/squishy/internal/dialects"
@@ -4767,7 +4768,7 @@ func (t *translator) buildDDL() {
 	// Post-copy AST: indexes, FKs, then post-actions.
 	// MySQL scopes index names per-table but PG scopes them per-schema, so
 	// rewrite any duplicate names by prefixing the owning table.
-	dedupeIndexNames(t.res.Plan.Indexes)
+	dedupeIndexNames(t.res.Plan.Indexes, t.planRelationKeys())
 	var post []pgast.Stmt
 	for _, idx := range t.res.Plan.Indexes {
 		post = append(post, &pgast.CreateIndex{
@@ -5208,8 +5209,16 @@ func mysqlTypeRepr(t ast.DataType) string {
 // schema. Only duplicates are touched; the first occurrence of each name
 // keeps its original label. A colliding name becomes "<table>_<name>"; if
 // that still collides (pathological case) we append a numeric suffix.
-func dedupeIndexNames(idxs []PGIndex) {
-	seen := make(map[string]bool, len(idxs))
+// reserved holds the "<schema>.<name>" keys of the other relations of the
+// plan (tables, views, primary-key indexes, sequences), which share the
+// index namespace on PostgreSQL: an index named like one of them is
+// renamed the same way (Northwind indexes customers(region) as "Region",
+// next to the table Region).
+func dedupeIndexNames(idxs []PGIndex, reserved map[string]bool) {
+	seen := make(map[string]bool, len(idxs)+len(reserved))
+	for k := range reserved {
+		seen[k] = true
+	}
 	key := func(schema, name string) string { return schema + "." + name }
 	for i := range idxs {
 		k := key(idxs[i].Schema, idxs[i].Name)
@@ -5226,6 +5235,32 @@ func dedupeIndexNames(idxs []PGIndex) {
 		idxs[i].Name = candidate
 		seen[k2] = true
 	}
+}
+
+// planRelationKeys returns the "<schema>.<name>" keys of the relations
+// other than secondary indexes the plan creates: tables, views, the
+// indexes of named primary keys, sequences (their PG schema: the target
+// schema, or every preserved schema for SQL Server, whose sequence names
+// are not tracked per schema).
+func (t *translator) planRelationKeys() map[string]bool {
+	keys := map[string]bool{}
+	schemas := map[string]bool{t.opt.TargetSchema: true}
+	for _, tbl := range t.res.Plan.Tables {
+		keys[tbl.Schema+"."+tbl.Name] = true
+		if tbl.PKName != "" {
+			keys[tbl.Schema+"."+tbl.PKName] = true
+		}
+		schemas[tbl.Schema] = true
+	}
+	for _, v := range t.res.Plan.Views {
+		keys[v.Schema+"."+v.Name] = true
+	}
+	for _, name := range t.sequenceNames {
+		for s := range schemas {
+			keys[s+"."+name] = true
+		}
+	}
+	return keys
 }
 
 func columnsNames(cs []ast.IndexedCol) []string {
@@ -8284,13 +8319,25 @@ func (t *translator) translateTSQLProcedure(s *ast.CreateProcedure) {
 	}
 	rctx.Params = t.tsqlRoutineParams(s.Params, true, rctx.Expr())
 	if t.tsqlBodyReturnsResultSet(s.Body) {
-		msg := "procedure " + schema + "." + name + " returns a result set (a SELECT that is not assigned to variables): a PostgreSQL procedure cannot return rows to its caller. Return them through an INOUT refcursor parameter, or turn the procedure into a set-returning function, and adapt the callers"
-		t.res.Explanations = append(t.res.Explanations, Explanation{
-			Object: obj, Source: "SELECT … (result set)", Target: "(rows not returned)", Reason: msg, Level: "warn",
-		})
-		t.warnSev(obj, "routine.procedure_returns_resultset", msg, SeverityBlocking)
+		if n, ok := t.tsqlResultSetCount(s.Body); ok && n > 0 {
+			rctx.ResultCursors = tsqlResultCursorNames(n, rctx.Params)
+			msg := "procedure " + schema + "." + name + " returns its result set(s) through INOUT refcursor parameter(s) " + strings.Join(rctx.ResultCursors, ", ") + " (DEFAULT NULL), one per result-set SELECT in source order: the body opens the cursor FOR the SELECT. A PostgreSQL procedure cannot stream rows to its caller as EXEC does: callers CALL it and FETCH ALL FROM the returned cursor name, in the same transaction (the cursor closes at commit)"
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: "SELECT … (result set)", Target: "OPEN <refcursor> FOR SELECT …", Reason: msg, Level: "info",
+			})
+			t.warnSev(obj, "routine.procedure_result_cursor", msg, SeverityInfo)
+		} else {
+			msg := "procedure " + schema + "." + name + " returns a result set (a SELECT that is not assigned to variables) from inside a loop: a PostgreSQL procedure cannot return rows to its caller, and one refcursor per SELECT cannot carry a result set per iteration. Return them through INOUT refcursor parameters, or turn the procedure into a set-returning function, and adapt the callers"
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: "SELECT … (result set)", Target: "(rows not returned)", Reason: msg, Level: "warn",
+			})
+			t.warnSev(obj, "routine.procedure_returns_resultset", msg, SeverityBlocking)
+		}
 	}
 	body, warnings, notes := t.tsqlRoutineBody(rctx)
+	for _, c := range rctx.ResultCursors {
+		rctx.Params = append(rctx.Params, RoutineParam{Name: c, Type: "refcursor", Mode: "INOUT", Default: "NULL"})
+	}
 	sig := tsqlSignature(rctx.Params, true)
 	node := &pgast.CreateProcedure{Schema: schema, Name: name, Params: sig, Body: body}
 	st.routines["PROCEDURE|"+t.tableKey(schema, name)] = tsqlRoutineRef{
@@ -8315,6 +8362,81 @@ func (t *translator) tsqlRoutineOptions(obj string, opts []string) {
 		Reason: "T-SQL routine options have no PostgreSQL counterpart in the routine header (EXECUTE AS OWNER is close to SECURITY DEFINER: set it by hand if the routine relies on the owner's rights).",
 		Level:  "info",
 	})
+}
+
+// tsqlResultSetCount returns the number of result-set SELECTs of a
+// procedure body (tsqlStmtsReturnRows), false when one of them runs in a
+// loop (one cursor per statement cannot carry a result set per
+// iteration).
+func (t *translator) tsqlResultSetCount(body string) (int, bool) {
+	parse := hookedRoutineBodyParser(t.opt.SourceKind)
+	if parse == nil {
+		return 0, false
+	}
+	stmts, _ := parse(body)
+	n, ok := 0, true
+	var walk func(stmts []ast.PLStmt, inLoop bool)
+	walk = func(stmts []ast.PLStmt, inLoop bool) {
+		for _, s := range stmts {
+			switch x := s.(type) {
+			case *ast.SelectStmt:
+				if x.IntoTable == nil {
+					n++
+					if inLoop {
+						ok = false
+					}
+				}
+			case *ast.Block:
+				walk(x.Stmts, inLoop)
+				if x.Except != nil {
+					for _, h := range x.Except.Handlers {
+						walk(h.Body, inLoop)
+					}
+				}
+			case *ast.IfStmt:
+				for _, b := range x.Branches {
+					walk(b.Body, inLoop)
+				}
+				walk(x.Else, inLoop)
+			case *ast.CaseStmt:
+				for _, w := range x.When {
+					walk(w.Body, inLoop)
+				}
+				walk(x.Else, inLoop)
+			case *ast.WhileStmt:
+				walk(x.Body, true)
+			case *ast.LoopStmt:
+				walk(x.Body, true)
+			case *ast.RepeatStmt:
+				walk(x.Body, true)
+			}
+		}
+	}
+	walk(stmts, false)
+	return n, ok
+}
+
+// tsqlResultCursorNames names the n result refcursor parameters of a
+// procedure (_result, or _result1 … _resultn), clear of its parameters.
+func tsqlResultCursorNames(n int, params []RoutineParam) []string {
+	taken := map[string]bool{}
+	for _, p := range params {
+		taken[p.Name] = true
+	}
+	out := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		base := "_result"
+		if n > 1 {
+			base += strconv.Itoa(i)
+		}
+		name := base
+		for k := 2; taken[name]; k++ {
+			name = base + "_" + strconv.Itoa(k)
+		}
+		taken[name] = true
+		out = append(out, name)
+	}
+	return out
 }
 
 // tsqlBodyReturnsResultSet reports whether a procedure body holds a
