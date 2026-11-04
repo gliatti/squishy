@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -202,6 +203,15 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 	timings.Parse = time.Since(parseStart)
 
 	translateStart := time.Now()
+	// A SQL Server database spans several T-SQL schemas (AdventureWorks:
+	// Person, Sales, …): every object keeps its schema on PG, prefixed by
+	// the database name when the migration shares its target database
+	// with others (dedicated_schema), as is otherwise (dedicated_db).
+	preserveSchemas := dialects.IsSQLServer(dialects.Kind(inst.Kind))
+	schemaPrefix := ""
+	if preserveSchemas && inst.TargetStrategy == "dedicated_schema" {
+		schemaPrefix = strings.ToLower(mig.SourceSchemaName) + "_"
+	}
 	result := translate.Translate(stmts, translate.Options{
 		TargetSchema:     mig.TargetSchemaName,
 		SourceKind:       dialects.Kind(inst.Kind),
@@ -210,6 +220,9 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		ParseError:       parseErr,
 
 		GeneratedOverrides: overrides,
+
+		PreserveSourceSchemas: preserveSchemas,
+		SchemaPrefix:          schemaPrefix,
 	})
 	if parseErr != nil {
 		result.Warnings = append(result.Warnings, translate.Warning{
@@ -226,6 +239,8 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		TargetSchema:   mig.TargetSchemaName,
 		TargetDBName:   mig.TargetDBName,
 		CreateTargetDB: inst.TargetStrategy == "dedicated_db",
+
+		PreserveSourceSchemas: preserveSchemas,
 	})
 	timings.PlannerBuild = time.Since(plannerStart)
 

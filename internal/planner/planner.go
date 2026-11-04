@@ -44,6 +44,11 @@ type BuildOptions struct {
 	// SkipData=true, create_fk depends directly on create_ddl (so FK and
 	// routine creation still run in order on the existing schema).
 	SkipData bool
+	// PreserveSourceSchemas mirrors translate.Options.PreserveSourceSchemas
+	// (SQL Server): each object lives in the PG schema the translator
+	// mapped its source schema to, so the step payloads carry that schema
+	// (the translated table's / routine's) instead of TargetSchema.
+	PreserveSourceSchemas bool
 }
 
 // copySourceVariantSystemTimeHistory is the copy_table payload
@@ -104,13 +109,29 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 
 	// One copy_table step per base table — skipped under SkipData.
 	copyIDs := make(map[string]uuid.UUID)
+	// copySchemas maps a copy step target to the PG schema the rows land
+	// in (create_index payloads reuse it).
+	copySchemas := make(map[string]string)
 	if !opts.SkipData {
 		for _, tbl := range source.Tables {
+			pgTbl := translatedTable(pg, tbl)
+			// A SQL Server snapshot carries its T-SQL schema (the pool is
+			// opened on the database): the source table is schema.table,
+			// and its rows go to the PG schema the translator mapped it
+			// to. The other dialects read <database>.<table> into the
+			// migration's target schema.
+			srcSchema, tgtSchema, target := tbl.Database, targetSchema, tbl.Name
+			if tbl.Schema != "" {
+				srcSchema, target = tbl.Schema, tbl.Schema+"."+tbl.Name
+				if pgTbl != nil && pgTbl.Schema != "" {
+					tgtSchema = pgTbl.Schema
+				}
+			}
 			payload := map[string]any{
-				"schema":        tbl.Database,
+				"schema":        srcSchema,
 				"table":         tbl.Name,
 				"rows":          tbl.Rows,
-				"target_schema": targetSchema,
+				"target_schema": tgtSchema,
 			}
 			// The translator sets an explicit copy list when the source
 			// catalog's default — every non-generated, non-spatial
@@ -118,13 +139,14 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 			// system-versioned table (ROW START / ROW END included) or
 			// refused generated columns created plain, whose values are
 			// copied (translate.PGTable.CopyColumns).
-			if pgTbl := translatedTable(pg, tbl.Name); pgTbl != nil && len(pgTbl.CopyColumns) > 0 {
+			if pgTbl != nil && len(pgTbl.CopyColumns) > 0 {
 				payload["columns"] = append([]string{}, pgTbl.CopyColumns...)
 			}
-			id := addStep("copy_table", tbl.Name, 100, payload, ddlID)
+			id := addStep("copy_table", target, 100, payload, ddlID)
 			// Rows estimated from information_schema; actual count computed by the worker.
 			p.Steps[len(p.Steps)-1].RowsTotal = tbl.Rows
-			copyIDs[tbl.Name] = id
+			copyIDs[target] = id
+			copySchemas[target] = tgtSchema
 		}
 		// MariaDB system-versioned tables emulated by the translator: the
 		// closed row versions (`FOR SYSTEM_TIME ALL`, ROW END in the past)
@@ -156,9 +178,13 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 	indexIDs := []uuid.UUID{}
 	if !opts.SkipData {
 		for tname, copyID := range copyIDs {
+			idxSchema := targetSchema
+			if s, ok := copySchemas[tname]; ok {
+				idxSchema = s
+			}
 			id := addStep("create_index", tname, 200, map[string]any{
 				"table":         tname,
-				"target_schema": targetSchema,
+				"target_schema": idxSchema,
 			}, copyID)
 			indexIDs = append(indexIDs, id)
 		}
@@ -176,17 +202,35 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 
 	// Views first — they may be referenced by triggers (INSTEAD OF on a view)
 	// or by other routines, so the trigger/routine dependency wiring below
-	// can read the view IDs.
+	// can read the view IDs. With preserved source schemas (SQL Server)
+	// views and routines are keyed and targeted schema-qualified (two
+	// schemas may hold the same name) and each step targets the schema
+	// its object lives in.
+	objKey := func(schema, name string) string {
+		if opts.PreserveSourceSchemas {
+			return schema + "." + name
+		}
+		return name
+	}
+	objSchema := func(schema string) string {
+		if opts.PreserveSourceSchemas && schema != "" {
+			return schema
+		}
+		return targetSchema
+	}
 	viewIDs := make(map[string]uuid.UUID, len(pg.Plan.Views))
+	viewNames := make(map[string]string, len(pg.Plan.Views))
 	for _, v := range pg.Plan.Views {
-		id := addStep("create_routine", "view:"+v.Name, 220, map[string]any{
+		key := objKey(v.Schema, v.Name)
+		id := addStep("create_routine", "view:"+key, 220, map[string]any{
 			"name":          v.Name,
 			"kind":          "view",
 			"ddl":           v.DDL,
 			"schema":        v.Schema,
-			"target_schema": targetSchema,
+			"target_schema": objSchema(v.Schema),
 		}, fkID)
-		viewIDs[v.Name] = id
+		viewIDs[key] = id
+		viewNames[key] = v.Name
 	}
 	// Routines (triggers, procedures, functions). Each step carries the
 	// target schema so hCreateRoutine can set search_path and resolve
@@ -194,20 +238,35 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 	// reference a view (INSTEAD OF on a view, or bodies that touch a view)
 	// must wait for the view to be created — otherwise the CREATE TRIGGER
 	// fails with "relation does not exist".
+	// fnSteps keeps the function steps and the views each one waits for
+	// (view → function ordering below).
+	type fnStep struct {
+		id    uuid.UUID
+		name  string
+		views map[uuid.UUID]bool
+	}
+	var fnSteps []fnStep
 	for _, r := range pg.Plan.Routines {
 		deps := []uuid.UUID{fkID}
-		for vname, vID := range viewIDs {
-			if referencesIdent(r.DDL, vname) {
+		for vkey, vID := range viewIDs {
+			if referencesIdent(r.DDL, viewNames[vkey]) {
 				deps = append(deps, vID)
 			}
 		}
-		addStep("create_routine", r.Kind+":"+r.Name, 220, map[string]any{
+		id := addStep("create_routine", r.Kind+":"+objKey(r.Schema, r.Name), 220, map[string]any{
 			"name":          r.Name,
 			"kind":          r.Kind,
 			"ddl":           r.DDL,
 			"schema":        r.Schema,
-			"target_schema": targetSchema,
+			"target_schema": objSchema(r.Schema),
 		}, deps...)
+		if r.Kind == "function" {
+			fs := fnStep{id: id, name: r.Name, views: map[uuid.UUID]bool{}}
+			for _, d := range deps {
+				fs.views[d] = true
+			}
+			fnSteps = append(fnSteps, fs)
+		}
 	}
 	// Views can reference other views (e.g. the employees sample's
 	// current_dept_emp joins dept_emp_latest_date). Wire view→view deps
@@ -223,28 +282,42 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 		if s.Kind != "create_routine" || !strings.HasPrefix(s.Target, "view:") {
 			continue
 		}
-		vname := strings.TrimPrefix(s.Target, "view:")
+		vkey := strings.TrimPrefix(s.Target, "view:")
 		var body string
 		var refs []string
 		for _, v := range pg.Plan.Views {
-			if v.Name == vname {
+			if objKey(v.Schema, v.Name) == vkey {
 				body = v.DDL + "\n" + v.SelectBody
 				refs = v.References
 				break
 			}
 		}
 		for other, otherID := range viewIDs {
-			if other == vname {
+			if other == vkey {
 				continue
 			}
 			var dep bool
 			if refs != nil {
-				dep = referencesName(refs, other)
+				dep = referencesName(refs, viewNames[other])
 			} else {
-				dep = referencesIdent(body, other)
+				dep = referencesIdent(body, viewNames[other])
 			}
 			if dep {
 				s.DependsOn = append(s.DependsOn, otherID)
+			}
+		}
+		// SQL Server views read table-valued functions (`FROM
+		// dbo.fn(…)`, `CROSS APPLY dbo.fn(…)`) and call scalar ones,
+		// and CREATE VIEW checks that they exist: the view waits for
+		// the function — unless the function itself waits for the view
+		// (a cycle the job retries would not resolve either way). Kept
+		// to preserved-schema plans so the other dialects' step graph is
+		// unchanged.
+		if opts.PreserveSourceSchemas {
+			for _, fs := range fnSteps {
+				if !fs.views[s.ID] && referencesIdent(body, fs.name) {
+					s.DependsOn = append(s.DependsOn, fs.id)
+				}
 			}
 		}
 	}
@@ -255,12 +328,21 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 	for _, s := range p.Steps {
 		depAll = append(depAll, s.ID)
 	}
-	addStep("validate", "", 300, map[string]any{
+	validate := map[string]any{
 		"tables":         tableNames(source.Tables),
 		"history_tables": historyValidations(pg),
 		"source_schema":  source.Database,
 		"target_schema":  targetSchema,
-	}, depAll...)
+	}
+	if checks := tableChecks(source, pg); checks != nil {
+		// SQL Server: every table has its own source and target schema,
+		// which the single source_schema / target_schema pair cannot
+		// express. table_checks lists them; tables stays empty so a
+		// worker that only reads it does not count <database>.<table>.
+		validate["tables"] = []string{}
+		validate["table_checks"] = checks
+	}
+	addStep("validate", "", 300, validate, depAll...)
 
 	assignLevels(p.Steps)
 	return p
@@ -301,21 +383,65 @@ func assignLevels(steps []Step) {
 	}
 }
 
-// translatedTable returns the translated table named table, or nil. The
-// name is matched exactly: the translator names a MySQL/MariaDB table
-// after its SHOW CREATE TABLE, like the inspector's snapshot, and two
-// tables may differ only by case on a case-sensitive source
-// (lower_case_table_names=0).
-func translatedTable(pg *translate.Result, table string) *translate.PGTable {
+// translatedTable returns the translated table of the inspected table
+// snap, or nil. A MySQL/MariaDB (Oracle, DB2) table is matched by exact
+// name: the translator names it after its SHOW CREATE TABLE, like the
+// inspector's snapshot, and two tables may differ only by case on a
+// case-sensitive source (lower_case_table_names=0). A SQL Server
+// snapshot (Schema set) is matched against the source schema and name
+// the translator recorded (PGTable.SourceSchema / SourceName),
+// case-insensitively like SQL Server's default collation, since the PG
+// names are folded and the schema mapped.
+func translatedTable(pg *translate.Result, snap inspect.ObjectSnapshot) *translate.PGTable {
 	if pg == nil {
 		return nil
 	}
 	for i := range pg.Plan.Tables {
-		if pg.Plan.Tables[i].Name == table {
-			return &pg.Plan.Tables[i]
+		t := &pg.Plan.Tables[i]
+		if snap.Schema != "" {
+			if t.SourceName != "" && strings.EqualFold(t.SourceName, snap.Name) && strings.EqualFold(t.SourceSchema, snap.Schema) {
+				return t
+			}
+			continue
+		}
+		if t.Name == snap.Name {
+			return t
 		}
 	}
 	return nil
+}
+
+// ValidateTableCheck is one entry of the validate step's table_checks
+// payload (SQL Server): a copied table with its own source schema (the
+// T-SQL schema, the source pool being opened on the database) and target
+// schema / name (the PG ones the translator mapped).
+type ValidateTableCheck struct {
+	SourceSchema string `json:"source_schema"`
+	SourceTable  string `json:"source_table"`
+	TargetSchema string `json:"target_schema"`
+	TargetTable  string `json:"target_table"`
+}
+
+// tableChecks returns the table_checks of the validate step: one per
+// inspected table with a T-SQL schema whose translated table is known,
+// in inspection order; nil when no snapshot carries a schema (every
+// dialect but SQL Server).
+func tableChecks(source *inspect.SourceSchema, pg *translate.Result) []ValidateTableCheck {
+	var out []ValidateTableCheck
+	for _, snap := range source.Tables {
+		if snap.Schema == "" {
+			continue
+		}
+		pgTbl := translatedTable(pg, snap)
+		if pgTbl == nil {
+			continue
+		}
+		out = append(out, ValidateTableCheck{
+			SourceSchema: snap.Schema, SourceTable: snap.Name,
+			TargetSchema: pgTbl.Schema, TargetTable: pgTbl.Name,
+		})
+	}
+	return out
 }
 
 // referencesName reports whether refs (the relation names a typed view

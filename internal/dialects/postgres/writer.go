@@ -69,6 +69,8 @@ func writeStmt(b *strings.Builder, s Stmt) {
 		writeCreateTrigger(b, x)
 	case *CreateView:
 		writeCreateView(b, x)
+	case *CreateDomain:
+		writeCreateDomain(b, x)
 	case *Raw:
 		b.WriteString(x.Text)
 		if !strings.HasSuffix(x.Text, "\n") {
@@ -94,6 +96,16 @@ func writeCreateTable(b *strings.Builder, t *CreateTable) {
 		}
 		if c.Identity != IdentityNone {
 			fmt.Fprintf(b, " GENERATED %s AS IDENTITY", c.Identity)
+			if c.HasIdentityOptions {
+				fmt.Fprintf(b, " (START WITH %d INCREMENT BY %d", c.IdentityStart, c.IdentityIncrement)
+				if c.HasIdentityMin {
+					fmt.Fprintf(b, " MINVALUE %d", c.IdentityMin)
+				}
+				if c.HasIdentityMax {
+					fmt.Fprintf(b, " MAXVALUE %d", c.IdentityMax)
+				}
+				b.WriteByte(')')
+			}
 		}
 		if c.NotNull {
 			b.WriteString(" NOT NULL")
@@ -117,7 +129,11 @@ func writeCreateTable(b *strings.Builder, t *CreateTable) {
 		for i, c := range t.PrimaryKey {
 			cols[i] = qIdent(c)
 		}
-		fmt.Fprintf(b, "  PRIMARY KEY (%s)", strings.Join(cols, ","))
+		b.WriteString("  ")
+		if t.PrimaryKeyName != "" {
+			fmt.Fprintf(b, "CONSTRAINT %s ", qIdent(t.PrimaryKeyName))
+		}
+		fmt.Fprintf(b, "PRIMARY KEY (%s)", strings.Join(cols, ","))
 		if len(t.Checks) > 0 {
 			b.WriteByte(',')
 		}
@@ -207,7 +223,32 @@ func writeCreateIndex(b *strings.Builder, idx *CreateIndex) {
 	if idx.Method != "" {
 		fmt.Fprintf(b, " USING %s", idx.Method)
 	}
-	fmt.Fprintf(b, " (%s);\n", strings.Join(cols, ","))
+	fmt.Fprintf(b, " (%s)", strings.Join(cols, ","))
+	if len(idx.Include) > 0 {
+		inc := make([]string, len(idx.Include))
+		for i, c := range idx.Include {
+			inc[i] = qIdent(c)
+		}
+		fmt.Fprintf(b, " INCLUDE (%s)", strings.Join(inc, ","))
+	}
+	if idx.Where != "" {
+		fmt.Fprintf(b, " WHERE (%s)", idx.Where)
+	}
+	b.WriteString(";\n")
+}
+
+func writeCreateDomain(b *strings.Builder, d *CreateDomain) {
+	fmt.Fprintf(b, "CREATE DOMAIN %s.%s AS %s", qIdent(d.Schema), qIdent(d.Name), d.Type)
+	if d.NotNull {
+		b.WriteString(" NOT NULL")
+	}
+	if d.Default != "" {
+		fmt.Fprintf(b, " DEFAULT %s", d.Default)
+	}
+	for _, c := range d.Checks {
+		fmt.Fprintf(b, " CHECK (%s)", c)
+	}
+	b.WriteString(";\n")
 }
 
 func writeAddFK(b *strings.Builder, fk *AlterTableAddFK) {
@@ -338,10 +379,20 @@ func writeCreateTrigger(b *strings.Builder, t *CreateTrigger) {
 		event = eb.String()
 	}
 	fmt.Fprintf(b,
-		"CREATE TRIGGER %s %s %s ON %s.%s\n  FOR EACH %s",
+		"CREATE TRIGGER %s %s %s ON %s.%s\n",
 		qIdent(t.Name), strings.ToUpper(t.Timing), event,
-		qIdent(t.Schema), qIdent(t.Table),
-		forEach)
+		qIdent(t.Schema), qIdent(t.Table))
+	if t.NewTable != "" || t.OldTable != "" {
+		b.WriteString("  REFERENCING")
+		if t.NewTable != "" {
+			fmt.Fprintf(b, " NEW TABLE AS %s", qIdent(t.NewTable))
+		}
+		if t.OldTable != "" {
+			fmt.Fprintf(b, " OLD TABLE AS %s", qIdent(t.OldTable))
+		}
+		b.WriteByte('\n')
+	}
+	fmt.Fprintf(b, "  FOR EACH %s", forEach)
 	if t.WhenCond != "" {
 		fmt.Fprintf(b, " WHEN (%s)", t.WhenCond)
 	}

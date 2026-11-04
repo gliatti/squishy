@@ -21,6 +21,11 @@ type typeResult struct {
 	// have no PG equivalent; the mapping is best-effort and nothing the user
 	// can "fix"). Mirrors Prerequisite.Severity.
 	WarningSeverity Severity
+	// WarningKind is the Warning.Kind under which a caller that honours
+	// it reports Warning (the SQL Server column translator does, so each
+	// lossy mapping gets its own prerequisite). Empty means "type", the
+	// historical kind every other caller uses.
+	WarningKind string
 }
 
 // Caps describes target PG capabilities consulted by the type mapper. Exposed

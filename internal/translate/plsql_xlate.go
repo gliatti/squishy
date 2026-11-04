@@ -69,6 +69,14 @@ func TranslateRoutineBodyExtVS(body string, kind dialects.Kind, newAlias, oldAli
 //     after the dialect rewrites and before the PG writer renders the
 //     body. nil for procedures and functions.
 func translateRoutineBodyWithSigs(body string, kind dialects.Kind, newAlias, oldAlias, targetSchema string, sigs *mysqlRoutineSigs, trigReturn ast.Rewriter) (string, []string, []string, bool) {
+	return translateRoutineBodyCore(body, kind, newAlias, oldAlias, targetSchema, sigs, trigReturn, nil)
+}
+
+// translateRoutineBodyCore is translateRoutineBodyWithSigs plus the hook
+// context of a kind whose bodies go through dialect_hooks.go
+// (usesHookedBodies): its registered BodyRewriter runs instead of the
+// MySQL passes, with hctx (nil outside a Translate run).
+func translateRoutineBodyCore(body string, kind dialects.Kind, newAlias, oldAlias, targetSchema string, sigs *mysqlRoutineSigs, trigReturn ast.Rewriter, hctx *ExprCtx) (string, []string, []string, bool) {
 	if strings.TrimSpace(body) == "" {
 		return "", nil, nil, false
 	}
@@ -115,6 +123,12 @@ func translateRoutineBodyWithSigs(body string, kind dialects.Kind, newAlias, old
 			extra = ast.Compose(extras...)
 		}
 		stmts = applyOracleASTRewritesWith(stmts, extra)
+	} else if usesHookedBodies(kind) {
+		// Dialect registered through dialect_hooks.go (SQL Server): its
+		// own AST pass, none of the MySQL-only ones.
+		if br := hookedBodyRewriter(kind); br != nil {
+			stmts = br(stmts, hctx)
+		}
 	} else {
 		// MySQL / MariaDB / DB2 path: every MySQL idiom (<=>, GROUP_CONCAT,
 		// JSON_EXTRACT paths, bare JOIN, INTERVAL, DATE_ADD, CAST types,
@@ -140,11 +154,14 @@ func translateRoutineBodyWithSigs(body string, kind dialects.Kind, newAlias, old
 	for _, d := range callArgDiags {
 		tx.warn(d)
 	}
-	if !dialects.IsOracle(kind) && errs != "" {
+	hooked := usesHookedBodies(kind)
+	if hooked && errs != "" {
+		tx.note(string(kind) + " parser reported errors while parsing the routine body (translation may be incomplete): " + errs)
+	} else if !dialects.IsOracle(kind) && errs != "" {
 		tx.note("MySQL parser reported errors while parsing the routine body (translation may be incomplete): " + errs)
 	}
 	pgStmts := tx.stmts(stmts)
-	if !dialects.IsOracle(kind) {
+	if !dialects.IsOracle(kind) && !hooked {
 		seen := map[string]bool{}
 		for _, s := range stmts {
 			for _, label := range mysqlResidualIdioms(s) {
@@ -1319,6 +1336,13 @@ func parseRoutineBodyByKind(body string, kind dialects.Kind) ([]ast.PLStmt, stri
 			return stmts, ""
 		}
 		return stmts, errs.Error()
+	}
+	if !dialects.IsMySQLFamily(kind) && !dialects.IsDB2Family(kind) {
+		// A dialect with its own routine-body parser (dialect_hooks.go;
+		// SQL Server defaults to the T-SQL parser).
+		if fn := hookedRoutineBodyParser(kind); fn != nil {
+			return fn(body)
+		}
 	}
 	stmts, errs := mysqldialect.ParseRoutineBody(body)
 	if len(errs) == 0 {

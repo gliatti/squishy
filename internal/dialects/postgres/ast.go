@@ -76,6 +76,10 @@ type CreateTable struct {
 	IfNotExists bool
 	Columns     []ColumnDef
 	PrimaryKey  []string // PK column names (inline constraint)
+	// PrimaryKeyName, when set, names the primary key constraint
+	// (`CONSTRAINT "name" PRIMARY KEY (…)`); empty lets PG generate
+	// <table>_pkey (historical output).
+	PrimaryKeyName string
 	Checks      []string // raw CHECK expressions (table-level)
 	// CheckNames, when set, runs parallel to Checks: a non-empty entry
 	// renders `CONSTRAINT "name" CHECK (…)`, an empty or missing one a
@@ -145,6 +149,21 @@ type ColumnDef struct {
 	// (e.g. `"C"`, `"und-x-icu"`). Empty = no explicit COLLATE clause.
 	// Already quoted exactly as it should appear in DDL.
 	Collation string
+
+	// IdentityStart / IdentityIncrement are the sequence options of an
+	// identity column, rendered `GENERATED … AS IDENTITY (START WITH s
+	// INCREMENT BY i [MINVALUE m] [MAXVALUE M])` when HasIdentityOptions
+	// is set (T-SQL IDENTITY(seed, increment)); without it the identity
+	// keeps PG's defaults (1, 1) and the historical output. The bounds are
+	// needed when the seed lies outside PG's default range (MINVALUE 1
+	// ascending, MAXVALUE -1 descending).
+	IdentityStart      int64
+	IdentityIncrement  int64
+	HasIdentityOptions bool
+	IdentityMin        int64
+	HasIdentityMin     bool
+	IdentityMax        int64
+	HasIdentityMax     bool
 }
 
 type IdentityMode string
@@ -178,6 +197,13 @@ type CreateIndex struct {
 	// Columns[i] is a raw expression (no qIdent quoting; wrapped in extra
 	// parens by the writer).
 	ColumnIsExpr []bool
+
+	// Include lists the non-key columns of a covering index (`INCLUDE
+	// (c, …)`, quoted by the writer); Where is the predicate of a partial
+	// index (already rendered PG expression text, written `WHERE (…)`).
+	// Both are empty for a plain index.
+	Include []string
+	Where   string
 }
 
 func (*CreateIndex) pgNode()   {}
@@ -258,6 +284,14 @@ type CreateTrigger struct {
 	// same expression syntax inline on CREATE TRIGGER. Empty means no
 	// WHEN clause.
 	WhenCond string
+	// NewTable / OldTable name the transition tables of an AFTER
+	// trigger: `REFERENCING NEW TABLE AS <NewTable> OLD TABLE AS
+	// <OldTable>` (each only when set). PostgreSQL allows NEW TABLE for
+	// INSERT / UPDATE events and OLD TABLE for UPDATE / DELETE, on AFTER
+	// triggers of a table only: the caller sets the applicable ones
+	// (T-SQL's inserted / deleted pseudo-tables).
+	NewTable string
+	OldTable string
 }
 
 func (*CreateTrigger) pgNode()   {}
@@ -292,6 +326,22 @@ type CreateProcedure struct {
 
 func (*CreateProcedure) pgNode()   {}
 func (*CreateProcedure) stmtNode() {}
+
+// CreateDomain renders `CREATE DOMAIN <schema>.<name> AS <type>
+// [NOT NULL] [DEFAULT <expr>] [CHECK (<expr>)…];` — the PG counterpart of
+// a T-SQL alias type (`CREATE TYPE t FROM base`). Type, Default and
+// Checks are already-rendered PG text.
+type CreateDomain struct {
+	Schema  string
+	Name    string
+	Type    string
+	NotNull bool
+	Default string
+	Checks  []string
+}
+
+func (*CreateDomain) pgNode()   {}
+func (*CreateDomain) stmtNode() {}
 
 // Raw is an escape hatch for statements we don't fully model yet. The writer
 // emits the Text verbatim with a trailing newline; use sparingly.

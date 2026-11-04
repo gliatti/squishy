@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"gitlab.com/dalibo/squishy/internal/dialects"
 )
 
 // buildPrerequisites folds the translator's Warnings into actionable
@@ -139,6 +141,12 @@ PG timestamptz expression, e.g.:
   fire_at TIMESTAMPTZ := now() + INTERVAL '1 hour';`,
 			})
 		case "routine.untranslated_construct":
+			if dialects.IsSQLServer(t.opt.SourceKind) {
+				// The template below speaks of MySQL; a T-SQL body
+				// has its own remediation.
+				add(tsqlRoutineReviewPrerequisite(w))
+				continue
+			}
 			add(Prerequisite{
 				Severity:    SeverityBlocking,
 				Category:    CatManualReview,
@@ -354,6 +362,10 @@ this prerequisite to migrate the current rows only.`,
   * Rewrite any FOR PORTION OF UPDATE/DELETE in application code as
     explicit DELETE + INSERT pairs that reflect the new ranges.`,
 			})
+		default:
+			if p, ok := tsqlPrerequisite(w); ok {
+				add(p)
+			}
 		}
 	}
 
@@ -497,4 +509,181 @@ CREATE EXTENSION IF NOT EXISTS pg_cron;
 func prereqID(cat Category, title, object string) string {
 	h := sha1.Sum([]byte(string(cat) + "|" + title + "|" + object))
 	return fmt.Sprintf("%x", h[:8])
+}
+
+// tsqlPrerequisite maps the SQL Server warning kinds (translateTSQLScript,
+// mapTSQLType) to their prerequisite; ok is false for any other kind.
+func tsqlPrerequisite(w Warning) (Prerequisite, bool) {
+	switch w.Kind {
+	case "table.temporal_not_emulated":
+		return Prerequisite{
+			Severity:    SeverityBlocking,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "SQL Server temporal tables: history not migrated",
+			Description: "One or more system-versioned (temporal) tables were found:\n\n  • " + w.Message + "\n\nsquishy migrates the current rows and keeps the period columns (ValidFrom / ValidTo) as plain timestamp columns. The history table is not copied, PostgreSQL does not maintain the period columns, and FOR SYSTEM_TIME AS OF / BETWEEN / ALL queries have no equivalent.",
+			Remediation: `Pick one:
+  1. Install the temporal_tables extension and recreate the history:
+       CREATE EXTENSION IF NOT EXISTS temporal_tables;
+       ALTER TABLE <table> ADD COLUMN sys_period tstzrange NOT NULL DEFAULT tstzrange(now(), null);
+       CREATE TABLE <table>_history (LIKE <table>);
+       CREATE TRIGGER versioning_trigger BEFORE INSERT OR UPDATE OR DELETE ON <table>
+         FOR EACH ROW EXECUTE PROCEDURE versioning('sys_period', '<table>_history', true);
+     then load the SQL Server history rows into <table>_history.
+  2. Maintain a history table with your own UPDATE / DELETE triggers.
+  3. Acknowledge this prerequisite to migrate the current rows only.`,
+		}, true
+	case "table.computed_not_generated":
+		// One prerequisite per column (the title names it).
+		return Prerequisite{
+			Severity:    SeverityBlocking,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "Provide the computation of column " + w.Object + " (SQL Server computed column not reproduced)",
+			Description: "  • " + w.Message + "\n\nThe column is created on PostgreSQL as a plain column of its inferred type and its values are copied from the source, so nothing wrong is stored. But PostgreSQL does not compute it: rows inserted or updated on PostgreSQL keep whatever the application writes (NULL by default) until a computation is provided.",
+			Remediation: `Pick one:
+  1. Set a PostgreSQL generation expression override for the column
+     (API PUT /api/v1/migrations/{id}/generated-overrides with
+     {"overrides":[{"table":"<table>","column":"<column>","expression":"<PG expression>"}]},
+     MCP set_generated_override, or the DDL tab), then re-plan. The
+     expression must be immutable (no now(), no user function, || on
+     text only) and give the value SQL Server computes.
+  2. Or install a BEFORE INSERT OR UPDATE trigger that fills the column,
+     or a view that computes it.
+  3. Or acknowledge this prerequisite to keep a plain column filled by
+     the application.`,
+		}, true
+	case "routine.tvf_columns_unresolved":
+		return Prerequisite{
+			Severity:    SeverityBlocking,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "Write the result columns of inline table-valued functions",
+			Description: "  • " + w.Message,
+			Remediation: "Replace RETURNS SETOF record by RETURNS TABLE (<column> <type>, …) matching the RETURN query, in the function DDL (create_routine step), then re-run the step.",
+		}, true
+	case "routine.procedure_returns_resultset":
+		return Prerequisite{
+			Severity:    SeverityBlocking,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "Rework SQL Server procedures that return result sets",
+			Description: "  • " + w.Message + "\n\nA T-SQL procedure streams the rows of its bare SELECT statements to the caller. A PostgreSQL procedure cannot: the translated SELECT has no destination.",
+			Remediation: `For each flagged procedure, either:
+  * turn it into a function: CREATE FUNCTION … RETURNS TABLE (…) / SETOF … and
+    RETURN QUERY SELECT …; callers use SELECT * FROM fn(…);
+  * or add an INOUT refcursor parameter, OPEN it FOR SELECT …, and have the
+    caller FETCH from the cursor inside the same transaction.`,
+		}, true
+	case tsqlWarnSpatial:
+		return Prerequisite{
+			Severity:    SeverityBlocking,
+			Category:    CatInstallExtension,
+			Object:      w.Object,
+			Title:       "Install PostGIS for SQL Server geography / geometry columns",
+			Description: "The source has geography / geometry columns. Without PostGIS on the target, squishy created them as text and copies the WKT form, which loses every spatial operation, index and the SRID.",
+			Remediation: "CREATE EXTENSION IF NOT EXISTS postgis;  -- on the target database\n\nThen re-plan the migration: the columns map to PostGIS geography / geometry.",
+		}, true
+	case tsqlWarnHierarchy:
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "hierarchyid columns migrated as text paths",
+			Description: w.Message,
+			Remediation: "The values are the canonical paths ('/1/3/'), whose text order is not the hierarchy order for multi-digit nodes. To query the hierarchy, convert them to ltree (CREATE EXTENSION ltree; replace the '/' separators by '.') or compare path arrays (string_to_array).",
+		}, true
+	case tsqlWarnSQLVariant:
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "sql_variant columns migrated as text",
+			Description: w.Message,
+			Remediation: "No automatic remediation: split the column by base type (or keep text and cast on read) where the application relies on the value's type.",
+		}, true
+	case tsqlWarnRowversion:
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "rowversion columns are not maintained on PostgreSQL",
+			Description: w.Message,
+			Remediation: "For optimistic concurrency use the xmin system column, or a BEFORE UPDATE trigger that bumps a bigint version column.",
+		}, true
+	case tsqlWarnTableType:
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "SQL Server table types migrated as composite types",
+			Description: w.Message,
+			Remediation: "Routines receiving a table-valued parameter get an array of the composite: read it with unnest(param) instead of selecting from the parameter.",
+		}, true
+	case "trigger.instead_of_table":
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "INSTEAD OF triggers on tables emulated row by row",
+			Description: w.Message,
+			Remediation: "Check that the trigger logic gives the same result when it runs once per row (statement-level counts, aggregates over inserted / deleted, RAISERROR after checking every row).",
+		}, true
+	case "table.computed_type_unknown":
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "Review the inferred type of computed columns",
+			Description: w.Message,
+			Remediation: "ALTER TABLE … ALTER COLUMN … TYPE <type> on the target if text is not the right type.",
+		}, true
+	case "trigger.ddl_not_migrated":
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "SQL Server DDL triggers not migrated",
+			Description: w.Message,
+			Remediation: "Reimplement them as PostgreSQL event triggers (CREATE EVENT TRIGGER … ON ddl_command_end) if the audit or the guard they provide is needed.",
+		}, true
+	case tsqlWarnUntranslatedExpr:
+		return Prerequisite{
+			Severity:    SeverityBlocking,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "Review T-SQL expressions kept in table DDL",
+			Description: "A DEFAULT, CHECK, computed column or filtered-index predicate kept a T-SQL construct squishy does not translate:\n\n  • " + w.Message + "\n\nThe statement holding it may fail on PostgreSQL, or compute something else.",
+			Remediation: "Rewrite the flagged expression in PostgreSQL syntax in the DDL (create_ddl / create_index step), then re-run the step; for a computed column, a generated-column override can supply the PG expression.",
+		}, true
+	case tsqlWarnNote:
+		// One info prerequisite per note text (the note is the title):
+		// the objects it applies to accumulate on it.
+		return Prerequisite{
+			Severity:    SeverityInfo,
+			Category:    CatManualReview,
+			Object:      w.Object,
+			Title:       "T-SQL behaviour difference: " + w.Message,
+			Description: w.Message,
+			Remediation: "No action needed unless the application depends on the SQL Server behaviour described.",
+		}, true
+	}
+	return Prerequisite{}, false
+}
+
+// tsqlRoutineReviewPrerequisite is the SQL Server version of the
+// "routine.untranslated_construct" prerequisite.
+func tsqlRoutineReviewPrerequisite(w Warning) Prerequisite {
+	return Prerequisite{
+		Severity:    SeverityBlocking,
+		Category:    CatManualReview,
+		Object:      w.Object,
+		Title:       "Review partially-translated T-SQL routine bodies",
+		Description: "squishy translated the T-SQL procedure / function / trigger body to PL/pgSQL (DECLARE hoisted, SET → :=, TRY/CATCH → EXCEPTION, inserted/deleted → transition tables, @@ROWCOUNT → GET DIAGNOSTICS, …), but some constructs have no exact PostgreSQL counterpart and need a human review:\n\n  • " + w.Message + "\n\nThe routine is created on the target but may fail at run time or behave differently.",
+		Remediation: `Compare the SQL Server source with the PG output:
+  sqlcmd: EXEC sp_helptext '<schema>.<name>';
+  psql:   \sf "<schema>"."<name>"
+Adjust the PG body for the flagged construct (dynamic SQL strings, XML /
+hierarchyid methods, MERGE … OUTPUT, sp_* system procedures, …).`,
+	}
 }

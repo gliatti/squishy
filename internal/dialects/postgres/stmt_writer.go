@@ -91,7 +91,16 @@ func writeSelectWithInto(s *ast.SelectStmt, into []string) string {
 		b.WriteString(" OFFSET ")
 		b.WriteString(WriteExpr(s.Offset))
 	}
-	if s.Limit != nil {
+	switch {
+	case s.Limit != nil && s.TopWithTies && len(s.OrderBy) > 0:
+		// T-SQL `TOP (n) WITH TIES` (rewritten to Limit by the T-SQL
+		// visitors, which keep the flag): PG 13+ has the same semantics
+		// in the SQL-standard spelling, which requires ORDER BY — as
+		// T-SQL does.
+		b.WriteString(" FETCH FIRST (")
+		b.WriteString(WriteExpr(s.Limit))
+		b.WriteString(") ROWS WITH TIES")
+	case s.Limit != nil:
 		b.WriteString(" LIMIT ")
 		b.WriteString(WriteExpr(s.Limit))
 	}
@@ -221,10 +230,40 @@ func writeFromItem(f ast.FromItem) string {
 			out += " (" + strings.Join(cols, ", ") + ")"
 		}
 		return out
+	case *ast.FromFunc:
+		// A set-returning function call (T-SQL table-valued function,
+		// unnest() of a table-valued parameter, string_to_table …).
+		out := WriteExpr(x.Func)
+		if x.Alias != "" {
+			out += " " + qIdent(x.Alias)
+		}
+		return out + writeColumnAliasList(x.Cols)
+	case *ast.FromValues:
+		rows := make([]string, len(x.Rows))
+		for i, row := range x.Rows {
+			cells := make([]string, len(row))
+			for j, e := range row {
+				cells[j] = WriteExpr(e)
+			}
+			rows[i] = "(" + strings.Join(cells, ", ") + ")"
+		}
+		out := "(VALUES " + strings.Join(rows, ", ") + ")"
+		if x.Alias != "" {
+			out += " " + qIdent(x.Alias)
+		}
+		return out + writeColumnAliasList(x.Cols)
 	case *ast.FromJoin:
 		left := writeFromItem(x.Left)
 		right := writeFromItem(x.Right)
 		kw := x.Kind.String()
+		switch x.Kind {
+		case ast.CrossApply:
+			// T-SQL APPLY is PG's LATERAL join: the right side may
+			// reference columns of the left side.
+			return left + " CROSS JOIN LATERAL " + right
+		case ast.OuterApply:
+			return left + " LEFT JOIN LATERAL " + right + " ON true"
+		}
 		if x.Natural {
 			kw = "NATURAL " + kw
 		}
@@ -529,4 +568,17 @@ func quoteColumnRef(s string) string {
 		parts[i] = qIdent(p)
 	}
 	return strings.Join(parts, ".")
+}
+
+// writeColumnAliasList renders the ` (c1, c2)` column alias list of a
+// FROM item ("" when there is none).
+func writeColumnAliasList(cols []string) string {
+	if len(cols) == 0 {
+		return ""
+	}
+	q := make([]string, len(cols))
+	for i, n := range cols {
+		q[i] = qIdent(n)
+	}
+	return " (" + strings.Join(q, ", ") + ")"
 }

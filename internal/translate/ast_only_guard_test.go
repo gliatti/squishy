@@ -18,17 +18,28 @@ import (
 // go/ast (no regex, no substring search on source text):
 //
 //	(a) no package imports regexp or regexp/syntax;
-//	(b) internal/translate never calls the MySQL lexer (NewLexer /
-//	    Tokenize) — the MySQL path parses once and rewrites the AST;
-//	    parser entry points (ParseRoutineBody, ParseSelect, ParseExpr…)
-//	    stay allowed;
+//	(b) internal/translate never calls the lexer of an AST-only dialect
+//	    (MySQL / MariaDB, SQL Server: NewLexer / Tokenize) — those paths
+//	    parse once and rewrite the AST; parser entry points
+//	    (ParseRoutineBody, ParseSelect, ParseExpr…) stay allowed;
 //	(c) the removed text rewriters are not resurrected under their old
 //	    names;
 //	(d) body_rewrite.go / routine_body.go do not come back.
 
-// astOnlyMySQLDialectPath is the import path of the MySQL dialect
-// package, whose lexer must not be reached from internal/translate.
-const astOnlyMySQLDialectPath = "gitlab.com/dalibo/squishy/internal/dialects/mysql"
+// astOnlyLexerDialect describes one AST-only dialect package for check
+// (b): the selectors of it that re-lex SQL text, and the dialect label
+// used in the violation message.
+type astOnlyLexerDialect struct {
+	label string
+	sels  map[string]bool
+}
+
+// astOnlyLexerDialects maps the import path of every AST-only dialect
+// package to its forbidden lexer selectors.
+var astOnlyLexerDialects = map[string]astOnlyLexerDialect{
+	"gitlab.com/dalibo/squishy/internal/dialects/mysql": {label: "MySQL", sels: map[string]bool{"NewLexer": true, "Tokenize": true}},
+	"gitlab.com/dalibo/squishy/internal/dialects/tsql":  {label: "T-SQL", sels: map[string]bool{"NewLexer": true, "Tokenize": true}},
+}
 
 // astOnlyTranslateDir is the logical directory whose files are subject
 // to check (b).
@@ -40,13 +51,6 @@ const astOnlyTranslateDir = "internal/translate"
 var astOnlyForbiddenImports = map[string]bool{
 	`regexp`:        true,
 	`regexp/syntax`: true,
-}
-
-// astOnlyForbiddenLexerSels are the MySQL dialect selectors rejected
-// by check (b).
-var astOnlyForbiddenLexerSels = map[string]bool{
-	"NewLexer": true,
-	"Tokenize": true,
 }
 
 // astOnlyForbiddenIdents are the legacy text-rewriter names rejected by
@@ -122,11 +126,16 @@ func checkASTOnly(fsys map[string]string) []string {
 		}
 
 		inTranslate := path.Dir(name) == astOnlyTranslateDir
-		mysqlNames := map[string]bool{}
+		// local package name → the AST-only dialect it imports.
+		lexerNames := map[string]astOnlyLexerDialect{}
 		if inTranslate {
 			for _, imp := range file.Imports {
 				p, err := strconv.Unquote(imp.Path.Value)
-				if err != nil || p != astOnlyMySQLDialectPath {
+				if err != nil {
+					continue
+				}
+				d, ok := astOnlyLexerDialects[p]
+				if !ok {
 					continue
 				}
 				local := path.Base(p)
@@ -138,9 +147,9 @@ func checkASTOnly(fsys map[string]string) []string {
 					// Blank import: no selector can reach the lexer.
 				case ".":
 					// A dot import would let NewLexer appear unqualified.
-					report(fset, imp.Pos(), "dot import of %s hides MySQL lexer calls; import it under a name", p)
+					report(fset, imp.Pos(), "dot import of %s hides %s lexer calls; import it under a name", p, d.label)
 				default:
-					mysqlNames[local] = true
+					lexerNames[local] = d
 				}
 			}
 		}
@@ -148,11 +157,15 @@ func checkASTOnly(fsys map[string]string) []string {
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch x := n.(type) {
 			case *ast.SelectorExpr:
-				if !inTranslate || !astOnlyForbiddenLexerSels[x.Sel.Name] {
+				if !inTranslate {
 					return true
 				}
-				if id, ok := x.X.(*ast.Ident); ok && mysqlNames[id.Name] {
-					report(fset, x.Pos(), "%s.%s re-lexes SQL text with the MySQL lexer; parse once and use ast.Rewrite + the PG writer", id.Name, x.Sel.Name)
+				id, ok := x.X.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				if d, ok := lexerNames[id.Name]; ok && d.sels[x.Sel.Name] {
+					report(fset, x.Pos(), "%s.%s re-lexes SQL text with the %s lexer; parse once and use ast.Rewrite + the PG writer", id.Name, x.Sel.Name, d.label)
 				}
 			case *ast.Ident:
 				if astOnlyForbiddenIdents[x.Name] {
@@ -297,6 +310,59 @@ func lex(s string) { _ = mysql.NewLexer(s) }
 import "gitlab.com/dalibo/squishy/internal/dialects/oracle"
 
 func lex(s string) { _ = oracle.NewLexer(s) }
+`,
+		},
+		{
+			name: "aliased T-SQL lexer in translate",
+			file: "internal/translate/relex3.go",
+			src: `package translate
+
+import tsqldialect "gitlab.com/dalibo/squishy/internal/dialects/tsql"
+
+func relex(s string) { _ = tsqldialect.NewLexer(s) }
+`,
+			want: "tsqldialect.NewLexer re-lexes SQL text with the T-SQL lexer",
+		},
+		{
+			name: "unaliased T-SQL Tokenize in translate",
+			file: "internal/translate/relex4.go",
+			src: `package translate
+
+import "gitlab.com/dalibo/squishy/internal/dialects/tsql"
+
+func relex(s string) { _, _ = tsql.Tokenize(s) }
+`,
+			want: "tsql.Tokenize re-lexes SQL text with the T-SQL lexer",
+		},
+		{
+			name: "dot import of the T-SQL dialect",
+			file: "internal/translate/dot.go",
+			src: `package translate
+
+import . "gitlab.com/dalibo/squishy/internal/dialects/tsql"
+
+func parse(s string) { _, _ = ParseRoutineBody(s) }
+`,
+			want: "hides T-SQL lexer calls",
+		},
+		{
+			name: "T-SQL parser entry point is allowed",
+			file: "internal/translate/ok2.go",
+			src: `package translate
+
+import tsqldialect "gitlab.com/dalibo/squishy/internal/dialects/tsql"
+
+func parse(s string) { _, _ = tsqldialect.ParseRoutineBody(s); _, _ = tsqldialect.ParseExpr(s) }
+`,
+		},
+		{
+			name: "T-SQL lexer outside translate is not check (b)",
+			file: "internal/planner/lex.go",
+			src: `package planner
+
+import "gitlab.com/dalibo/squishy/internal/dialects/tsql"
+
+func lex(s string) { _ = tsql.NewLexer(s) }
 `,
 		},
 		{
