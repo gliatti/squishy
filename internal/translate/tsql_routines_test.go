@@ -134,7 +134,7 @@ func TestTSQLRoutines_ErrorLogProcedures(t *testing.T) {
 		// ERROR_*() of the TRY part read the error of the caller's CATCH
 		// block (tsql.error_field).
 		"  BEGIN\n    IF tsql.error_number_of(tsql.error_field('state')) IS NULL THEN\n      RETURN;\n    END IF;",
-		`tsql.error_number_of(tsql.error_field('state')), CASE WHEN tsql.error_field('state') IS NOT NULL THEN 16 END, CASE WHEN tsql.error_field('state') IS NOT NULL THEN 1 END, CAST(NULL AS text), CAST(NULL AS integer), tsql.error_field('message'));`,
+		`tsql.error_number_of(tsql.error_field('state')), CASE WHEN tsql.error_field('state') IS NOT NULL THEN 16 END, CASE WHEN tsql.error_field('state') IS NOT NULL THEN 1 END, CAST(NULL AS text), CASE WHEN tsql.error_field('state') IS NOT NULL THEN 0 END, tsql.error_field('message'));`,
 		// Its CATCH block calls uspPrintError: it publishes its own error
 		// first, and restores the caller's before RETURN.
 		"  EXCEPTION\n    WHEN OTHERS THEN\n      \"_tsql\".\"_error_context\" := tsql.error_enter(SQLSTATE, SQLERRM);\n      RAISE NOTICE '%', 'An error occurred in stored procedure uspLogError: ';\n      CALL \"dbo\".\"uspprinterror\"();\n      PERFORM tsql.error_leave(\"_tsql\".\"_error_context\");\n      RETURN;\n  END;",
@@ -175,7 +175,7 @@ END;
 GO
 `)
 	ddl := tsqlRoutineDDL(t, res, "procedure", "dbo", "logit")
-	require.Contains(t, ddl, `VALUES ('x', tsql.error_number_of("sqlstate"), 16, 1, CAST(NULL AS text), CAST(NULL AS integer), "sqlerrm");`)
+	require.Contains(t, ddl, `VALUES ('x', tsql.error_number_of("sqlstate"), 16, 1, CAST(NULL AS text), 0, "sqlerrm");`)
 	require.Contains(t, ddl, "      RAISE;\n")
 	require.Empty(t, tsqlObjectWarnings(res, "procedure.dbo.logit", "routine.untranslated_construct"))
 	notes := strings.Join(tsqlObjectWarnings(res, "procedure.dbo.logit", "routine.translated_with_remarks"), "\n")

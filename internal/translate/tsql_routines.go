@@ -846,8 +846,8 @@ func (b *tsqlBody) errorFunc(name string, p ast.Position) ast.Expr {
 		b.note("ERROR_STATE() reads 1 (PostgreSQL errors have no state number)")
 		return &ast.Literal{Kind: "number", Text: "1", P: p}
 	case "ERROR_LINE":
-		b.note("ERROR_LINE() reads NULL (GET STACKED DIAGNOSTICS … PG_EXCEPTION_CONTEXT holds the PL/pgSQL context instead)")
-		return tsqlTypedNull("integer", p)
+		b.note(tsqlErrorLineNote)
+		return &ast.Literal{Kind: "number", Text: "0", P: p}
 	}
 	b.note("ERROR_PROCEDURE() reads NULL (GET STACKED DIAGNOSTICS … PG_EXCEPTION_CONTEXT holds the routine names instead)")
 	return tsqlTypedNull("text", p)
