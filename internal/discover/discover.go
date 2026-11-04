@@ -10,7 +10,7 @@ import (
 )
 
 // Schemas returns the list of non-system source schemas (Oracle, DB2) or
-// databases (MySQL/MariaDB) reachable through the open *sql.DB.
+// databases (MySQL/MariaDB, SQL Server) reachable through the open *sql.DB.
 func Schemas(ctx context.Context, db *sql.DB, kind string) ([]string, error) {
 	switch kind {
 	case "mysql", "mariadb":
@@ -21,6 +21,8 @@ func Schemas(ctx context.Context, db *sql.DB, kind string) ([]string, error) {
 		return discoverDB2LUW(ctx, db)
 	case "db2zos":
 		return discoverDB2zOS(ctx, db)
+	case "sqlserver":
+		return discoverSQLServer(ctx, db)
 	default:
 		return nil, errors.New("discover: unsupported kind " + kind)
 	}

@@ -327,3 +327,183 @@ func TestRewrite_AggOrderByPostOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestRewrite_ReachesTSQLSlots pins the descent into every expression /
+// statement slot added for the T-SQL dialect (new nodes and new fields of
+// existing nodes): one case per slot, read back through the root after the
+// renaming rewriter ran.
+func TestRewrite_ReachesTSQLSlots(t *testing.T) {
+	type tc struct {
+		name string
+		root Node
+		get  func() Expr
+	}
+	var cases []tc
+
+	{ // a LIKE 'x' ESCAPE e
+		root := &BinaryExpr{Op: "LIKE", Lhs: BuildIdent("a"), Rhs: BuildStringLit("x"), Escape: BuildIdent("e")}
+		cases = append(cases, tc{"BinaryExpr.Escape", root, func() Expr { return root.Escape }})
+	}
+	{ // CONVERT(int, x, s)
+		root := &CastExpr{Expr: BuildIdent("x"), Type: &IntType{Name: "INT"}, IsConvert: true, ConvertStyle: BuildIdent("s")}
+		cases = append(cases,
+			tc{"CastExpr.Expr", root, func() Expr { return root.Expr }},
+			tc{"CastExpr.ConvertStyle", root, func() Expr { return root.ConvertStyle }},
+		)
+	}
+	{ // c COLLATE x
+		root := &CollateExpr{Expr: BuildIdent("c"), Collation: "Latin1_General_BIN"}
+		cases = append(cases, tc{"CollateExpr.Expr", root, func() Expr { return root.Expr }})
+	}
+	{ // col.GetAncestor(n)
+		root := &MethodCall{Target: BuildIdent("col"), Method: "GetAncestor", Args: []Expr{BuildIdent("n")}}
+		cases = append(cases,
+			tc{"MethodCall.Target", root, func() Expr { return root.Target }},
+			tc{"MethodCall.Args", root, func() Expr { return root.Args[0] }},
+		)
+	}
+	{ // EXEC p @x = v
+		root := &CallStmt{Name: "p", Args: []Expr{&NamedArg{Name: "@x", Value: BuildIdent("v")}}}
+		cases = append(cases, tc{"NamedArg.Value", root, func() Expr { return root.Args[0].(*NamedArg).Value }})
+	}
+	{ // SELECT TOP (n) * FROM f(x), (…) q PIVOT (SUM(g) …), (VALUES (v)) vv
+		pivot := &FromPivot{Source: &FromSubquery{Stmt: selectWhere("s"), Alias: "q"}, Agg: BuildFuncCall("SUM", BuildIdent("g")), ForCol: "y", InCols: []string{"1"}}
+		root := &SelectStmt{
+			Top:  BuildIdent("n"),
+			Cols: []SelectItem{{Star: true}},
+			From: []FromItem{
+				&FromFunc{Func: BuildFuncCall("f", BuildIdent("x")), Alias: "f"},
+				pivot,
+				&FromValues{Rows: [][]Expr{{BuildIdent("v")}}, Alias: "vv"},
+			},
+		}
+		cases = append(cases,
+			tc{"SelectStmt.Top", root, func() Expr { return root.Top }},
+			tc{"FromFunc.Func", root, func() Expr { return root.From[0].(*FromFunc).Func.(*FuncCall).Args[0] }},
+			tc{"FromPivot.Source", root, func() Expr { return whereLhs(root.From[1].(*FromPivot).Source.(*FromSubquery).Stmt) }},
+			tc{"FromPivot.Agg", root, func() Expr { return root.From[1].(*FromPivot).Agg.(*FuncCall).Args[0] }},
+			tc{"FromValues.Rows", root, func() Expr { return root.From[2].(*FromValues).Rows[0][0] }},
+		)
+	}
+	{ // WITH c AS (…) INSERT TOP (n) INTO t EXEC p a
+		root := &InsertStmt{
+			Table: TableRef{Name: "t"},
+			With:  &WithClause{CTEs: []CTE{{Name: "c", Body: selectWhere("w")}}},
+			Top:   BuildIdent("n"),
+			Exec:  &CallStmt{Name: "p", Args: []Expr{BuildIdent("a")}},
+		}
+		cases = append(cases,
+			tc{"InsertStmt.With", root, func() Expr { return whereLhs(root.With.CTEs[0].Body) }},
+			tc{"InsertStmt.Top", root, func() Expr { return root.Top }},
+			tc{"InsertStmt.Exec", root, func() Expr { return root.Exec.(*CallStmt).Args[0] }},
+		)
+	}
+	{ // WITH … UPDATE TOP (n) t SET c = 1 / WITH … DELETE TOP (m) t
+		upd := &UpdateStmt{
+			Table: TableRef{Name: "t"},
+			With:  &WithClause{CTEs: []CTE{{Name: "c", Body: selectWhere("w")}}},
+			Top:   BuildIdent("n"),
+			Sets:  []Assign{{Col: "c", Expr: BuildIntLit(1)}},
+		}
+		del := &DeleteStmt{
+			Table: TableRef{Name: "t"},
+			With:  &WithClause{CTEs: []CTE{{Name: "c", Body: selectWhere("w")}}},
+			Top:   BuildIdent("m"),
+		}
+		cases = append(cases,
+			tc{"UpdateStmt.With", upd, func() Expr { return whereLhs(upd.With.CTEs[0].Body) }},
+			tc{"UpdateStmt.Top", upd, func() Expr { return upd.Top }},
+			tc{"DeleteStmt.With", del, func() Expr { return whereLhs(del.With.CTEs[0].Body) }},
+			tc{"DeleteStmt.Top", del, func() Expr { return del.Top }},
+		)
+	}
+	{ // MERGE … WHEN MATCHED AND c THEN UPDATE SET x = s … BY SOURCE AND d THEN DELETE
+		root := &MergeStmt{
+			Target: TableRef{Name: "t"},
+			Source: &FromTable{Name: "s"},
+			On:     BuildIdent("on"),
+			With:   &WithClause{CTEs: []CTE{{Name: "c", Body: selectWhere("w")}}},
+			Top:    BuildIdent("n"),
+			WhenMatched: []MergeAction{{Kind: "UPDATE", Cond: BuildIdent("c"),
+				Sets: []Assign{{Col: "x", Expr: BuildIdent("s")}}}},
+			WhenNotMatched:         []MergeAction{{Kind: "INSERT", InsertCols: []string{"x"}, InsertValues: []Expr{BuildIdent("i")}}},
+			WhenNotMatchedBySource: []MergeAction{{Kind: "DELETE", Cond: BuildIdent("d")}},
+		}
+		cases = append(cases,
+			tc{"MergeStmt.With", root, func() Expr { return whereLhs(root.With.CTEs[0].Body) }},
+			tc{"MergeStmt.Top", root, func() Expr { return root.Top }},
+			tc{"MergeStmt.WhenMatched.Cond", root, func() Expr { return root.WhenMatched[0].Cond }},
+			tc{"MergeStmt.WhenMatched.Sets", root, func() Expr { return root.WhenMatched[0].Sets[0].Expr }},
+			tc{"MergeStmt.WhenNotMatched.InsertValues", root, func() Expr { return root.WhenNotMatched[0].InsertValues[0] }},
+			tc{"MergeStmt.WhenNotMatchedBySource.Cond", root, func() Expr { return root.WhenNotMatchedBySource[0].Cond }},
+		)
+	}
+	{ // EXEC sp_executesql @s, @params, @p
+		root := &ExecuteImmediateStmt{SQL: BuildIdent("s"), ParamDecl: BuildIdent("params"), Using: []Expr{BuildIdent("p")}, SPExecuteSQL: true}
+		cases = append(cases, tc{"ExecuteImmediateStmt.ParamDecl", root, func() Expr { return root.ParamDecl }})
+	}
+	{ // RAISERROR (m, sev, st, a) / THROW n, …
+		root := &RaiseStmt{Kind: "RAISERROR", Message: BuildIdent("m"), ErrNumber: BuildIdent("n"),
+			Severity: BuildIdent("sev"), State: BuildIdent("st"), Args: []Expr{BuildIdent("a")}}
+		cases = append(cases,
+			tc{"RaiseStmt.Message", root, func() Expr { return root.Message }},
+			tc{"RaiseStmt.ErrNumber", root, func() Expr { return root.ErrNumber }},
+			tc{"RaiseStmt.Severity", root, func() Expr { return root.Severity }},
+			tc{"RaiseStmt.State", root, func() Expr { return root.State }},
+			tc{"RaiseStmt.Args", root, func() Expr { return root.Args[0] }},
+		)
+	}
+	{ // FETCH ABSOLUTE n FROM c
+		root := &FetchStmt{Cursor: "c", Direction: "ABSOLUTE", Offset: BuildIdent("n")}
+		cases = append(cases, tc{"FetchStmt.Offset", root, func() Expr { return root.Offset }})
+	}
+	{ // DECLARE @a int = d
+		root := &DeclareStmt{Decls: []PLDecl{&DeclareVar{Name: "@a", Type: &IntType{Name: "INT"}, Default: BuildIdent("d")}}}
+		cases = append(cases, tc{"DeclareStmt.Decls", root, func() Expr { return root.Decls[0].(*DeclareVar).Default }})
+	}
+	{ // CREATE INDEX … WHERE w (top level and inside a body);
+		// CREATE FUNCTION … RETURN (SELECT …); ALTER TABLE … ADD DEFAULT d FOR c
+		idx := &CreateIndex{Name: "ix", Where: BuildIdent("w")}
+		emb := &EmbeddedDDL{Stmt: &CreateIndex{Name: "ix2", Where: BuildIdent("w2")}}
+		fn := &CreateFunction{Name: "f", ReturnsInlineTable: true, Select: selectWhere("q")}
+		alt := &AlterTable{Table: TableRef{Name: "t"}, Actions: []AlterAction{{Kind: "SET_DEFAULT", DropName: "c", Default: BuildIdent("d")}}}
+		cases = append(cases,
+			tc{"CreateIndex.Where", idx, func() Expr { return idx.Where }},
+			tc{"EmbeddedDDL.Stmt", emb, func() Expr { return emb.Stmt.(*CreateIndex).Where }},
+			tc{"CreateFunction.Select", fn, func() Expr { return whereLhs(fn.Select) }},
+			tc{"AlterTable.Actions.Default", alt, func() Expr { return alt.Actions[0].Default }},
+		)
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if out := Rewrite(c.root, renameIdents()); out != c.root {
+				t.Fatalf("root identity changed: got %T", out)
+			}
+			name := identName(t, c.get())
+			if len(name) < 2 || name[:2] != "r_" {
+				t.Errorf("ident not rewritten: got %q", name)
+			}
+		})
+	}
+}
+
+// TestRewrite_TSQLLeaves checks that the T-SQL leaf nodes are handed to
+// the rewriter without a dedicated case.
+func TestRewrite_TSQLLeaves(t *testing.T) {
+	for _, n := range []Node{
+		&CommentStmt{ObjectKind: "TABLE"}, &CreateSchema{Name: "s"}, &TransactionStmt{Kind: "COMMIT"},
+		&LabelStmt{Label: "l"}, &NullStmt{Source: "SET NOCOUNT ON"},
+	} {
+		seen := false
+		Rewrite(n, func(m Node) Node {
+			if m == n {
+				seen = true
+			}
+			return m
+		})
+		if !seen {
+			t.Errorf("%T not handed to the rewriter", n)
+		}
+	}
+}

@@ -34,7 +34,11 @@ type Block struct {
 	// the translator's text path still consumes — the typed form is
 	// strictly additive during the transition window.
 	Except *ExceptionBlock
-	P      Position
+	// TryCatch is true when the block comes from T-SQL's
+	// `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`: Stmts is the TRY
+	// part and Except holds one OTHERS handler with the CATCH part.
+	TryCatch bool
+	P        Position
 }
 
 func (b *Block) Pos() Position { return b.P }
@@ -65,7 +69,13 @@ type DeclareCursor struct {
 	// Stmt is the typed cursor query when the dialect parser could parse
 	// it; nil otherwise. SelectBody keeps the raw text.
 	Stmt *SelectStmt
-	P    Position
+	// Options are T-SQL cursor options in source order, upper-cased
+	// (LOCAL, GLOBAL, FORWARD_ONLY, SCROLL, STATIC, KEYSET, DYNAMIC,
+	// FAST_FORWARD, READ_ONLY, SCROLL_LOCKS, OPTIMISTIC,
+	// TYPE_WARNING); ForUpdate is the raw `FOR UPDATE [OF …]` tail.
+	Options   []string
+	ForUpdate string
+	P         Position
 }
 
 func (d *DeclareCursor) Pos() Position { return d.P }
@@ -197,7 +207,11 @@ type CallStmt struct {
 	Schema string
 	Name   string
 	Args   []Expr
-	P      Position
+	// ReturnVar is the T-SQL return-status target of
+	// `EXEC @rc = proc …` (with its @); "" otherwise. T-SQL named and
+	// OUTPUT arguments appear in Args as *NamedArg.
+	ReturnVar string
+	P         Position
 }
 
 func (c *CallStmt) Pos() Position { return c.P }
@@ -231,7 +245,12 @@ func (o *OpenStmt) plStmtNode()   {}
 type FetchStmt struct {
 	Cursor string
 	Into   []string // variable names receiving columns
-	P      Position
+	// Direction is T-SQL's fetch orientation, upper-cased: "NEXT",
+	// "PRIOR", "FIRST", "LAST", "ABSOLUTE", "RELATIVE" ("" when omitted,
+	// which means NEXT). Offset is the n of ABSOLUTE / RELATIVE.
+	Direction string
+	Offset    Expr
+	P         Position
 }
 
 func (f *FetchStmt) Pos() Position { return f.P }
@@ -239,7 +258,10 @@ func (f *FetchStmt) plStmtNode()   {}
 
 type CloseStmt struct {
 	Cursor string
-	P      Position
+	// Deallocate is true for T-SQL's DEALLOCATE (releases the cursor
+	// definition; PG closes and forgets in one step).
+	Deallocate bool
+	P          Position
 }
 
 func (c *CloseStmt) Pos() Position { return c.P }
@@ -353,7 +375,13 @@ type ExecuteImmediateStmt struct {
 	SQL   Expr     // the dynamic SQL expression (usually a string literal or concatenation)
 	Into  []string // target variable names
 	Using []Expr   // bind arguments
-	P     Position
+	// T-SQL: SPExecuteSQL is true for `EXEC sp_executesql @stmt
+	// [, @params [, args…]]` (ParamDecl is the parameter-declaration
+	// string, Using the arguments, *NamedArg for `@p = v` / OUTPUT);
+	// false for `EXEC (expr)`.
+	SPExecuteSQL bool
+	ParamDecl    Expr
+	P            Position
 }
 
 func (e *ExecuteImmediateStmt) Pos() Position { return e.P }
@@ -373,7 +401,26 @@ type RaiseStmt struct {
 	// empty for bare RAISE or for names without a binding (those
 	// surface a separate prerequisite).
 	SQLState string
-	P        Position
+
+	// T-SQL forms. Kind is "THROW", "RAISERROR" or "PRINT" ("" for the
+	// Oracle RAISE). Level is "ERROR" (THROW, RAISERROR with a literal
+	// severity >= 11 or a non-literal one) or "NOTICE" (PRINT,
+	// RAISERROR severity <= 10).
+	//   - THROW n, msg, state: ErrNumber, Message, State. A bare THROW
+	//     (re-raise inside CATCH) leaves all three nil.
+	//   - RAISERROR (msg | n, severity, state [, args…]) [WITH …]:
+	//     Message (or ErrNumber when numeric), Severity, State, Args,
+	//     Options (LOG, NOWAIT, SETERROR).
+	//   - PRINT expr: Message.
+	Kind      string
+	Level     string
+	Message   Expr
+	ErrNumber Expr
+	Severity  Expr
+	State     Expr
+	Args      []Expr
+	Options   []string
+	P         Position
 }
 
 func (r *RaiseStmt) Pos() Position { return r.P }
@@ -423,7 +470,17 @@ func (g *GotoStmt) Pos() Position { return g.P }
 func (g *GotoStmt) plStmtNode()   {}
 
 // NullStmt — NULL; (no-op in PL/SQL; becomes empty in PL/pgSQL)
-type NullStmt struct{ P Position }
+//
+// The T-SQL parser also maps session settings and waits that have no
+// procedural effect on PG to a NullStmt: Source is their text (e.g.
+// "SET NOCOUNT ON", "WAITFOR DELAY '00:00:05'") and Warn is true when
+// dropping them changes behaviour (any SET option other than
+// NOCOUNT / XACT_ABORT ON, WAITFOR), so the translator reports it.
+type NullStmt struct {
+	Source string
+	Warn   bool
+	P      Position
+}
 
 func (n *NullStmt) Pos() Position { return n.P }
 func (n *NullStmt) plStmtNode()   {}

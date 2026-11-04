@@ -26,10 +26,23 @@ type PLBlock struct {
 	// non-empty, the writer emits `EXCEPTION <handlers>` between the block
 	// body and the closing `END;`.
 	Exception string
-	Body  []PLStmt
+	// Handlers is the typed form of the EXCEPTION section: each handler
+	// is rendered `WHEN <cond> [OR <cond>…] THEN <body>`, its body
+	// written like any other statement list. Handlers follow Exception
+	// (when both are set) under the same EXCEPTION keyword.
+	Handlers []PLHandler
+	Body     []PLStmt
 }
 
 func (*PLBlock) plStmt() {}
+
+// PLHandler is one `WHEN <conditions> THEN <body>` exception handler of a
+// PLBlock. Conditions are PL/pgSQL condition names (`OTHERS`,
+// `unique_violation`, `SQLSTATE '23505'`), emitted verbatim.
+type PLHandler struct {
+	Conditions []string
+	Body       []PLStmt
+}
 
 type PLBlockDecl struct {
 	// `<name> <type> [DEFAULT <expr>];` or `<name> CURSOR FOR <select>;`
@@ -196,6 +209,17 @@ type PLCursorOp struct {
 
 func (*PLCursorOp) plStmt() {}
 
+// PLGetDiagnostics renders `GET DIAGNOSTICS <Target> = <Item>;` — e.g.
+// Item "ROW_COUNT" right after a DML statement, the PL/pgSQL way to read
+// what T-SQL exposes as @@ROWCOUNT. Target is the already-rendered
+// variable name; an empty Item means ROW_COUNT.
+type PLGetDiagnostics struct {
+	Target string
+	Item   string
+}
+
+func (*PLGetDiagnostics) plStmt() {}
+
 // WritePLpgSQL renders a PLBlock as PL/pgSQL text suitable for the body of
 // CreateFunction / CreateProcedure (i.e. what goes between $body$ ... $body$).
 func WritePLpgSQL(b *PLBlock) string {
@@ -221,8 +245,20 @@ func writePLBlock(b *strings.Builder, blk *PLBlock, depth int) {
 	for _, s := range blk.Body {
 		writePLStmt(b, s, depth+1)
 	}
-	if strings.TrimSpace(blk.Exception) != "" {
+	hasText := strings.TrimSpace(blk.Exception) != ""
+	if hasText {
 		fmt.Fprintf(b, "%sEXCEPTION\n%s\n", pfx, blk.Exception)
+	}
+	if len(blk.Handlers) > 0 {
+		if !hasText {
+			fmt.Fprintf(b, "%sEXCEPTION\n", pfx)
+		}
+		for _, h := range blk.Handlers {
+			fmt.Fprintf(b, "%s  WHEN %s THEN\n", pfx, strings.Join(h.Conditions, " OR "))
+			for _, s := range h.Body {
+				writePLStmt(b, s, depth+2)
+			}
+		}
 	}
 	fmt.Fprintf(b, "%sEND;\n", pfx)
 }
@@ -234,6 +270,12 @@ func writePLStmt(b *strings.Builder, s PLStmt, depth int) {
 		writePLBlock(b, x, depth)
 	case *PLAssign:
 		fmt.Fprintf(b, "%s%s := %s;\n", pfx, x.Target, x.Expr)
+	case *PLGetDiagnostics:
+		item := x.Item
+		if item == "" {
+			item = "ROW_COUNT"
+		}
+		fmt.Fprintf(b, "%sGET DIAGNOSTICS %s = %s;\n", pfx, x.Target, item)
 	case *PLIf:
 		for i, br := range x.Branches {
 			kw := "IF"

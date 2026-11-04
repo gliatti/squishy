@@ -420,7 +420,7 @@ func (d *Deps) listInstanceMigrations(w http.ResponseWriter, r *http.Request) {
 
 func validKind(k string) bool {
 	switch k {
-	case "mysql", "mariadb", "oracle", "oracle19", "db2", "db2zos":
+	case "mysql", "mariadb", "oracle", "oracle19", "db2", "db2zos", "sqlserver":
 		return true
 	}
 	return false
@@ -484,6 +484,11 @@ func openSourceForInstance(ctx context.Context, inst *project.Instance) (*sql.DB
 		return connection.OpenOracle(ctx, p)
 	case "db2", "db2zos":
 		return connection.OpenDB2(ctx, p)
+	case "sqlserver":
+		// Opened on the instance's login database (master by default):
+		// discovery lists every database from there, and InspectSQLServer
+		// scopes its own connections to the migrated database.
+		return connection.OpenSQLServer(ctx, p)
 	}
 	return nil, errors.New("unsupported source kind: " + inst.Kind)
 }

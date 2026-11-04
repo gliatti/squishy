@@ -51,6 +51,7 @@ func Walk(v Visitor, n Node) {
 	case *BinaryExpr:
 		Walk(v, x.Lhs)
 		Walk(v, x.Rhs)
+		Walk(v, x.Escape)
 	case *UnaryExpr:
 		Walk(v, x.Rhs)
 	case *ParenExpr:
@@ -114,6 +115,16 @@ func Walk(v Visitor, n Node) {
 		if x.Type != nil {
 			Walk(v, x.Type)
 		}
+		Walk(v, x.ConvertStyle)
+	case *CollateExpr:
+		Walk(v, x.Expr)
+	case *MethodCall:
+		Walk(v, x.Target)
+		for _, a := range x.Args {
+			Walk(v, a)
+		}
+	case *NamedArg:
+		Walk(v, x.Value)
 	// --- DML statements ---
 	case *SelectStmt:
 		if x.With != nil {
@@ -121,6 +132,7 @@ func Walk(v Visitor, n Node) {
 				walkSelect(v, c.Body)
 			}
 		}
+		Walk(v, x.Top)
 		for _, c := range x.Cols {
 			Walk(v, c.Expr)
 		}
@@ -148,7 +160,22 @@ func Walk(v Visitor, n Node) {
 		Walk(v, x.Left)
 		Walk(v, x.Right)
 		Walk(v, x.On)
+	case *FromFunc:
+		Walk(v, x.Func)
+	case *FromPivot:
+		Walk(v, x.Source)
+		Walk(v, x.Agg)
+	case *FromValues:
+		for _, row := range x.Rows {
+			for _, e := range row {
+				Walk(v, e)
+			}
+		}
+	case *FromXMLTable:
+		Walk(v, x.Passing)
 	case *InsertStmt:
+		walkWith(v, x.With)
+		Walk(v, x.Top)
 		for _, row := range x.Values {
 			for _, e := range row {
 				Walk(v, e)
@@ -166,7 +193,10 @@ func Walk(v Visitor, n Node) {
 		for _, ri := range x.Returning {
 			Walk(v, ri.Expr)
 		}
+		Walk(v, x.Exec)
 	case *UpdateStmt:
+		walkWith(v, x.With)
+		Walk(v, x.Top)
 		for _, a := range x.Sets {
 			Walk(v, a.Expr)
 		}
@@ -178,6 +208,8 @@ func Walk(v Visitor, n Node) {
 			Walk(v, ri.Expr)
 		}
 	case *DeleteStmt:
+		walkWith(v, x.With)
+		Walk(v, x.Top)
 		for _, f := range x.Using {
 			Walk(v, f)
 		}
@@ -186,6 +218,8 @@ func Walk(v Visitor, n Node) {
 			Walk(v, ri.Expr)
 		}
 	case *MergeStmt:
+		walkWith(v, x.With)
+		Walk(v, x.Top)
 		if x.Source != nil {
 			Walk(v, x.Source)
 		}
@@ -196,12 +230,23 @@ func Walk(v Visitor, n Node) {
 		for _, ma := range x.WhenNotMatched {
 			walkMergeAction(v, ma)
 		}
+		for _, ma := range x.WhenNotMatchedBySource {
+			walkMergeAction(v, ma)
+		}
 
 	// --- DDL nodes carrying typed bodies ---
 	case *CreateView:
 		walkSelect(v, x.Select)
 	case *CreateEvent:
 		Walk(v, x.AtExpr)
+	case *CreateFunction:
+		walkSelect(v, x.Select)
+	case *CreateIndex:
+		Walk(v, x.Where)
+	case *AlterTable:
+		for _, a := range x.Actions {
+			Walk(v, a.Default)
+		}
 
 	// --- PL (procedural) declarations and statements ---
 	case *Block:
@@ -255,6 +300,28 @@ func Walk(v Visitor, n Node) {
 		}
 	case *SelectInto:
 		walkSelect(v, x.Stmt)
+	case *ExecuteImmediateStmt:
+		Walk(v, x.SQL)
+		for _, e := range x.Using {
+			Walk(v, e)
+		}
+		Walk(v, x.ParamDecl)
+	case *RaiseStmt:
+		Walk(v, x.Message)
+		Walk(v, x.ErrNumber)
+		Walk(v, x.Severity)
+		Walk(v, x.State)
+		for _, e := range x.Args {
+			Walk(v, e)
+		}
+	case *FetchStmt:
+		Walk(v, x.Offset)
+	case *DeclareStmt:
+		for _, d := range x.Decls {
+			Walk(v, d)
+		}
+	case *EmbeddedDDL:
+		Walk(v, x.Stmt)
 	}
 }
 
@@ -263,6 +330,16 @@ func Walk(v Visitor, n Node) {
 func walkSelect(v Visitor, s *SelectStmt) {
 	if s != nil {
 		Walk(v, s)
+	}
+}
+
+// walkWith walks the CTE bodies of a WITH prelude.
+func walkWith(v Visitor, w *WithClause) {
+	if w == nil {
+		return
+	}
+	for _, c := range w.CTEs {
+		walkSelect(v, c.Body)
 	}
 }
 

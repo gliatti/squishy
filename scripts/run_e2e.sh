@@ -40,6 +40,15 @@ if [[ "${SQUISHY_E2E_DB2:-0}" == "1" ]]; then
   dc --profile db2 up -d --wait db2-sample
 fi
 
+# Optional SQL Server source — image is ~2.3 GB, boot ~30 s, then
+# sqlserver-init loads test/fixtures/sqlserver_{sample,seed}.sql and only
+# turns healthy once the load succeeded. Set SQUISHY_E2E_SQLSERVER=1 to
+# include the SQL Server e2e scenario.
+if [[ "${SQUISHY_E2E_SQLSERVER:-0}" == "1" ]]; then
+  echo "[e2e] start sqlserver-sample + load the squishy_sample fixture"
+  dc --profile sqlserver up -d --wait sqlserver-sample sqlserver-init
+fi
+
 echo "[e2e] apply migrations explicitly"
 dc --profile e2e run --rm migrate
 
@@ -47,6 +56,9 @@ echo "[e2e] start API + wait for /readyz healthcheck"
 dc up -d --wait api
 
 echo "[e2e] run integration tests"
-dc --profile e2e run --rm -e SQUISHY_E2E_DB2="${SQUISHY_E2E_DB2:-0}" e2e
+dc --profile e2e run --rm \
+  -e SQUISHY_E2E_DB2="${SQUISHY_E2E_DB2:-0}" \
+  -e SQUISHY_E2E_SQLSERVER="${SQUISHY_E2E_SQLSERVER:-0}" \
+  e2e
 
 echo "[e2e] done — leaving containers up for inspection. Tear down with: make e2e-down"

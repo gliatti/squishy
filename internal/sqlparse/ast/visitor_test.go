@@ -148,3 +148,39 @@ func (p pruneIf) Visit(n Node) Visitor {
 	}
 	return p
 }
+
+// TestWalk_ReachesTSQLSlots checks that Walk enumerates the children of
+// the T-SQL nodes and of the T-SQL fields of existing nodes.
+func TestWalk_ReachesTSQLSlots(t *testing.T) {
+	root := &Block{Stmts: []PLStmt{
+		&DeclareStmt{Decls: []PLDecl{&DeclareVar{Name: "@a", Default: BuildIdent("decl")}}},
+		&RaiseStmt{Kind: "THROW", ErrNumber: BuildIdent("num"), Message: BuildIdent("msg"), State: BuildIdent("st")},
+		&ExecuteImmediateStmt{SQL: BuildIdent("sql"), ParamDecl: BuildIdent("params"), Using: []Expr{&NamedArg{Name: "@p", Value: BuildIdent("named")}}},
+		&FetchStmt{Cursor: "c", Offset: BuildIdent("off")},
+		&EmbeddedDDL{Stmt: &CreateIndex{Name: "ix", Where: BuildIdent("filter")}},
+		&InsertStmt{Table: TableRef{Name: "t"}, Top: BuildIdent("itop"), Exec: &CallStmt{Name: "p", Args: []Expr{BuildIdent("execarg")}}},
+		&SelectStmt{
+			Top: BuildIdent("top"),
+			Cols: []SelectItem{
+				{Expr: &CollateExpr{Expr: BuildIdent("coll")}},
+				{Expr: &MethodCall{Target: BuildIdent("target"), Args: []Expr{BuildIdent("marg")}}},
+				{Expr: &CastExpr{Expr: BuildIdent("conv"), ConvertStyle: BuildIdent("style")}},
+				{Expr: &BinaryExpr{Op: "LIKE", Lhs: BuildIdent("l"), Rhs: BuildIdent("r"), Escape: BuildIdent("esc")}},
+			},
+			From: []FromItem{
+				&FromFunc{Func: BuildFuncCall("f", BuildIdent("farg"))},
+				&FromPivot{Source: &FromTable{Name: "s"}, Agg: BuildFuncCall("SUM", BuildIdent("agg"))},
+				&FromValues{Rows: [][]Expr{{BuildIdent("row")}}},
+			},
+		},
+		&MergeStmt{Target: TableRef{Name: "t"}, Source: &FromTable{Name: "s"}, On: BuildIdent("on"),
+			WhenNotMatchedBySource: []MergeAction{{Kind: "DELETE", Cond: BuildIdent("bysrc")}}},
+	}}
+	seen := collectIdents(root)
+	for _, n := range []string{"decl", "num", "msg", "st", "sql", "params", "named", "off", "filter",
+		"itop", "execarg", "top", "coll", "target", "marg", "conv", "style", "esc", "farg", "agg", "row", "bysrc"} {
+		if !seen[n] {
+			t.Errorf("Walk did not reach %q", n)
+		}
+	}
+}

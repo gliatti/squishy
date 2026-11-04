@@ -45,8 +45,8 @@ type mysqlDialect struct{}
 
 func MySQLSource() SourceDialect { return mysqlDialect{} }
 
-func (mysqlDialect) Kind() string            { return "mysql" }
-func (mysqlDialect) Quote(id string) string  { return "`" + strings.ReplaceAll(id, "`", "``") + "`" }
+func (mysqlDialect) Kind() string               { return "mysql" }
+func (mysqlDialect) Quote(id string) string     { return "`" + strings.ReplaceAll(id, "`", "``") + "`" }
 func (mysqlDialect) PlaceholderAt(n int) string { return "?" }
 func (d mysqlDialect) Qualify(schema, name string) string {
 	if schema == "" {
@@ -207,6 +207,10 @@ func (d oracleDialect) SelectRangeQuery(schema, table string, cols []string, ran
 		joinQuoted(d, cols), d.Qualify(schema, table),
 		d.Quote(rangeCol), d.PlaceholderAt(1), d.PlaceholderAt(2), d.Quote(rangeCol))
 }
+
+// OffsetArgsFirst: OFFSET :1 ROWS FETCH NEXT :2 ROWS binds (offset, limit).
+func (oracleDialect) OffsetArgsFirst() bool { return true }
+
 func (d oracleDialect) SelectOffsetQuery(schema, table string, cols []string) string {
 	// Oracle 12c+ ISO-syntax. Arg order: 1=offset, 2=limit — so the caller
 	// must pass (low["offset"], high["limit"]) in that order.
@@ -304,6 +308,12 @@ func (d db2Dialect) SelectOffsetQuery(schema, table string, cols []string) strin
 		d.PlaceholderAt(1), d.PlaceholderAt(2))
 }
 
+// OffsetArgsFirst: the ISO OFFSET ? ROWS FETCH NEXT ? ROWS form above
+// binds (offset, limit). Before this method the copier bound DB2 like
+// MySQL, (limit, offset), so the first OFFSET batch of a DB2 table
+// without a single numeric PK read `OFFSET 10000 ROWS FETCH NEXT 0 ROWS`.
+func (db2Dialect) OffsetArgsFirst() bool { return true }
+
 // ---- Catalog queries — branches LUW (SYSCAT.*) vs z/OS (SYSIBM.*) ----
 
 func (d db2Dialect) ListColumnsQuery() string {
@@ -366,6 +376,266 @@ func (db2Dialect) IsNumericDataType(dt string) bool {
 	return false
 }
 
+// ---------------------------------------------------------------------------
+// Microsoft SQL Server dialect
+// ---------------------------------------------------------------------------
+
+// sqlserverDialect reads a SQL Server database. The pool is opened on the
+// migrated database (connection Params.Database = the discovered
+// database), so the schema argument everywhere is the T-SQL schema
+// (dbo, Sales, …) and INFORMATION_SCHEMA / OBJECT_ID resolve inside that
+// database.
+//
+// exprs, when set (see ForColumns), maps a copied column to the
+// server-side conversion that replaces it in the SELECT list.
+type sqlserverDialect struct {
+	exprs map[string]string
+}
+
+func SQLServerSource() SourceDialect { return sqlserverDialect{} }
+
+func (sqlserverDialect) Kind() string { return "sqlserver" }
+
+// Quote brackets the identifier, doubling a closing bracket — the
+// QUOTENAME rule — so it works whatever QUOTED_IDENTIFIER is set to.
+func (sqlserverDialect) Quote(id string) string {
+	return "[" + strings.ReplaceAll(id, "]", "]]") + "]"
+}
+
+// go-mssqldb binds positional args to @p1, @p2, … in order.
+func (sqlserverDialect) PlaceholderAt(n int) string { return fmt.Sprintf("@p%d", n) }
+
+func (d sqlserverDialect) Qualify(schema, name string) string {
+	if schema == "" {
+		return d.Quote(name)
+	}
+	return d.Quote(schema) + "." + d.Quote(name)
+}
+
+// sqlserverSelectExpr is the SELECT-list conversion of a column whose
+// driver value the copier cannot load as is: the CLR types come back as
+// their serialized bytes and sql_variant has no stable Go value, so the
+// server renders them as text — hierarchyid as its path ('/1/3/'),
+// sql_variant as nvarchar. geography / geometry depend on the target
+// column (targetUDT, its PG udt_name): into PostGIS they are read as
+// their SRID (4 bytes, big-endian) followed by their WKB with Z and M
+// (AsBinaryZM, SQL Server 2022), which sqlserverValue turns into the EWKB
+// the binary COPY sends; into a text placeholder (no PostGIS) as EWKT
+// ('SRID=4326;POINT (2 1)': the SRID, which WKT lacks, then AsTextZM).
+// A NULL value stays NULL (the concatenation yields NULL). Every other
+// type is selected as is. The conversion keeps the column name (AS [col]).
+func sqlserverSelectExpr(quoted, dataType, targetUDT string) string {
+	switch strings.ToLower(dataType) {
+	case "hierarchyid":
+		return "CAST(" + quoted + " AS nvarchar(4000)) AS " + quoted
+	case "sql_variant":
+		return sqlserverVariantText(quoted) + " AS " + quoted
+	case "geography", "geometry":
+		if targetUDT == "geography" || targetUDT == "geometry" {
+			return "CAST(" + quoted + ".STSrid AS binary(4)) + " + quoted + ".AsBinaryZM() AS " + quoted
+		}
+		return "N'SRID=' + CAST(" + quoted + ".STSrid AS nvarchar(11)) + N';' + " + quoted + ".AsTextZM() AS " + quoted
+	}
+	return ""
+}
+
+// ForColumns returns the dialect to SELECT cols of schema.table with: the
+// columns needing a server-side conversion (sqlserverSelectExpr) are
+// looked up in INFORMATION_SCHEMA.COLUMNS (ColumnTypes). The copier only
+// calls it for a batch whose payload lacks the types resolved at
+// partition time (PartitionPlan.SourceTypes → CopyOpts.SourceTypes).
+func (d sqlserverDialect) ForColumns(ctx context.Context, db *sql.DB, schema, table string, cols, targetTypes []string) (SourceDialect, error) {
+	types, err := d.ColumnTypes(ctx, db, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	return d.withTypes(cols, types, targetTypes), nil
+}
+
+// ColumnTypes reads the DATA_TYPE of the table's columns that
+// sqlserverSelectExpr converts (DATA_TYPE is the base type, so alias
+// types convert like their base). The other columns are left out, which
+// keeps the map small enough to ride in every copy_batch payload.
+func (d sqlserverDialect) ColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map[string]string, error) {
+	rows, err := db.QueryContext(ctx, sqlserverColumnTypesQuery, schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("column types: %w", err)
+	}
+	defer rows.Close()
+	types := map[string]string{}
+	for rows.Next() {
+		var n, dt string
+		if err := rows.Scan(&n, &dt); err != nil {
+			return nil, err
+		}
+		// A type converted for one target is converted for every target
+		// (geography / geometry only pick their form from it), so the
+		// empty target is enough to tell.
+		if sqlserverSelectExpr(d.Quote(n), dt, "") != "" {
+			types[n] = dt
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return types, nil
+}
+
+// sqlserverColumnTypesQuery lists the columns of @p1.@p2 with their type.
+const sqlserverColumnTypesQuery = `
+		SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+		 WHERE TABLE_SCHEMA = @p1 AND TABLE_NAME = @p2`
+
+// WithColumnTypes is ForColumns with types already read by ColumnTypes.
+func (d sqlserverDialect) WithColumnTypes(cols []string, types map[string]string, targetTypes []string) SourceDialect {
+	return d.withTypes(cols, types, targetTypes)
+}
+
+// withTypes is ForColumns without the catalog lookup.
+func (d sqlserverDialect) withTypes(cols []string, types map[string]string, targetTypes []string) sqlserverDialect {
+	out := sqlserverDialect{}
+	for i, c := range cols {
+		target := ""
+		if i < len(targetTypes) {
+			target = targetTypes[i]
+		}
+		if e := sqlserverSelectExpr(d.Quote(c), types[c], target); e != "" {
+			if out.exprs == nil {
+				out.exprs = map[string]string{}
+			}
+			out.exprs[c] = e
+		}
+	}
+	return out
+}
+
+// selectList renders the SELECT list: quoted columns, or their conversion.
+func (d sqlserverDialect) selectList(cols []string) string {
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		if e, ok := d.exprs[c]; ok {
+			parts[i] = e
+			continue
+		}
+		parts[i] = d.Quote(c)
+	}
+	return strings.Join(parts, ",")
+}
+
+// CountQuery uses COUNT_BIG: COUNT(*) is an int and overflows past
+// 2^31-1 rows.
+func (d sqlserverDialect) CountQuery(schema, table string) string {
+	return "SELECT COUNT_BIG(*) FROM " + d.Qualify(schema, table)
+}
+func (d sqlserverDialect) MinMaxQuery(schema, table, pkCol string) string {
+	return fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s",
+		d.Quote(pkCol), d.Quote(pkCol), d.Qualify(schema, table))
+}
+func (d sqlserverDialect) SelectRangeQuery(schema, table string, cols []string, rangeCol string) string {
+	return fmt.Sprintf("SELECT %s FROM %s WHERE %s BETWEEN %s AND %s ORDER BY %s",
+		d.selectList(cols), d.Qualify(schema, table),
+		d.Quote(rangeCol), d.PlaceholderAt(1), d.PlaceholderAt(2), d.Quote(rangeCol))
+}
+
+// SelectOffsetQuery is the key-less fallback: OFFSET … FETCH requires an
+// ORDER BY in T-SQL and `(SELECT NULL)` satisfies it without a sort, but
+// the row order is then not guaranteed between two batches. The copier
+// therefore prefers SelectOffsetOrderedQuery (ORDER BY the primary key)
+// whenever the table has one; this form only serves heaps without a
+// primary key. Arg order: 1=offset, 2=limit (like Oracle).
+// OffsetArgsFirst: OFFSET @p1 ROWS FETCH NEXT @p2 ROWS binds (offset, limit).
+func (sqlserverDialect) OffsetArgsFirst() bool { return true }
+
+func (d sqlserverDialect) SelectOffsetQuery(schema, table string, cols []string) string {
+	return fmt.Sprintf("SELECT %s FROM %s ORDER BY (SELECT NULL) OFFSET %s ROWS FETCH NEXT %s ROWS ONLY",
+		d.selectList(cols), d.Qualify(schema, table),
+		d.PlaceholderAt(1), d.PlaceholderAt(2))
+}
+
+// SelectOffsetOrderedQuery pages in primary-key order, which makes the
+// OFFSET batches disjoint and complete (a composite or non-numeric key
+// cannot be split by range). The key columns are qualified with the
+// table so ORDER BY sorts on the stored column (index order) even when
+// the SELECT list carries a converted column under the same name.
+// Arg order: 1=offset, 2=limit.
+func (d sqlserverDialect) SelectOffsetOrderedQuery(schema, table string, cols, orderBy []string) string {
+	t := d.Qualify(schema, table)
+	keys := make([]string, len(orderBy))
+	for i, c := range orderBy {
+		keys[i] = t + "." + d.Quote(c)
+	}
+	return fmt.Sprintf("SELECT %s FROM %s ORDER BY %s OFFSET %s ROWS FETCH NEXT %s ROWS ONLY",
+		d.selectList(cols), t, strings.Join(keys, ","),
+		d.PlaceholderAt(1), d.PlaceholderAt(2))
+}
+
+// ListColumnsQuery is the default copy column list (used when a copy
+// does not carry its own, CopyOpts.Columns). It leaves out:
+//   - computed columns (sys.computed_columns, PERSISTED or not): PG
+//     either computes them itself (GENERATED ALWAYS AS … STORED, which
+//     COPY must not write) or, when the translator refuses the
+//     expression, the planner passes an explicit column list that reads
+//     them from the source (PGTable.CopyColumns);
+//   - rowversion / timestamp (DATA_TYPE 'timestamp'): an engine-managed
+//     row version, meaningless once copied to PG;
+//   - geography, geometry: whether they land in PostGIS or in text is
+//     the translator's call (PostGIS presence), and the WKT the copier
+//     can read loses the SRID — an explicit column list opts in.
+//
+// hierarchyid and sql_variant stay in the list: the copier selects them
+// converted to text server-side (see ForColumns), which is what they map
+// to. Dropping them would lose data — and fail the copy outright when
+// the column is the primary key (AdventureWorks Production.Document).
+// Alias types report their base type in INFORMATION_SCHEMA.COLUMNS
+// (DATA_TYPE), so an alias of geography is filtered like the base type.
+func (sqlserverDialect) ListColumnsQuery() string {
+	return `
+		SELECT c.COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS c
+		 WHERE c.TABLE_SCHEMA = @p1 AND c.TABLE_NAME = @p2
+		   AND NOT EXISTS (
+		         SELECT 1 FROM sys.computed_columns cc
+		          WHERE cc.object_id = OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME))
+		            AND cc.name = c.COLUMN_NAME)
+		   AND c.DATA_TYPE NOT IN ('timestamp','rowversion','geography','geometry')
+		 ORDER BY c.ORDINAL_POSITION`
+}
+
+// ColumnDataTypeQuery reports a decimal/numeric column with a fractional
+// scale as 'decimal_scaled': the range partitioner splits on integer
+// bounds (BETWEEN 1 AND 10000, then 10001 …), which would skip a key of
+// 10000.5, so such keys must take the OFFSET path.
+func (sqlserverDialect) ColumnDataTypeQuery() string {
+	return `SELECT CASE WHEN DATA_TYPE IN ('decimal','numeric') AND NUMERIC_SCALE > 0
+	                    THEN 'decimal_scaled' ELSE DATA_TYPE END
+	          FROM INFORMATION_SCHEMA.COLUMNS
+	         WHERE TABLE_SCHEMA = @p1 AND TABLE_NAME = @p2 AND COLUMN_NAME = @p3`
+}
+func (sqlserverDialect) PKColumnsQuery() string {
+	return `SELECT k.COLUMN_NAME
+	          FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS t
+	          JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k
+	            ON k.CONSTRAINT_SCHEMA = t.CONSTRAINT_SCHEMA
+	           AND k.CONSTRAINT_NAME = t.CONSTRAINT_NAME
+	           AND k.TABLE_SCHEMA = t.TABLE_SCHEMA
+	           AND k.TABLE_NAME = t.TABLE_NAME
+	         WHERE t.TABLE_SCHEMA = @p1 AND t.TABLE_NAME = @p2
+	           AND t.CONSTRAINT_TYPE = 'PRIMARY KEY'
+	         ORDER BY k.ORDINAL_POSITION`
+}
+
+// IsNumericDataType decides whether a single-column key can be split by
+// integer ranges. Only exact integers and scale-0 decimals qualify:
+// money / smallmoney / float / real keys hold fractional values the
+// integer bounds would skip (and MIN/MAX of a float does not scan into
+// the partitioner's int64), so they take the OFFSET path.
+func (sqlserverDialect) IsNumericDataType(dt string) bool {
+	switch strings.ToLower(dt) {
+	case "tinyint", "smallint", "int", "bigint", "decimal", "numeric":
+		return true
+	}
+	return false
+}
+
 // joinQuoted quotes each column and joins with commas, for SELECT list.
 func joinQuoted(d SourceDialect, cols []string) string {
 	parts := make([]string, 0, len(cols))
@@ -419,4 +689,95 @@ func sourcePKColumns(ctx context.Context, db *sql.DB, d SourceDialect, schema, t
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// uniqueKeyDialect is implemented by the keyed-OFFSET dialects that can
+// order a table without primary key by one of its unique indexes.
+type uniqueKeyDialect interface {
+	// UniqueKeyColumnsQuery lists, in key order, the columns of a unique,
+	// unfiltered, enabled index of schema.table (@p1, @p2); no row when
+	// the table has none.
+	UniqueKeyColumnsQuery() string
+}
+
+// UniqueKeyColumnsQuery picks the first unique index (a UNIQUE constraint
+// is one) that covers every row — not filtered, not disabled, rowstore —
+// of a table without primary key. Its key orders the rows totally under
+// the index collation (two rows the collation calls equal cannot both be
+// in a unique index), so OFFSET pages over it are disjoint and complete.
+func (sqlserverDialect) UniqueKeyColumnsQuery() string {
+	return `
+		SELECT c.name
+		  FROM sys.index_columns ic
+		  JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+		 WHERE ic.object_id = OBJECT_ID(QUOTENAME(@p1) + '.' + QUOTENAME(@p2))
+		   AND ic.key_ordinal > 0
+		   AND ic.index_id = (
+		         SELECT TOP 1 i.index_id FROM sys.indexes i
+		          WHERE i.object_id = ic.object_id AND i.is_unique = 1
+		            AND i.has_filter = 0 AND i.is_disabled = 0 AND i.type IN (1, 2)
+		          ORDER BY i.index_id)
+		 ORDER BY ic.key_ordinal`
+}
+
+// sourceOrderKey returns the columns that order every row of a source
+// table for keyed OFFSET paging: its primary key, else (uniqueKeyDialect)
+// the key of a unique index; nil when there is neither.
+func sourceOrderKey(ctx context.Context, db *sql.DB, d SourceDialect, schema, table string) ([]string, error) {
+	pk, err := sourcePKColumns(ctx, db, d, schema, table)
+	if err != nil || len(pk) > 0 {
+		return pk, err
+	}
+	ud, ok := d.(uniqueKeyDialect)
+	if !ok {
+		return nil, nil
+	}
+	rows, err := db.QueryContext(ctx, ud.UniqueKeyColumnsQuery(), schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// sqlserverVariantText renders a sql_variant column as the lossless text
+// of its value, chosen by its base type (SQL_VARIANT_PROPERTY): a plain
+// CAST to nvarchar uses style 0, which drops the seconds of a datetime
+// ('May  1 2024  1:45PM'), keeps 6 digits of a float and 2 decimals of a
+// money, and reads binary bytes as characters. Each branch first casts
+// the variant to its base type, then converts it with the style that
+// keeps every digit: ISO 8601 (126) for date/times, 17 significant
+// digits (3) for float / real, 4 decimals (2) for money, 0x… hex (1) for
+// binary; other types (strings, integers, decimals, uniqueidentifier)
+// convert exactly with a CAST to nvarchar(max), which also never cuts a
+// string past 4000 characters.
+func sqlserverVariantText(quoted string) string {
+	base := "CAST(SQL_VARIANT_PROPERTY(" + quoted + ", 'BaseType') AS sysname)"
+	conv := func(typ, style string) string {
+		return "CONVERT(nvarchar(max), CAST(" + quoted + " AS " + typ + "), " + style + ")"
+	}
+	return "CASE " + base +
+		" WHEN 'datetime' THEN " + conv("datetime", "126") +
+		" WHEN 'smalldatetime' THEN " + conv("smalldatetime", "126") +
+		" WHEN 'datetime2' THEN " + conv("datetime2(7)", "126") +
+		" WHEN 'datetimeoffset' THEN " + conv("datetimeoffset(7)", "126") +
+		" WHEN 'date' THEN " + conv("date", "23") +
+		" WHEN 'time' THEN CAST(CAST(" + quoted + " AS time(7)) AS nvarchar(max))" +
+		" WHEN 'float' THEN " + conv("float", "3") +
+		" WHEN 'real' THEN " + conv("real", "3") +
+		" WHEN 'money' THEN " + conv("money", "2") +
+		" WHEN 'smallmoney' THEN " + conv("smallmoney", "2") +
+		" WHEN 'binary' THEN " + conv("varbinary(8000)", "1") +
+		" WHEN 'varbinary' THEN " + conv("varbinary(8000)", "1") +
+		" WHEN 'varchar' THEN CAST(CAST(" + quoted + " AS varchar(8000)) AS nvarchar(max))" +
+		" WHEN 'char' THEN CAST(CAST(" + quoted + " AS varchar(8000)) AS nvarchar(max))" +
+		" ELSE CAST(" + quoted + " AS nvarchar(max)) END"
 }

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <em>Web UI + Go API for piloting <strong>MySQL / MariaDB / Oracle / IBM DB2 → PostgreSQL</strong> migrations,
+  <em>Web UI + Go API for piloting <strong>MySQL / MariaDB / Oracle / IBM DB2 / SQL Server → PostgreSQL</strong> migrations,
   with a Postgres-backed job queue, real-time SSE monitoring, per-batch error recovery,
   and an MCP server for agentic clients.</em>
 </p>
@@ -17,6 +17,7 @@
   <img alt="MariaDB" src="https://img.shields.io/badge/MariaDB-11-003545?logo=mariadb&logoColor=white"/>
   <img alt="Oracle" src="https://img.shields.io/badge/Oracle-19c%20%2F%2023ai-F80000?logo=oracle&logoColor=white"/>
   <img alt="IBM DB2" src="https://img.shields.io/badge/IBM%20DB2-11.5%20LUW-052FAD?logo=ibm&logoColor=white"/>
+  <img alt="SQL Server" src="https://img.shields.io/badge/SQL%20Server-2016--2022-CC2927?logo=microsoftsqlserver&logoColor=white"/>
   <a href="https://www.docker.com/"><img alt="Docker" src="https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white"/></a>
   <a href="LICENSE"><img alt="License: PostgreSQL" src="https://img.shields.io/badge/license-PostgreSQL-336791"/></a>
 </p>
@@ -39,7 +40,8 @@
 - **Exhaustive translator**: numeric / string / temporal / spatial types,
   ENUM / SET, AUTO_INCREMENT → IDENTITY, ON UPDATE CURRENT_TIMESTAMP →
   trigger, generated columns, views, triggers, procedures, functions,
-  MySQL events → pg_cron snippets, Oracle PL/SQL packages, DB2 routines.
+  MySQL events → pg_cron snippets, Oracle PL/SQL packages, DB2 routines,
+  T-SQL procedures / functions / triggers (SQL Server schemas preserved).
 - **Per-table × 10 000-row batches**, idempotent `COPY FROM STDIN`,
   individual batch retry, orphan-lock recovery.
 - **MCP server** (`mcp-server/`) exposing the same workflow to agentic
@@ -60,12 +62,14 @@ open http://localhost:5173
 The `mysql-sample` container auto-loads an exhaustive fixture
 (`test/fixtures/mysql_sample.sql` + `mysql_seed.sql`) covering every
 MySQL type/feature the translator handles. MariaDB, Oracle 23ai, Oracle
-19c and DB2 LUW samples are opt-in via Compose profiles:
+19c, DB2 LUW and SQL Server 2022 samples are opt-in via Compose profiles:
 
 ```bash
 make oracle-up       # Oracle 23ai (profile: oracle)
 make oracle19-up     # Oracle 19c   (profile: oracle19, requires container-registry.oracle.com login)
 make db2-up          # DB2 11.5 LUW (profile: db2, ~4-5 min first boot, EULA accepted)
+make sqlserver-up    # SQL Server 2022 Developer (profile: sqlserver) + fixture database squishy_sample
+make sqlserver-load-dumps   # + Northwind, pubs, AdventureWorks (fetch with scripts/fetch_dumps.sh)
 ```
 
 End-to-end gate (unit tests + Compose stack + migration scenarios):
@@ -73,6 +77,7 @@ End-to-end gate (unit tests + Compose stack + migration scenarios):
 ```bash
 make e2e             # MySQL flow by default
 SQUISHY_E2E_DB2=1 make e2e   # also runs the DB2 scenario
+SQUISHY_E2E_SQLSERVER=1 make e2e   # also runs the SQL Server scenario
 make e2e-down        # tear the e2e stack down
 ```
 
@@ -81,7 +86,7 @@ The e2e run uses its own Compose project (`squishy-e2e`, overlay
 the `make up` stack nor collides with ports held by other local stacks. The
 `make up` host ports can be moved with `SQUISHY_PG_HOST_PORT`,
 `SQUISHY_MYSQL_HOST_PORT`, `SQUISHY_API_HOST_PORT`, `SQUISHY_WEB_HOST_PORT`
-(and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,MCP}_HOST_PORT`). They are bound
+(and `SQUISHY_{MARIADB,ORACLE,ORACLE19,DB2,SQLSERVER,MCP}_HOST_PORT`). They are bound
 to `127.0.0.1` by default; set `SQUISHY_BIND_ADDR=0.0.0.0` to expose them on
 the network (then also set `SQUISHY_API_TOKEN`).
 
@@ -103,6 +108,7 @@ the network (then also set `SQUISHY_API_TOKEN`).
   │ MariaDB 11  │◀───read────────┤  └─ connection/ per-run pool cache   │
   │ Oracle 19c/23ai             │                                       │
   │ DB2 11.5 LUW│                │                                      │
+  │ SQL Server  │                │                                      │
   └─────────────┘                │                                      │
   ┌─────────────┐                │                                      │
   │ Postgres 17 │◀──app DB───────┤  squishy.{projects,instances,        │
@@ -134,8 +140,8 @@ internal/
 │   └── migrations/   NNNNNN_name.up/.down SQL files (one ledger: squishy_meta._migrations)
 ├── project/          domain: projects / instances / migrations
 ├── connection/       source/target pool factories + DB2 cgo build tag
-├── discover/         source introspection (MySQL / MariaDB / Oracle / DB2)
-├── dialects/         SQL dialect registry — currently mysql, mariadb, oracle, db2, postgres
+├── discover/         source introspection (MySQL / MariaDB / Oracle / DB2 / SQL Server)
+├── dialects/         SQL dialect registry — currently mysql, mariadb, oracle, db2, tsql (SQL Server), postgres
 │   └── <id>/
 │       ├── reference/  vendored .g4 (spec only, no ANTLR runtime)
 │       ├── lexer.go  parser.go  parser_ddl.go  parser_dml.go  parser_expr.go  …
@@ -152,7 +158,7 @@ internal/
 └── version/
 web/                  Vue 3 + Vite + Pinia
 test/
-├── fixtures/         sample dumps + seeds (mysql / oracle / oracle19 / db2)
+├── fixtures/         sample dumps + seeds (mysql / oracle / oracle19 / db2 / sqlserver)
 └── integration/      e2e_test.go + db2_e2e_test.go (build tag: e2e)
 ```
 
@@ -258,7 +264,8 @@ make migrate-up      apply embedded SQL migrations (cmd/squishy-migrate, same le
 make migrate-down    roll back the latest migration
 make migrate-status  list migrations and whether they are applied
 make migrate-new name=add_foo   scaffold a new up/down migration pair
-make oracle-up | oracle19-up | db2-up | mariadb-sample (via compose profiles)
+make oracle-up | oracle19-up | db2-up | sqlserver-up | mariadb-sample (via compose profiles)
+make sqlserver-load-dumps | sqlserver-cli | sqlserver-down
 make test            unit tests + check-no-regex
 make e2e             scripts/run_e2e.sh (full Compose round-trip)
 make web-build       vite build → web/dist

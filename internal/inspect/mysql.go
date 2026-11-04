@@ -42,6 +42,7 @@ type SourceSchema struct {
 type ObjectSnapshot struct {
 	Name     string `json:"name"`
 	Database string `json:"database"`
+	Schema   string `json:"schema,omitempty"` // T-SQL schema of the object (SQL Server, where Database is the database); empty for other dialects
 	Rows     int64  `json:"rows,omitempty"`
 	DDL      string `json:"ddl"`
 }

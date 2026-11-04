@@ -11,12 +11,12 @@ import (
 
 // oracle_dyn_trigger.go — visitor for Oracle's "build a CREATE TRIGGER
 // at runtime via string concat then EXECUTE IMMEDIATE" idiom, common
-// in maintenance-style APP-class procedures.
+// in legacy maintenance-style PL/SQL procedures.
 //
 // Source shape (typical):
 //
-//   L_VC_STMT := 'CREATE OR REPLACE trigger ' || pfx || 'MVT_' || tab
-//             || chr(10) || 'BEFORE INSERT ON ' || pfx || 'MVT_' || tab2
+//   L_VC_STMT := 'CREATE OR REPLACE trigger ' || pfx || 'HIST_' || tab
+//             || chr(10) || 'BEFORE INSERT ON ' || pfx || 'HIST_' || tab2
 //             || chr(10) || 'FOR EACH ROW' || chr(10)
 //             || 'DECLARE ' || chr(10) || 'vl_x varchar2(3);'
 //             || chr(10) || 'BEGIN ' || ver || chr(10);
@@ -332,7 +332,7 @@ func mapTriggerPseudoVarsInLiteral(s string) string {
 // dropFromDualInLiteral removes any case-insensitive ` FROM DUAL`
 // occurrence inside a single Literal's content. PG's SELECT INTO
 // doesn't need a FROM clause for constant projections — orafce ships
-// a `dual` view but most APP-class code uses FROM DUAL purely as
+// a `dual` view but most legacy maintenance-style code uses FROM DUAL purely as
 // Oracle syntactic noise.
 func dropFromDualInLiteral(s string) string {
 	upper := strings.ToUpper(s)
@@ -555,7 +555,7 @@ func matchDynamicTriggerRange(stmts []ast.PLStmt, i int) (m dynTriggerMatch, ok 
 			m.accum = append(m.accum, cParts[1:]...)
 		case *ast.IfStmt:
 			// IfStmt is a contributor when every branch only appends
-			// to var. Most APP-style routines mix var-appends with
+			// to var. Most legacy maintenance-style routines mix var-appends with
 			// other targets (L_BO_CLAUSE := …) inside the same body,
 			// so we relax: collect every AssignStmt that DOES append
 			// to var (selfRef-shaped) into m.accum, even when the
@@ -635,8 +635,8 @@ func patchIfBranchesSink(s *ast.IfStmt, varName string) {
 // ifContainsSink reports whether any branch (or Else) of `s` holds
 // a sink stmt for varName — either EXECUTE IMMEDIATE var or CALL
 // dbms_sql.parse(_, var). The walk is non-recursive: we only look at
-// direct children of each branch, not at nested IfStmts. The APP
-// pattern fits this: `IF length > max THEN parse(_, array) ELSE
+// direct children of each branch, not at nested IfStmts. The legacy
+// journal-trigger generator pattern fits this: `IF length > max THEN parse(_, array) ELSE
 // parse(_, scalar) END IF` has the sinks at branch top level.
 func ifContainsSink(s *ast.IfStmt, varName string) bool {
 	scan := func(body []ast.PLStmt) bool {
@@ -978,7 +978,7 @@ func rewriteDynTriggerRange(stmts []ast.PLStmt, m dynTriggerMatch, targetSchema,
 
 	// Locate the boundary: the first top-level CONTRIBUTOR whose rhs
 	// includes a `'BEGIN '` or `'DECLARE'` literal. Falls back to the
-	// initiator if it already carries the marker (rare — APP-style
+	// initiator if it already carries the marker (rare — legacy maintenance-style
 	// code emits BEGIN in a separate self-append).
 	boundaryStmtIdx, boundaryKw := findBoundaryContributor(stmts, m)
 	if boundaryStmtIdx < 0 {
@@ -1362,7 +1362,7 @@ func rewriteEndMarker(s ast.PLStmt, varName string) (ast.PLStmt, bool) {
 // caller will append a fresh `RETURN NEW; END $f$;` trailer.
 //
 // If the END; spans multiple Literals (e.g. `'EN' || 'D;'`) we leave
-// it alone — the structure on real APP-class code always emits the
+// it alone — the structure on real legacy maintenance-style code always emits the
 // marker as a single Literal.
 func stripTrailingEndMarker(parts []ast.Expr) []ast.Expr {
 	for i := len(parts) - 1; i >= 0; i-- {

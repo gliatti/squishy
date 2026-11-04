@@ -161,6 +161,73 @@ services:
       retries: 60
       start_period: 600s
 
+  # Microsoft SQL Server 2022 (Developer edition, gratuite hors production).
+  # Image officielle MCR (~2.3 GB), EULA acceptée via ACCEPT_EULA=Y. Boot
+  # ~20-40 s. Le mot de passe SA doit respecter la politique de complexité
+  # (8+ caractères, 3 classes parmi maj/min/chiffres/symboles) sinon le
+  # moteur refuse de démarrer. L'image Linux n'embarque PAS la recherche
+  # plein texte (package mssql-server-fts) : les CREATE FULLTEXT des dumps
+  # doivent être sautés au chargement (voir dumps/README.md).
+  #
+  # Pas de répertoire d'init auto dans l'image : c'est le one-shot
+  # sqlserver-init ci-dessous qui charge les fixtures une fois le moteur
+  # healthy. Port 1433 (port T-SQL par défaut).
+  sqlserver-sample:
+    profiles: ["sqlserver", "e2e"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: Squishy_2026x
+    ports: ["${SQUISHY_BIND_ADDR:-127.0.0.1}:${SQUISHY_SQLSERVER_HOST_PORT:-1433}:1433"]
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL",
+             "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -b -Q 'SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  # Chargeur des fixtures : exécute test/fixtures/sqlserver_{sample,seed}.sql
+  # dans la base squishy_sample une fois sqlserver-sample healthy.
+  #   -I        QUOTED_IDENTIFIER ON (sqlcmd le met OFF par défaut, ce qui
+  #             interdit index filtrés et colonnes calculées indexées)
+  #   -f 65001  fixtures en UTF-8
+  #   -b        sortie non nulle à la première erreur
+  # `up --wait` considère « prêt » un conteneur sans healthcheck dès qu'il
+  # tourne, donc un vrai one-shot rendrait la main avant la fin du
+  # chargement. Le service pose donc un marqueur puis reste en vie : son
+  # healthcheck passe au vert quand le chargement a réussi, et une erreur SQL
+  # fait sortir le conteneur en code non nul, ce que `up --wait` remonte.
+  # Le sample commence par DROP DATABASE si la base existe : recréer le
+  # service (`up -d --force-recreate sqlserver-init`) recharge une base propre.
+  sqlserver-init:
+    profiles: ["sqlserver", "e2e"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      sqlserver-sample:
+        condition: service_healthy
+    environment:
+      SQLCMDPASSWORD: Squishy_2026x
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        /opt/mssql-tools18/bin/sqlcmd -C -b -I -f 65001 -S sqlserver-sample -U sa
+        -i /fixtures/sqlserver_sample.sql -i /fixtures/sqlserver_seed.sql
+        && touch /tmp/squishy-init.done
+        && exec sleep infinity
+    volumes:
+      - ./test/fixtures/sqlserver_sample.sql:/fixtures/sqlserver_sample.sql:ro
+      - ./test/fixtures/sqlserver_seed.sql:/fixtures/sqlserver_seed.sql:ro
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/squishy-init.done"]
+      interval: 3s
+      timeout: 2s
+      retries: 100
+    restart: "no"
+
   api:
     build:
       context: .
@@ -278,6 +345,14 @@ services:
       SQUISHY_API_TOKEN: ${SQUISHY_API_TOKEN:-}
       SQUISHY_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
       SQUISHY_MYSQL_DSN: sakila:sakila@tcp(mysql-sample:3306)/sakila?parseTime=true&multiStatements=true
+      # Opt-in scenarios, passed through from the host (run_e2e.sh also
+      # forwards them with -e): SQUISHY_E2E_DB2=1 (db2 profile) and
+      # SQUISHY_E2E_SQLSERVER=1 (sqlserver profile, test/integration/
+      # sqlserver_e2e_test.go, which compares SQL Server and PG row counts
+      # through SQUISHY_SQLSERVER_DSN).
+      SQUISHY_E2E_DB2: ${SQUISHY_E2E_DB2:-0}
+      SQUISHY_E2E_SQLSERVER: ${SQUISHY_E2E_SQLSERVER:-0}
+      SQUISHY_SQLSERVER_DSN: sqlserver://sa:Squishy_2026x@sqlserver-sample:1433?database=squishy_sample&encrypt=disable
       TARGET_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
     depends_on:
       api:
@@ -302,5 +377,6 @@ volumes:
   oracle19-data:
   mariadb-data:
   db2-data:
+  sqlserver-data:
   mcp-gocache:
   mcp-gomod:

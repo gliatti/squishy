@@ -3,6 +3,7 @@ package translate
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gitlab.com/dalibo/squishy/internal/dialects"
@@ -53,6 +54,20 @@ type Options struct {
 	// an override that matches no source generated column is reported
 	// (table.generated_override_unused). See mysql_generated_override.go.
 	GeneratedOverrides []GeneratedOverride
+
+	// PreserveSourceSchemas keeps each object in a PG schema derived
+	// from its own source schema instead of materialising everything in
+	// TargetSchema (SQL Server, where one database spans several
+	// schemas: AdventureWorks' Person, Sales, …). The PG schema of
+	// source schema s is SchemaPrefix + lower(s), "dbo" for an
+	// unqualified object (translator.schemaFor). The DDL creates every
+	// such schema and puts them all on the search_path.
+	PreserveSourceSchemas bool
+	// SchemaPrefix prefixes every preserved schema name: "" when the
+	// migration has a database of its own (dedicated_db: dbo stays dbo),
+	// "<database>_" when it shares the target database with others
+	// (dedicated_schema: squishy_sample_dbo, squishy_sample_sales).
+	SchemaPrefix string
 }
 
 // hasExt reports whether opt.TargetExtensions contains ext (case-insensitive).
@@ -89,6 +104,19 @@ func Translate(stmts []ast.Stmt, opt Options) *Result {
 	t := &translator{opt: opt, res: &Result{}}
 	t.res.Plan.PostActions = []string{}
 	t.res.Plan.TargetExtensions = append([]string(nil), opt.TargetExtensions...)
+	if dialects.IsSQLServer(opt.SourceKind) {
+		// SQL Server has its own statement loop (translateTSQLScript):
+		// the T-SQL object shapes (schemas, IDENTITY, computed columns,
+		// statement-level triggers, table-valued functions) share the
+		// plan structures and the DDL builder with the other dialects,
+		// but none of their per-statement code paths.
+		t.translateTSQLScript(stmts)
+		t.harmonizeFKTypes()
+		t.computeCopyColumns()
+		t.buildDDL()
+		t.buildPrerequisites()
+		return t.res
+	}
 	// Pre-pass: register every CREATE TYPE the dump contains so that table
 	// columns referencing those types (CUSTOMERS.cust_address →
 	// CUST_ADDRESS_TYP) resolve to the migrated PG composite/array even if
@@ -199,11 +227,11 @@ func (t *translator) harmonizeFKTypes() {
 	tableByName := make(map[string]*PGTable, len(t.res.Plan.Tables))
 	for i := range t.res.Plan.Tables {
 		tbl := &t.res.Plan.Tables[i]
-		tableByName[strings.ToLower(tbl.Name)] = tbl
+		tableByName[t.tableKey(tbl.Schema, tbl.Name)] = tbl
 	}
 	for _, fk := range t.res.Plan.ForeignKeys {
-		srcTbl := tableByName[strings.ToLower(fk.Table)]
-		refTbl := tableByName[strings.ToLower(fk.RefTable)]
+		srcTbl := tableByName[t.tableKey(fk.Schema, fk.Table)]
+		refTbl := tableByName[t.tableKey(fk.RefSchema, fk.RefTable)]
 		if srcTbl == nil || refTbl == nil {
 			continue
 		}
@@ -232,6 +260,17 @@ func (t *translator) harmonizeFKTypes() {
 			})
 		}
 	}
+}
+
+// tableKey is the lookup key of a PG table among the plan's tables: the
+// lower-cased name, schema-qualified when the plan spans several schemas
+// (Options.PreserveSourceSchemas). The single-schema dialects keep their
+// historical name-only matching.
+func (t *translator) tableKey(schema, name string) string {
+	if t.opt.PreserveSourceSchemas {
+		return strings.ToLower(schema) + "." + strings.ToLower(name)
+	}
+	return strings.ToLower(name)
 }
 
 func columnIndex(cols []PGColumn, name string) int {
@@ -312,6 +351,13 @@ type translator struct {
 	// copier cannot transfer: computeCopyColumns leaves them out of an
 	// explicit copy list.
 	spatialCols map[int]map[string]bool
+
+	// tsql is the SQL Server state (translateTSQLScript); nil for the
+	// other dialects.
+	tsql *tsqlState
+	// sourceObjects is the set of objects the SQL Server script
+	// creates (sourceObjectKey), read by HookRun.ResolveRelation.
+	sourceObjects map[string]bool
 }
 
 // markSpatialColumn records a spatial source column of the table at
@@ -337,6 +383,10 @@ func (t *translator) markSpatialColumn(tableIdx int, col string) {
 // refused generated columns plain) and before emitSystemVersioning (which
 // appends the history tables, copied through HistoryCopyColumns).
 func (t *translator) computeCopyColumns() {
+	if dialects.IsSQLServer(t.opt.SourceKind) {
+		t.computeTSQLCopyColumns()
+		return
+	}
 	for i := range t.res.Plan.Tables {
 		tbl := &t.res.Plan.Tables[i]
 		if tbl.SystemVersioning == nil && len(tbl.CopiedGenerated) == 0 {
@@ -3646,7 +3696,7 @@ func (t *translator) translateAlterTrigger(s *ast.AlterTrigger) {
 	} else {
 		// No matching routine in this dump — the CREATE TRIGGER lives
 		// elsewhere or is created at runtime (e.g. by an application
-		// procedure like REFRESH_AUDIT). Wrap in a runtime DO block that
+		// maintenance procedure). Wrap in a runtime DO block that
 		// no-ops if the trigger doesn't exist, so we don't sink the
 		// migration with `relation does not exist` when the static
 		// ALTER tries to run before the trigger is created. Lands in
@@ -4587,10 +4637,21 @@ func (t *translator) buildDDL() {
 	// Include `public` in search_path so extension-provided types (geometry
 	// from PostGIS, hstore, citext, …) resolve without qualification when
 	// the target schema is something other than public.
-	pre = append(pre,
-		&pgast.CreateSchema{Name: t.opt.TargetSchema, IfNotExists: true},
-		&pgast.SetSearchPath{Schema: t.opt.TargetSchema, Additional: []string{"public"}},
-	)
+	if t.opt.PreserveSourceSchemas {
+		// One PG schema per source schema (SQL Server): create them all,
+		// and resolve unqualified names through every one of them, the
+		// default schema (dbo) first.
+		schemas := t.emittedSchemaList()
+		for _, s := range schemas {
+			pre = append(pre, &pgast.CreateSchema{Name: s, IfNotExists: true})
+		}
+		pre = append(pre, &pgast.SetSearchPath{Schema: schemas[0], Additional: append(append([]string{}, schemas[1:]...), "public")})
+	} else {
+		pre = append(pre,
+			&pgast.CreateSchema{Name: t.opt.TargetSchema, IfNotExists: true},
+			&pgast.SetSearchPath{Schema: t.opt.TargetSchema, Additional: []string{"public"}},
+		)
+	}
 	// Pre-actions (e.g. sequences feeding DEFAULT nextval in table columns).
 	for _, a := range t.res.Plan.PreActions {
 		pre = append(pre, &pgast.Raw{Text: a})
@@ -4600,6 +4661,7 @@ func (t *translator) buildDDL() {
 		ct := &pgast.CreateTable{
 			Schema: tbl.Schema, Name: tbl.Name,
 			PrimaryKey: tbl.PK, Checks: tbl.Checks, CheckNames: tbl.CheckNames,
+			PrimaryKeyName: tbl.PKName,
 		}
 		for _, c := range tbl.Columns {
 			col := pgast.ColumnDef{
@@ -4612,6 +4674,16 @@ func (t *translator) buildDDL() {
 			}
 			if c.Identity {
 				col.Identity = pgast.IdentityByDefault
+				if o := c.IdentityOptions; o != nil {
+					col.HasIdentityOptions = true
+					col.IdentityStart, col.IdentityIncrement = o.Start, o.Increment
+					if o.MinValue != nil {
+						col.HasIdentityMin, col.IdentityMin = true, *o.MinValue
+					}
+					if o.MaxValue != nil {
+						col.HasIdentityMax, col.IdentityMax = true, *o.MaxValue
+					}
+				}
 			}
 			if c.Generated != nil {
 				col.Generated = &pgast.GeneratedCol{Expr: c.Generated.Expr}
@@ -4696,13 +4768,14 @@ func (t *translator) buildDDL() {
 	// Post-copy AST: indexes, FKs, then post-actions.
 	// MySQL scopes index names per-table but PG scopes them per-schema, so
 	// rewrite any duplicate names by prefixing the owning table.
-	dedupeIndexNames(t.res.Plan.Indexes)
+	dedupeIndexNames(t.res.Plan.Indexes, t.planRelationKeys())
 	var post []pgast.Stmt
 	for _, idx := range t.res.Plan.Indexes {
 		post = append(post, &pgast.CreateIndex{
 			Schema: idx.Schema, Table: idx.Table, Name: idx.Name,
 			Unique: idx.Unique, Columns: idx.Columns, Method: idx.Using,
 			ColumnDirs: idx.ColumnDirs, ColumnIsExpr: idx.ColumnIsExpr,
+			Include: idx.Include, Where: idx.Where,
 		})
 	}
 	// PG rejects `ADD CONSTRAINT … NOT VALID FOREIGN KEY` when the table is
@@ -4724,10 +4797,10 @@ func (t *translator) buildDDL() {
 	// dropped and can recreate it after migrating the parent schema.
 	migratedTables := make(map[string]bool, len(t.res.Plan.Tables))
 	for _, tbl := range t.res.Plan.Tables {
-		migratedTables[strings.ToLower(tbl.Name)] = true
+		migratedTables[t.tableKey(tbl.Schema, tbl.Name)] = true
 	}
 	for _, fk := range t.res.Plan.ForeignKeys {
-		if !migratedTables[strings.ToLower(fk.RefTable)] {
+		if !migratedTables[t.tableKey(fk.RefSchema, fk.RefTable)] {
 			// Resolve the source-side schema and table name that own the
 			// missing reference. fk.RefSchema/fk.RefTable may have been
 			// rewritten to the PG target schema (lowercased); fall back to
@@ -5136,8 +5209,16 @@ func mysqlTypeRepr(t ast.DataType) string {
 // schema. Only duplicates are touched; the first occurrence of each name
 // keeps its original label. A colliding name becomes "<table>_<name>"; if
 // that still collides (pathological case) we append a numeric suffix.
-func dedupeIndexNames(idxs []PGIndex) {
-	seen := make(map[string]bool, len(idxs))
+// reserved holds the "<schema>.<name>" keys of the other relations of the
+// plan (tables, views, primary-key indexes, sequences), which share the
+// index namespace on PostgreSQL: an index named like one of them is
+// renamed the same way (Northwind indexes customers(region) as "Region",
+// next to the table Region).
+func dedupeIndexNames(idxs []PGIndex, reserved map[string]bool) {
+	seen := make(map[string]bool, len(idxs)+len(reserved))
+	for k := range reserved {
+		seen[k] = true
+	}
 	key := func(schema, name string) string { return schema + "." + name }
 	for i := range idxs {
 		k := key(idxs[i].Schema, idxs[i].Name)
@@ -5154,6 +5235,32 @@ func dedupeIndexNames(idxs []PGIndex) {
 		idxs[i].Name = candidate
 		seen[k2] = true
 	}
+}
+
+// planRelationKeys returns the "<schema>.<name>" keys of the relations
+// other than secondary indexes the plan creates: tables, views, the
+// indexes of named primary keys, sequences (their PG schema: the target
+// schema, or every preserved schema for SQL Server, whose sequence names
+// are not tracked per schema).
+func (t *translator) planRelationKeys() map[string]bool {
+	keys := map[string]bool{}
+	schemas := map[string]bool{t.opt.TargetSchema: true}
+	for _, tbl := range t.res.Plan.Tables {
+		keys[tbl.Schema+"."+tbl.Name] = true
+		if tbl.PKName != "" {
+			keys[tbl.Schema+"."+tbl.PKName] = true
+		}
+		schemas[tbl.Schema] = true
+	}
+	for _, v := range t.res.Plan.Views {
+		keys[v.Schema+"."+v.Name] = true
+	}
+	for _, name := range t.sequenceNames {
+		for s := range schemas {
+			keys[s+"."+name] = true
+		}
+	}
+	return keys
 }
 
 func columnsNames(cs []ast.IndexedCol) []string {
@@ -6429,4 +6536,2853 @@ func rewriteOracleCompositeConstructors(body string, types map[string]UserTypeRe
 		i = k
 	}
 	return out.String()
+}
+
+// ---------------------------------------------------------------------------
+// SQL Server (T-SQL)
+//
+// translateTSQLScript is the statement loop of the SQL Server source. It
+// shares the plan structures (PGTable, PGIndex, …), the DDL builder
+// (buildDDL), the copy-list and prerequisite passes with the other
+// dialects, and plugs the dialect knowledge in through dialect_hooks.go:
+// expressions, view queries and routine bodies go through the hooks
+// registered for dialects.KindSQLServer (tsql_visitors.go,
+// tsql_routines.go); the object shapes are handled here.
+//
+// Conventions:
+//   - every identifier reaching PG is folded to lower case
+//     (normalizeTSQLIdent, the fold dataxfer and the worker use too);
+//   - every object keeps its T-SQL schema, mapped by schemaFor when
+//     Options.PreserveSourceSchemas is set (httpapi does for kind
+//     sqlserver);
+//   - source DDL is the inspector's canonical script (one batch per
+//     object, constraints inline) or a real T-SQL script (constraints
+//     added by ALTER TABLE, comments by sp_addextendedproperty): both
+//     shapes are handled.
+// ---------------------------------------------------------------------------
+
+// normalizeTSQLIdent folds ONE T-SQL identifier to its PG name: lower
+// case. SQL Server's default collations compare identifiers
+// case-insensitively, so `[SalesOrderHeader]`, `SalesOrderHeader` and
+// `salesorderheader` name the same object; folding keeps PG names
+// unquoted-friendly. It must stay identical to dataxfer.FoldSQLServerIdent
+// and worker.pgNormalizeIdent (the copy targets the same names).
+//
+// The folded name is cut to PostgreSQL's 63 bytes on a rune boundary,
+// which is what PG does to a longer identifier in DDL (SQL Server allows
+// 128 characters, and non-ASCII names pass 63 bytes sooner in UTF-8):
+// every name the plan, the copy and the worker use is then the one PG
+// stored. Two names that only differ past that point collide; the
+// translator reports it (name.fold_collision).
+func normalizeTSQLIdent(s string) string { return clipUTF8(strings.ToLower(s), pgMaxIdentLen) }
+
+// tsqlParamName is the PG name of a T-SQL parameter or local variable:
+// `@CustomerID` → `customerid`.
+func tsqlParamName(s string) string {
+	return normalizeTSQLIdent(strings.TrimPrefix(s, "@"))
+}
+
+// tsqlState is the per-run state of translateTSQLScript.
+type tsqlState struct {
+	run *HookRun
+	// tables maps tableKey(PG schema, PG name) → Plan.Tables index.
+	tables map[string]int
+	// srcCols maps a Plan.Tables index to its PG column → source
+	// column names (the copy reads the source spelling).
+	srcCols map[int]map[string]string
+	// colClass maps a Plan.Tables index to its PG column → value class
+	// (computed-column proofs).
+	colClass map[int]map[string]tsqlClass
+	// explicitCopy marks the tables whose copy needs an explicit column
+	// list (rowversion / spatial columns, which the copier's catalog
+	// default leaves out).
+	explicitCopy map[int]bool
+	// aliasTypes records every alias type (tsqlUserTypeKey).
+	aliasTypes map[string]*ast.CreateType
+	// domainBase maps the PG type text of an alias-type domain
+	// (`"dbo"."name"`, as column types spell it) to its base PG type,
+	// so hooks can classify domain-typed columns (HookRun.TableColumns).
+	domainBase map[string]string
+	// funcReturns records the return type of every scalar function of
+	// the script (sourceObjectKey), for computed-column type inference.
+	funcReturns map[string]ast.DataType
+	// funcDefs are the functions of the script (sourceObjectKey), and
+	// deterministic caches tsqlDeterministicFunc.
+	funcDefs      map[string]*ast.CreateFunction
+	deterministic map[string]bool
+	// procDefs are the procedures of the script (sourceObjectKey), for
+	// the INOUT arguments of their callers (tsql_call_args.go).
+	procDefs map[string]*ast.CreateProcedure
+	// computedTriggers are the computed columns emulated by a trigger
+	// (tsql_computed_trigger.go).
+	computedTriggers []tsqlComputedTrigger
+	// schemas lists the PG schemas objects were emitted in, in first-use
+	// order (buildDDL creates them).
+	schemas    []string
+	schemaSeen map[string]bool
+	comments   []*ast.CommentStmt
+	triggers   []*ast.CreateTrigger
+	// views maps tableKey(PG schema, PG name) → Plan.Views index.
+	views map[string]int
+	// routines maps "<kind>|" + tableKey(PG schema, PG name) → routine
+	// (functions, procedures) for comments.
+	routines map[string]tsqlRoutineRef
+	// triggerRoutines maps tableKey(PG schema, trigger name) →
+	// Plan.Routines indexes (a multi-event AFTER trigger emits one PG
+	// trigger per event).
+	triggerRoutines map[string][]int
+	// triggerNames maps a Plan.Routines index of a trigger to the PG
+	// trigger names its DDL creates.
+	triggerNames map[int][]string
+	// overrideUsed runs parallel to Options.GeneratedOverrides.
+	overrideUsed []bool
+}
+
+// tsqlRoutineRef locates an emitted function / procedure.
+type tsqlRoutineRef struct {
+	idx int
+	// target is the COMMENT ON target: `"s"."f"(integer, text)`.
+	target string
+	object string // "FUNCTION" | "PROCEDURE"
+}
+
+// schemaFor returns the PG schema of the source schema src (see
+// Options.PreserveSourceSchemas): opt.TargetSchema when schemas are not
+// preserved, else SchemaPrefix + lower(src), dbo for "".
+func (t *translator) schemaFor(src string) string {
+	if !t.opt.PreserveSourceSchemas {
+		return t.opt.TargetSchema
+	}
+	if src == "" {
+		src = "dbo"
+	}
+	return t.opt.SchemaPrefix + normalizeTSQLIdent(src)
+}
+
+// useSchema is schemaFor for an object the translator emits: the PG
+// schema is recorded so buildDDL creates it.
+func (t *translator) useSchema(src string) string {
+	s := t.schemaFor(src)
+	if st := t.tsql; st != nil && !st.schemaSeen[s] {
+		st.schemaSeen[s] = true
+		st.schemas = append(st.schemas, s)
+	}
+	return s
+}
+
+// emittedSchemaList returns the PG schemas buildDDL creates when schemas
+// are preserved: the default schema (dbo's) first when it is used, then
+// the others in first-use order; opt.TargetSchema when none was used.
+func (t *translator) emittedSchemaList() []string {
+	if t.tsql == nil || len(t.tsql.schemas) == 0 {
+		return []string{t.schemaFor("")}
+	}
+	def := t.schemaFor("")
+	out := make([]string, 0, len(t.tsql.schemas))
+	if t.tsql.schemaSeen[def] {
+		out = append(out, def)
+	}
+	for _, s := range t.tsql.schemas {
+		if s != def {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (t *translator) translateTSQLScript(stmts []ast.Stmt) {
+	st := &tsqlState{
+		tables:          map[string]int{},
+		srcCols:         map[int]map[string]string{},
+		colClass:        map[int]map[string]tsqlClass{},
+		explicitCopy:    map[int]bool{},
+		aliasTypes:      map[string]*ast.CreateType{},
+		domainBase:      map[string]string{},
+		funcReturns:     map[string]ast.DataType{},
+		funcDefs:        map[string]*ast.CreateFunction{},
+		procDefs:        map[string]*ast.CreateProcedure{},
+		deterministic:   map[string]bool{},
+		schemaSeen:      map[string]bool{},
+		views:           map[string]int{},
+		routines:        map[string]tsqlRoutineRef{},
+		triggerRoutines: map[string][]int{},
+		triggerNames:    map[int][]string{},
+		overrideUsed:    make([]bool, len(t.opt.GeneratedOverrides)),
+	}
+	t.tsql = st
+	st.run = &HookRun{Kind: t.opt.SourceKind, Schema: t.schemaFor, t: t}
+	t.collectTSQLSourceObjects(stmts)
+	t.emitTSQLUserTypes(stmts)
+	st.run.Caps = t.caps()
+	for _, s := range stmts {
+		switch x := s.(type) {
+		case *ast.CreateSchema:
+			t.useSchema(x.Name)
+		case *ast.CreateTable:
+			t.translateTSQLTable(x)
+		case *ast.AlterTable:
+			t.translateTSQLAlterTable(x)
+		case *ast.CreateIndex:
+			t.translateTSQLIndex(x)
+		case *ast.CreateView:
+			t.translateTSQLView(x)
+		case *ast.CreateTrigger:
+			// After every table and view: a trigger may precede the
+			// view it is created on in a hand-written script.
+			st.triggers = append(st.triggers, x)
+		case *ast.CreateProcedure:
+			t.translateTSQLProcedure(x)
+		case *ast.CreateFunction:
+			t.translateTSQLFunction(x)
+		case *ast.CreateSequence:
+			t.translateTSQLSequence(x)
+		case *ast.CommentStmt:
+			st.comments = append(st.comments, x)
+		case *ast.NoopStmt:
+			t.translateTSQLNoop(x)
+		}
+	}
+	for _, tr := range st.triggers {
+		t.translateTSQLTrigger(tr)
+	}
+	// After the triggers: the versioning trigger names are kept clear
+	// of theirs.
+	t.emitTSQLTemporal()
+	t.emitTSQLComputedTriggers()
+	t.fillTSQLFKRefColumns()
+	t.applyTSQLComments()
+	t.reportUnusedGeneratedOverrides(st.overrideUsed)
+	if pre := hookedPreActions(t.opt.SourceKind, st.run); len(pre) > 0 {
+		t.res.Plan.PreActions = append(append([]string{}, pre...), t.res.Plan.PreActions...)
+	}
+}
+
+// collectTSQLSourceObjects records every object the script creates
+// (HookRun.ResolveRelation) and the return type of its scalar functions.
+func (t *translator) collectTSQLSourceObjects(stmts []ast.Stmt) {
+	t.sourceObjects = map[string]bool{}
+	add := func(schema, name string) {
+		if name != "" {
+			t.sourceObjects[sourceObjectKey(schema, name)] = true
+		}
+	}
+	for _, s := range stmts {
+		switch x := s.(type) {
+		case *ast.CreateTable:
+			add(x.Schema, x.Name)
+		case *ast.CreateView:
+			add(x.View.Schema, x.View.Name)
+		case *ast.CreateProcedure:
+			add(x.Schema, x.Name)
+			t.tsql.procDefs[sourceObjectKey(x.Schema, x.Name)] = x
+		case *ast.CreateFunction:
+			add(x.Schema, x.Name)
+			t.tsql.funcDefs[sourceObjectKey(x.Schema, x.Name)] = x
+			if x.Returns != nil && x.ReturnsTableVar == "" && !x.ReturnsInlineTable {
+				t.tsql.funcReturns[sourceObjectKey(x.Schema, x.Name)] = x.Returns
+			}
+		case *ast.CreateSequence:
+			add(x.Schema, x.Name)
+		case *ast.CreateType:
+			add(x.Schema, x.Name)
+		}
+	}
+}
+
+// registerTSQLUserType records a T-SQL alias / table type under its
+// schema-qualified key, and under its bare name when no other schema
+// uses that name (unqualified references from another schema).
+func (t *translator) registerTSQLUserType(schema, name string, ref UserTypeRef) {
+	if t.userTypes == nil {
+		t.userTypes = map[string]UserTypeRef{}
+	}
+	t.userTypes[tsqlUserTypeKey(schema, name)] = ref
+	bare := normalizeTSQLIdent(name)
+	if prev, ok := t.userTypes[bare]; ok && (prev.Schema != ref.Schema || prev.Name != ref.Name) {
+		prev.Kind = "ambiguous"
+		t.userTypes[bare] = prev
+		return
+	}
+	t.userTypes[bare] = ref
+}
+
+// emitTSQLUserTypes emits every T-SQL user type before anything else:
+// alias types as PG domains, then table types as composite types (their
+// columns may use the domains). The inspector lists types after the
+// tables that use them, so they are registered before any column is
+// mapped.
+func (t *translator) emitTSQLUserTypes(stmts []ast.Stmt) {
+	st := t.tsql
+	for _, s := range stmts {
+		x, ok := s.(*ast.CreateType)
+		if !ok || x.Kind != "alias" || x.BaseType == nil {
+			continue
+		}
+		schema := t.useSchema(x.Schema)
+		name := normalizeTSQLIdent(x.Name)
+		tr := MapType(t.opt.SourceKind, x.BaseType, name, t.caps())
+		t.res.Plan.PreActions = append(t.res.Plan.PreActions,
+			strings.TrimSuffix(pgast.Write([]pgast.Stmt{&pgast.CreateDomain{Schema: schema, Name: name, Type: tr.PG}}), "\n"))
+		st.aliasTypes[tsqlUserTypeKey(x.Schema, x.Name)] = x
+		st.domainBase[quoteIdent(schema)+"."+quoteIdent(name)] = tr.PG
+		t.registerTSQLUserType(x.Schema, x.Name, UserTypeRef{Kind: "domain", Schema: schema, Name: name})
+		nullability := "NULL"
+		if x.NotNull {
+			nullability = "NOT NULL"
+		}
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: "type." + schema + "." + name,
+			Source: "CREATE TYPE " + x.Name + " FROM " + tsqlTypeLabel(x.BaseType) + " " + nullability,
+			Target: "CREATE DOMAIN " + pgQuote(schema) + "." + pgQuote(name) + " AS " + tr.PG,
+			Reason: "A T-SQL alias type becomes a PostgreSQL domain over the mapped base type. Its NULL / NOT NULL is only the default of the columns that do not state theirs (a column can override it in T-SQL, which a NOT NULL domain would forbid), so it is applied to those columns, not to the domain. Range CHECKs of the base type (tinyint, binary(n)) are put on the columns too.",
+			Level:  "info",
+		})
+		if tr.Warning != "" {
+			t.warnSev("type."+schema+"."+name, tsqlWarningKind(tr), tr.Warning, tr.WarningSeverity)
+		}
+	}
+	for _, s := range stmts {
+		x, ok := s.(*ast.CreateType)
+		if !ok || x.Kind != "table" {
+			continue
+		}
+		schema := t.useSchema(x.Schema)
+		name := normalizeTSQLIdent(x.Name)
+		parts := make([]string, 0, len(x.TableCols))
+		for _, c := range x.TableCols {
+			if c.Type == nil {
+				continue // computed column of the table type: no stored value
+			}
+			col := normalizeTSQLIdent(c.Name)
+			parts = append(parts, quoteIdent(col)+" "+MapType(t.opt.SourceKind, c.Type, col, t.caps()).PG)
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		t.res.Plan.PreActions = append(t.res.Plan.PreActions,
+			fmt.Sprintf("CREATE TYPE %s.%s AS (%s);", quoteIdent(schema), quoteIdent(name), strings.Join(parts, ", ")))
+		t.registerTSQLUserType(x.Schema, x.Name, UserTypeRef{Kind: "composite", Schema: schema, Name: name})
+		msg := "T-SQL table type " + x.Name + " emitted as the composite type " + pgQuote(schema) + "." + pgQuote(name) + ": its constraints, keys and defaults are dropped, and a table-valued parameter of this type becomes an array of the composite (unnest() it in the routine body)"
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: "type." + schema + "." + name,
+			Source: "CREATE TYPE " + x.Name + " AS TABLE (…)",
+			Target: "CREATE TYPE " + pgQuote(schema) + "." + pgQuote(name) + " AS (…)",
+			Reason: msg,
+			Level:  "warn",
+		})
+		t.warnSev("type."+schema+"."+name, tsqlWarnTableType, msg, SeverityInfo)
+	}
+}
+
+// tsqlWarningKind is the warning kind of a type mapping (the mapper's
+// own kind, "type" by default).
+func tsqlWarningKind(tr typeResult) string {
+	if tr.WarningKind != "" {
+		return tr.WarningKind
+	}
+	return "type"
+}
+
+// tsqlTypeLabel renders a T-SQL data type for explanations and the type
+// mapping table.
+func tsqlTypeLabel(dt ast.DataType) string {
+	switch x := dt.(type) {
+	case nil:
+		return "(computed)"
+	case *ast.CharType:
+		name := strings.ToLower(x.Name)
+		switch {
+		case x.Max:
+			return name + "(max)"
+		case x.HasLength:
+			return fmt.Sprintf("%s(%d)", name, x.Length)
+		}
+		return name
+	case *ast.BinaryType:
+		name := strings.ToLower(x.Name)
+		if x.Max {
+			return name + "(max)"
+		}
+		return fmt.Sprintf("%s(%d)", name, x.Length)
+	case *ast.DecimalType:
+		return fmt.Sprintf("%s(%d,%d)", strings.ToLower(x.Name), x.Precision, x.Scale)
+	case *ast.FloatType:
+		if x.HasPS {
+			return fmt.Sprintf("float(%d)", x.Precision)
+		}
+		return strings.ToLower(x.Name)
+	case *ast.TimeType:
+		return fmt.Sprintf("time(%d)", x.Fsp)
+	case *ast.TSQLType:
+		name := strings.ToLower(x.Name)
+		if x.HasPrecision {
+			return fmt.Sprintf("%s(%d)", name, x.Precision)
+		}
+		return name
+	case *ast.UserDefinedType:
+		if x.Schema != "" {
+			return x.Schema + "." + x.Name
+		}
+		return x.Name
+	}
+	return strings.ToLower(dt.TypeName())
+}
+
+// ---------------------------------------------------------------------------
+// T-SQL tables
+// ---------------------------------------------------------------------------
+
+func (t *translator) translateTSQLTable(s *ast.CreateTable) {
+	st := t.tsql
+	if s.Temporary {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: "table." + s.Name,
+			Source: "CREATE TABLE " + s.Name,
+			Target: "(skipped)",
+			Reason: "A T-SQL #temporary table is session data, not part of the migrated schema.",
+			Level:  "info",
+		})
+		return
+	}
+	srcSchema := s.Schema
+	if srcSchema == "" {
+		srcSchema = "dbo"
+	}
+	schema := t.useSchema(srcSchema)
+	name := normalizeTSQLIdent(s.Name)
+	key := t.tableKey(schema, name)
+	if prev, dup := st.tables[key]; dup {
+		first := t.res.Plan.Tables[prev]
+		if first.SourceSchema != srcSchema || first.SourceName != s.Name {
+			// Two source tables fold to one PG name: they differ by case
+			// (a case-sensitive _CS_ / _BIN2 database) or only past the
+			// 63 bytes PG keeps. Migrating one silently would drop the
+			// other, and both copies would target the same PG table.
+			t.tsqlFoldCollision("table."+schema+"."+name,
+				"source tables "+first.SourceSchema+"."+first.SourceName+" and "+srcSchema+"."+s.Name+" both become the PostgreSQL table "+schema+"."+name+
+					" (identifiers are folded to lower case and cut to 63 bytes): only the first is created. Rename one of them on the source (or migrate it separately) before the migration")
+			return
+		}
+		t.warnSev("table."+schema+"."+name, "table.duplicate",
+			"table "+schema+"."+name+" is created twice by the source script; only the first definition is migrated", SeverityInfo)
+		return
+	}
+	idx := len(t.res.Plan.Tables)
+	tbl := PGTable{Schema: schema, Name: name, SourceSchema: srcSchema, SourceName: s.Name}
+	srcCols := map[string]string{}
+	classes := map[string]tsqlClass{}
+
+	// Pass 1: column shapes (types, nullability, identity).
+	s = t.tsqlDropFoldedColumnDups(idx, s, schema, name, srcSchema)
+	for _, c := range s.Columns {
+		col := t.tsqlColumnShape(idx, &tbl, c)
+		srcCols[col.Name] = c.Name
+		if c.Type != nil {
+			classes[col.Name] = t.tsqlClassOf(c.Type)
+		}
+		tbl.Columns = append(tbl.Columns, col)
+	}
+	// Pass 1.5: computed column types, inferred from their expression
+	// (T-SQL computed columns declare none) once every plain column is
+	// typed.
+	for i, c := range s.Columns {
+		if c.Generated == nil {
+			continue
+		}
+		pgType, class := t.inferTSQLExprType(c.Generated.Expr, &tbl, classes)
+		if pgType == "" {
+			pgType, class = "text", tsqlClassText
+			msg := "the type of computed column " + schema + "." + name + "." + tbl.Columns[i].Name +
+				" could not be inferred from its expression (T-SQL computed columns declare no type): created as text, its values are copied from the source"
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: "table." + schema + "." + name + "." + tbl.Columns[i].Name,
+				Source: "AS (" + pgast.WriteExpr(c.Generated.Expr) + ")",
+				Target: "text",
+				Reason: msg,
+				Level:  "warn",
+			})
+			t.warnSev(schema+"."+name+"."+tbl.Columns[i].Name, "table.computed_type_unknown", msg, SeverityInfo)
+		}
+		tbl.Columns[i].Type = pgType
+		classes[tbl.Columns[i].Name] = class
+	}
+	st.colClass[idx] = classes
+
+	// Pass 2: expressions (DEFAULT, computed), which may reference any
+	// column.
+	ctx := &ExprCtx{Run: st.run, Object: "table." + schema + "." + name, DefaultSchema: srcSchema, Columns: pgColumnTypes(&tbl)}
+	for i, c := range s.Columns {
+		col := &tbl.Columns[i]
+		if c.HasDefault && c.Default != nil {
+			col.Default = t.tsqlDefault(c.Default, classes[col.Name] == tsqlClassBool, ctx)
+			if c.DefaultName != "" {
+				t.res.Explanations = append(t.res.Explanations, Explanation{
+					Object: "table." + schema + "." + name + "." + col.Name,
+					Source: "CONSTRAINT " + c.DefaultName + " DEFAULT",
+					Target: "DEFAULT " + col.Default,
+					Reason: "PostgreSQL column defaults are not named constraints: the default is kept, its constraint name " + c.DefaultName + " is not.",
+					Level:  "info",
+				})
+			}
+		}
+		if c.Generated != nil {
+			t.tsqlComputedColumn(&tbl, i, s, c, ctx, classes)
+		}
+	}
+
+	if s.SystemVersioned || len(s.Periods) > 0 {
+		if tv := t.tsqlTemporalEmulation(s, srcSchema); tv != nil {
+			tbl.TSQLTemporal = tv
+			t.tsqlTemporalHidden(s, schema+"."+name)
+		} else {
+			t.tsqlTemporalTable(s, schema, name)
+		}
+	}
+
+	t.res.Plan.Tables = append(t.res.Plan.Tables, tbl)
+	st.tables[key] = idx
+	st.srcCols[idx] = srcCols
+	for _, cons := range s.Constraints {
+		t.tsqlAddConstraint(idx, srcSchema, cons)
+	}
+	for _, ix := range s.Indexes {
+		t.tsqlAddIndex(idx, ix.Name, ix.Unique, ix.Columns, nil, nil, "", srcSchema)
+	}
+	t.emitTSQLIdentityRestarts(idx)
+}
+
+// tsqlColumnShape translates a column definition's type, nullability,
+// identity and attributes (not its expressions) for the table at
+// Plan.Tables index idx (tbl, not appended yet).
+func (t *translator) tsqlColumnShape(idx int, tbl *PGTable, c *ast.ColumnDef) PGColumn {
+	st := t.tsql
+	pgName := normalizeTSQLIdent(c.Name)
+	obj := tbl.Schema + "." + tbl.Name + "." + pgName
+	col := PGColumn{Name: pgName, NotNull: c.NotNull}
+	if c.Type != nil {
+		tr := MapType(t.opt.SourceKind, c.Type, pgName, t.caps())
+		col.Type = tr.PG
+		col.Check = tr.Check
+		if ud, ok := c.Type.(*ast.UserDefinedType); ok {
+			if alias := st.aliasTypes[tsqlUserTypeKey(ud.Schema, ud.Name)]; alias != nil {
+				// The alias' nullability is the column default; its base
+				// type's range CHECK goes on the column (a domain CHECK
+				// would need VALUE, the mapper writes column checks).
+				if !c.HasNullable && alias.NotNull {
+					col.NotNull = true
+				}
+				col.Check = MapType(t.opt.SourceKind, alias.BaseType, pgName, t.caps()).Check
+			}
+		}
+		if tr.Note != "" {
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: tsqlTypeLabel(c.Type), Target: tr.PG, Reason: tr.Note, Level: "info",
+			})
+		}
+		if tr.Warning != "" {
+			t.warnSev(obj, tsqlWarningKind(tr), tr.Warning, tr.WarningSeverity)
+		}
+		t.res.TypeMappings = append(t.res.TypeMappings, TypeMapping{
+			Object: obj, MySQL: tsqlTypeLabel(c.Type), PG: tr.PG, Note: tr.Note,
+		})
+		switch x := c.Type.(type) {
+		case *ast.TSQLType:
+			switch x.Name {
+			case "ROWVERSION", "TIMESTAMP", "GEOGRAPHY", "GEOMETRY":
+				// The copier's catalog default leaves these out: the
+				// table needs an explicit copy list.
+				st.explicitCopy[idx] = true
+			}
+		}
+	}
+	if c.AutoInc {
+		t.tsqlIdentity(&col, c, obj)
+	}
+	if c.RowGUIDCol {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "ROWGUIDCOL", Target: "(attribute dropped)",
+			Reason: "ROWGUIDCOL only designates the column $ROWGUID refers to (merge replication, FILESTREAM). The uuid column and its default are migrated.",
+			Level:  "info",
+		})
+	}
+	if c.Sparse {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "SPARSE", Target: "(attribute dropped)",
+			Reason: "SPARSE is a T-SQL storage optimisation for mostly-NULL columns; PostgreSQL stores NULLs in the row's null bitmap at no cost.",
+			Level:  "info",
+		})
+	}
+	if c.FileStream {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "FILESTREAM", Target: "bytea",
+			Reason: "FILESTREAM stores varbinary(max) data in the file system; PostgreSQL stores the bytes in the table (TOAST).",
+			Level:  "info",
+		})
+	}
+	if c.Collation != "" {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "COLLATE " + c.Collation, Target: "(database collation)",
+			Reason: "T-SQL collations have no PostgreSQL counterpart by name; the column uses the target database collation. A case- or accent-insensitive collation (_CI_, _AI_) compares differently: use citext or a nondeterministic ICU collation where the application relies on it.",
+			Level:  "info",
+		})
+	}
+	if c.Invisible {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "HIDDEN", Target: "(visible column)",
+			Reason: "PostgreSQL has no hidden columns: the period column appears in SELECT *.",
+			Level:  "info",
+		})
+	}
+	return col
+}
+
+// tsqlIdentity turns an IDENTITY column into a PG identity column
+// (GENERATED BY DEFAULT: the copy inserts the source values) with the
+// source seed and increment.
+func (t *translator) tsqlIdentity(col *PGColumn, c *ast.ColumnDef, obj string) {
+	col.NotNull = true
+	col.Identity = true
+	switch col.Type {
+	case "smallint", "integer", "bigint":
+	default:
+		// IDENTITY on decimal(p,0) / numeric(p,0): PG identity columns
+		// are integer-typed.
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: tsqlTypeLabel(c.Type) + " IDENTITY", Target: "bigint GENERATED BY DEFAULT AS IDENTITY",
+			Reason: "PostgreSQL identity columns must be smallint, integer or bigint: the decimal identity column becomes bigint.",
+			Level:  "info",
+		})
+		col.Type = "bigint"
+	}
+	seed, inc := c.IdentitySeed, c.IdentityIncrement
+	if !c.HasIdentityArgs || inc == 0 {
+		seed, inc = 1, 1
+	}
+	opts := &PGIdentityOptions{Start: seed, Increment: inc}
+	// PG's default bounds are MINVALUE 1 (ascending) / MAXVALUE -1
+	// (descending): a seed outside them needs the bound moved.
+	if inc > 0 && seed < 1 {
+		v := seed
+		opts.MinValue = &v
+	}
+	if inc < 0 && seed > -1 {
+		v := seed
+		opts.MaxValue = &v
+	}
+	if c.HasIdentityArgs && (seed != 1 || inc != 1) {
+		col.IdentityOptions = opts
+	} else if opts.MinValue != nil || opts.MaxValue != nil {
+		col.IdentityOptions = opts
+	}
+	reason := fmt.Sprintf("T-SQL IDENTITY(%d,%d) → PG identity column. GENERATED BY DEFAULT lets the copy insert the source values; the sequence is moved past them after the copy.", seed, inc)
+	if c.NotForReplication {
+		reason += " NOT FOR REPLICATION has no PG counterpart."
+	}
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: obj, Source: fmt.Sprintf("IDENTITY(%d,%d)", seed, inc),
+		Target: "GENERATED BY DEFAULT AS IDENTITY", Reason: reason, Level: "info",
+	})
+}
+
+// emitTSQLIdentityRestarts appends, for every identity column of the
+// table at Plan.Tables index idx, the post-copy statement moving its
+// sequence past the copied values (T-SQL: the next identity is the
+// largest value plus the increment, or the seed of an empty table; the
+// smallest value for a descending identity):
+//
+//	SELECT setval(pg_get_serial_sequence('"s"."t"', 'c'),
+//	  GREATEST(<seed>, COALESCE((SELECT max("c")::bigint FROM "s"."t") + <inc>, <seed>)), false);
+func (t *translator) emitTSQLIdentityRestarts(idx int) {
+	tbl := &t.res.Plan.Tables[idx]
+	rel := quoteIdent(tbl.Schema) + "." + quoteIdent(tbl.Name)
+	for _, c := range tbl.Columns {
+		if !c.Identity {
+			continue
+		}
+		seed, inc := int64(1), int64(1)
+		if c.IdentityOptions != nil {
+			seed, inc = c.IdentityOptions.Start, c.IdentityOptions.Increment
+		}
+		agg, bound := "max", "GREATEST"
+		if inc < 0 {
+			agg, bound = "min", "LEAST"
+		}
+		t.res.Plan.PostActions = append(t.res.Plan.PostActions,
+			fmt.Sprintf("SELECT setval(pg_get_serial_sequence(%s, %s), %s(%d, COALESCE((SELECT %s(%s)::bigint FROM %s) + (%d), %d)), false);",
+				sqlStringLit(rel), sqlStringLit(c.Name), bound, seed, agg, quoteIdent(c.Name), rel, inc, seed))
+	}
+}
+
+// tsqlTemporalTable reports a system-versioned (temporal) table: the
+// current rows and the period columns are migrated as a plain table, the
+// history is not emulated in this version.
+func (t *translator) tsqlTemporalTable(s *ast.CreateTable, schema, name string) {
+	obj := schema + "." + name
+	period := ""
+	for _, p := range s.Periods {
+		period = " PERIOD FOR SYSTEM_TIME (" + p.StartCol + ", " + p.EndCol + ")"
+	}
+	history := "its history table"
+	if s.HistoryTable != nil {
+		h := s.HistoryTable.Name
+		if s.HistoryTable.Schema != "" {
+			h = s.HistoryTable.Schema + "." + h
+		}
+		history = "its history table " + h
+	}
+	msg := "system-versioned temporal table " + obj + ": the current rows and the period columns are migrated as a plain table, but " + history +
+		" (the closed row versions) is not migrated, the period columns are no longer maintained, and FOR SYSTEM_TIME queries have no PostgreSQL equivalent (temporal tables are not emulated in this version)"
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: "table." + obj,
+		Source: "WITH (SYSTEM_VERSIONING = ON)" + period,
+		Target: "plain table (history not migrated)",
+		Reason: msg,
+		Level:  "warn",
+	})
+	t.warnSev("table."+obj, "table.temporal_not_emulated", msg, SeverityBlocking)
+}
+
+// tsqlTable returns the Plan.Tables index of the table a source
+// reference names (resolved like SQL Server does from defaultSchema), or
+// -1.
+func (t *translator) tsqlTable(srcSchema, srcName, defaultSchema string) int {
+	schema, name := t.tsql.run.ResolveRelation(srcSchema, srcName, defaultSchema)
+	if idx, ok := t.tsql.tables[t.tableKey(schema, name)]; ok {
+		return idx
+	}
+	return -1
+}
+
+func (t *translator) translateTSQLAlterTable(s *ast.AlterTable) {
+	idx := t.tsqlTable(s.Table.Schema, s.Table.Name, "dbo")
+	if idx < 0 {
+		return
+	}
+	srcSchema := t.res.Plan.Tables[idx].SourceSchema
+	for _, act := range s.Actions {
+		switch act.Kind {
+		case "ADD_CONSTRAINT":
+			if act.Constraint != nil {
+				t.tsqlAddConstraint(idx, srcSchema, act.Constraint)
+			}
+		case "SET_DEFAULT":
+			tbl := &t.res.Plan.Tables[idx]
+			ci := columnIndex(tbl.Columns, normalizeTSQLIdent(act.DropName))
+			if ci < 0 || act.Default == nil {
+				continue
+			}
+			ctx := &ExprCtx{Run: t.tsql.run, Object: "table." + tbl.Schema + "." + tbl.Name, DefaultSchema: srcSchema, Columns: pgColumnTypes(tbl)}
+			tbl.Columns[ci].Default = t.tsqlDefault(act.Default, t.tsql.colClass[idx][tbl.Columns[ci].Name] == tsqlClassBool, ctx)
+		case "ADD_COLUMN":
+			if act.Column == nil || act.Column.Generated != nil {
+				continue
+			}
+			tbl := &t.res.Plan.Tables[idx]
+			col := t.tsqlColumnShape(idx, tbl, act.Column)
+			if act.Column.HasDefault && act.Column.Default != nil {
+				ctx := &ExprCtx{Run: t.tsql.run, Object: "table." + tbl.Schema + "." + tbl.Name, DefaultSchema: srcSchema, Columns: pgColumnTypes(tbl)}
+				col.Default = t.tsqlDefault(act.Column.Default, t.tsqlClassOf(act.Column.Type) == tsqlClassBool, ctx)
+			}
+			tbl.Columns = append(tbl.Columns, col)
+			t.tsql.srcCols[idx][col.Name] = act.Column.Name
+			t.tsql.colClass[idx][col.Name] = t.tsqlClassOf(act.Column.Type)
+		}
+	}
+}
+
+// tsqlAddConstraint adds a table constraint (inline or ALTER TABLE …
+// ADD CONSTRAINT) to the table at Plan.Tables index idx. srcSchema is
+// the table's source schema (unqualified FK references resolve from it).
+func (t *translator) tsqlAddConstraint(idx int, srcSchema string, cons ast.TableConstraint) {
+	st := t.tsql
+	tbl := &t.res.Plan.Tables[idx]
+	obj := tbl.Schema + "." + tbl.Name
+	switch c := cons.(type) {
+	case *ast.PKConstraint:
+		if len(tbl.PK) > 0 {
+			return
+		}
+		for _, col := range c.Columns {
+			tbl.PK = append(tbl.PK, normalizeTSQLIdent(col.Name))
+		}
+		tbl.PKName = normalizeTSQLIdent(c.Name)
+	case *ast.UQConstraint:
+		t.tsqlAddIndex(idx, c.Name, true, c.Columns, nil, nil, "", srcSchema)
+	case *ast.FKConstraint:
+		refSchema, refTable := st.run.ResolveRelation(c.RefSchema, c.RefTable, srcSchema)
+		cols := make([]string, len(c.Columns))
+		for i, col := range c.Columns {
+			cols[i] = normalizeTSQLIdent(col)
+		}
+		refCols := make([]string, len(c.RefColumns))
+		for i, col := range c.RefColumns {
+			refCols[i] = normalizeTSQLIdent(col)
+		}
+		name := normalizeTSQLIdent(c.Name)
+		if name == "" {
+			name = "fk_" + tbl.Name + "_" + strings.Join(cols, "_")
+		}
+		t.res.Plan.ForeignKeys = append(t.res.Plan.ForeignKeys, PGForeignKey{
+			Schema: tbl.Schema, Table: tbl.Name, Name: name,
+			Columns: cols, RefSchema: refSchema, RefTable: refTable, RefColumns: refCols,
+			OnDelete: c.OnDelete, OnUpdate: c.OnUpdate,
+			NotValid: c.State.NoValidate,
+		})
+		if c.NotForReplication {
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: "table." + obj + ".constraint." + name, Source: "FOREIGN KEY … NOT FOR REPLICATION",
+				Target: "FOREIGN KEY (always enforced)",
+				Reason: "NOT FOR REPLICATION exempts replication agents from the constraint; PostgreSQL enforces it for every session (logical replication applies changes as a replica session where triggers but not constraints can be skipped).",
+				Level:  "info",
+			})
+		}
+	case *ast.CheckConstraint:
+		ctx := &ExprCtx{Run: st.run, Object: "table." + obj, DefaultSchema: srcSchema, Columns: pgColumnTypes(tbl)}
+		e := tsqlStripParens(t.tsqlDDLExpr(tsqlStripParens(c.Expr), ctx))
+		tbl.Checks = append(tbl.Checks, pgast.WriteExpr(e))
+		tbl.CheckNames = append(tbl.CheckNames, normalizeTSQLIdent(c.Name))
+		if c.NotForReplication {
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: "table." + obj + ".constraint." + normalizeTSQLIdent(c.Name), Source: "CHECK … NOT FOR REPLICATION",
+				Target: "CHECK (always enforced)",
+				Reason: "NOT FOR REPLICATION exempts replication agents from the CHECK; PostgreSQL enforces it for every session.",
+				Level:  "info",
+			})
+		}
+	}
+}
+
+// tsqlAddIndex adds an index (UNIQUE constraint, inline INDEX, CREATE
+// INDEX) on the table at Plan.Tables index idx. include are the INCLUDE
+// columns, where the filter predicate (nil for a full index), clustered
+// the CLUSTERED / NONCLUSTERED keyword.
+func (t *translator) tsqlAddIndex(idx int, srcName string, unique bool, keys []ast.IndexedCol, include []string, where ast.Expr, clustered, srcSchema string) {
+	tbl := &t.res.Plan.Tables[idx]
+	cols := make([]string, len(keys))
+	dirs := make([]string, len(keys))
+	hasDir := false
+	for i, k := range keys {
+		cols[i] = normalizeTSQLIdent(k.Name)
+		if strings.EqualFold(k.Order, "DESC") {
+			dirs[i] = "DESC"
+			hasDir = true
+		}
+	}
+	name := normalizeTSQLIdent(srcName)
+	if name == "" {
+		prefix := "idx_"
+		if unique {
+			prefix = "uq_"
+		}
+		name = prefix + tbl.Name + "_" + strings.Join(cols, "_")
+	}
+	pgIdx := PGIndex{Schema: tbl.Schema, Table: tbl.Name, Name: name, Unique: unique, Columns: cols}
+	if hasDir {
+		pgIdx.ColumnDirs = dirs
+	}
+	for _, c := range include {
+		pgIdx.Include = append(pgIdx.Include, normalizeTSQLIdent(c))
+	}
+	obj := tbl.Schema + "." + tbl.Name + "." + name
+	if where != nil {
+		ctx := &ExprCtx{Run: t.tsql.run, Object: "index." + obj, DefaultSchema: srcSchema, Columns: pgColumnTypes(tbl)}
+		pgIdx.Where = pgast.WriteExpr(tsqlStripParens(t.tsqlDDLExpr(tsqlStripParens(where), ctx)))
+	}
+	if strings.EqualFold(clustered, "CLUSTERED") {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: "index." + obj, Source: "CLUSTERED INDEX", Target: "B-tree index",
+			Reason: "A T-SQL clustered index stores the table in index order. PostgreSQL tables are heaps: the index is created as a regular B-tree; `CLUSTER " + quoteIdent(tbl.Schema) + "." + quoteIdent(tbl.Name) + " USING " + quoteIdent(name) + "` reorders the rows once if locality matters.",
+			Level:  "info",
+		})
+	}
+	if unique {
+		for _, c := range cols {
+			if ci := columnIndex(tbl.Columns, c); ci >= 0 && !tbl.Columns[ci].NotNull && where == nil {
+				t.res.Explanations = append(t.res.Explanations, Explanation{
+					Object: "index." + obj, Source: "UNIQUE on nullable column " + c, Target: "UNIQUE (NULLs distinct)",
+					Reason: "SQL Server lets a unique key hold one NULL only; PostgreSQL treats NULLs as distinct and accepts several. Add NULLS NOT DISTINCT (PostgreSQL 15+) to the index if the application relies on the T-SQL behaviour.",
+					Level:  "info",
+				})
+				break
+			}
+		}
+	}
+	t.res.Plan.Indexes = append(t.res.Plan.Indexes, pgIdx)
+}
+
+func (t *translator) translateTSQLIndex(s *ast.CreateIndex) {
+	idx := t.tsqlTable(s.Table.Schema, s.Table.Name, "dbo")
+	if idx < 0 {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: "index." + normalizeTSQLIdent(s.Name),
+			Source: "CREATE INDEX " + s.Name + " ON " + s.Table.Name,
+			Target: "(skipped)",
+			Reason: "The indexed relation is not a migrated table (an indexed view, or a table outside the script). PostgreSQL has no indexed views: use a materialized view with its own indexes if the precomputation matters.",
+			Level:  "info",
+		})
+		return
+	}
+	t.tsqlAddIndex(idx, s.Name, s.Unique, s.Columns, s.Include, s.Where, s.Clustered, t.res.Plan.Tables[idx].SourceSchema)
+}
+
+// fillTSQLFKRefColumns completes the FKs written `REFERENCES t` without a
+// column list: they reference the primary key of t, which the PG DDL
+// must name explicitly.
+func (t *translator) fillTSQLFKRefColumns() {
+	for i := range t.res.Plan.ForeignKeys {
+		fk := &t.res.Plan.ForeignKeys[i]
+		if len(fk.RefColumns) > 0 {
+			continue
+		}
+		if idx, ok := t.tsql.tables[t.tableKey(fk.RefSchema, fk.RefTable)]; ok {
+			fk.RefColumns = append([]string{}, t.res.Plan.Tables[idx].PK...)
+		}
+	}
+}
+
+// computeTSQLCopyColumns sets PGTable.CopyColumns on the SQL Server
+// tables whose copy cannot use the copier's catalog default (computed,
+// rowversion and spatial columns excluded): tables with computed columns
+// created plain (CopiedGenerated) and tables with rowversion / spatial
+// columns. The list holds the SOURCE column names (the copier selects
+// them from SQL Server and folds them for PG), generated PG columns
+// excluded.
+func (t *translator) computeTSQLCopyColumns() {
+	if t.tsql == nil {
+		return
+	}
+	for i := range t.res.Plan.Tables {
+		tbl := &t.res.Plan.Tables[i]
+		if !t.tsql.explicitCopy[i] && len(tbl.CopiedGenerated) == 0 {
+			continue
+		}
+		src := t.tsql.srcCols[i]
+		cols := make([]string, 0, len(tbl.Columns))
+		for _, c := range tbl.Columns {
+			if c.Generated != nil {
+				continue
+			}
+			name := c.Name
+			if s, ok := src[c.Name]; ok {
+				name = s
+			}
+			cols = append(cols, name)
+		}
+		tbl.CopyColumns = cols
+	}
+	// The history table emitTSQLTemporal appended for an emulated
+	// system-versioned table copies every column of the current table
+	// by its source name: the source history table stores them all as
+	// plain columns (computed ones included), and the copier's catalog
+	// default would leave rowversion / spatial columns out while the PG
+	// history table declares them.
+	for i := range t.res.Plan.Tables {
+		cur := &t.res.Plan.Tables[i]
+		tv := cur.TSQLTemporal
+		if tv == nil || !tv.CopyHistory {
+			continue
+		}
+		hi, ok := t.tsql.tables[t.tableKey(tv.HistorySchema, tv.HistoryTable)]
+		if !ok {
+			continue
+		}
+		src := t.tsql.srcCols[i]
+		cols := make([]string, 0, len(cur.Columns))
+		for _, c := range cur.Columns {
+			name := c.Name
+			if s, ok := src[c.Name]; ok {
+				name = s
+			}
+			cols = append(cols, name)
+		}
+		t.res.Plan.Tables[hi].CopyColumns = cols
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T-SQL DDL expressions (DEFAULT, CHECK, computed columns, index filters)
+// ---------------------------------------------------------------------------
+
+// tsqlDDLExpr runs the registered SQL Server expression rewriter over a
+// DDL expression, then turns the sequence references it left
+// (`NEXT VALUE FOR s.seq`) into nextval() on the PG sequence. The T-SQL
+// visitors already rewrite them the same way; this pass keeps the core
+// correct when no hook is registered.
+func (t *translator) tsqlDDLExpr(e ast.Expr, ctx *ExprCtx) ast.Expr {
+	if e == nil {
+		return nil
+	}
+	e = rewriteHookedExpr(t.opt.SourceKind, e, ctx)
+	out, _ := ast.Rewrite(e, func(n ast.Node) ast.Node {
+		sr, ok := n.(*ast.SequenceRef)
+		if !ok || !strings.EqualFold(sr.Op, "NEXTVAL") {
+			return n
+		}
+		schema, name := t.tsql.run.ResolveRelation(sr.Schema, sr.Name, ctx.DefaultSchema)
+		return &ast.FuncCall{Name: "nextval", Args: []ast.Expr{
+			&ast.Literal{Kind: "string", Text: quoteIdent(schema) + "." + quoteIdent(name), P: sr.P},
+		}, P: sr.P}
+	}).(ast.Expr)
+	if out == nil {
+		return e
+	}
+	return out
+}
+
+// tsqlStripParens removes the parentheses SQL Server's catalog wraps
+// around stored expressions (`((0))`, `(getdate())`, `([qty]>(0))`):
+// every outer pair, and the pairs around a literal operand anywhere.
+// Operator precedence never depends on them: a pair around a literal
+// or a lone call is redundant, and an outer pair is supplied again by
+// the DDL clause (CHECK (…), WHERE (…), GENERATED ALWAYS AS (…)) or is
+// not needed by DEFAULT.
+func tsqlStripParens(e ast.Expr) ast.Expr {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok || p.Inner == nil {
+			break
+		}
+		e = p.Inner
+	}
+	if e == nil {
+		return nil
+	}
+	out, ok := ast.Rewrite(e, func(n ast.Node) ast.Node {
+		p, ok := n.(*ast.ParenExpr)
+		if !ok {
+			return n
+		}
+		switch p.Inner.(type) {
+		case *ast.Literal, *ast.Ident, *ast.FuncCall, *ast.ParenExpr:
+			return p.Inner
+		case *ast.UnaryExpr:
+			if _, lit := p.Inner.(*ast.UnaryExpr).Rhs.(*ast.Literal); lit {
+				return p.Inner
+			}
+		}
+		return n
+	}).(ast.Expr)
+	if !ok {
+		return e
+	}
+	return out
+}
+
+// tsqlDefault renders a column (or parameter) DEFAULT; boolean is set for
+// a bit column / parameter (boolean on PG, directly or through a domain).
+func (t *translator) tsqlDefault(e ast.Expr, boolean bool, ctx *ExprCtx) string {
+	e = tsqlStripParens(t.tsqlDDLExpr(tsqlStripParens(e), ctx))
+	if boolean {
+		// bit DEFAULT (0) / (1): PG has no implicit integer → boolean
+		// conversion in a DEFAULT.
+		if lit, ok := e.(*ast.Literal); ok && lit.Kind == "number" {
+			switch lit.Text {
+			case "0":
+				return "false"
+			case "1":
+				return "true"
+			}
+		}
+	}
+	return pgast.WriteExpr(e)
+}
+
+// tsqlComputedColumn translates the computed column tbl.Columns[i]
+// (source c, typed by pass 1.5). A user override wins. A PERSISTED column
+// whose expression squishy proves immutable and identical on PG becomes
+// GENERATED ALWAYS AS (…) STORED; any other one (non-persisted, or an
+// expression with user functions, getdate(), newid(), text conversions
+// PG prints differently, …) becomes a plain column whose values the copy
+// reads from the source (CopiedGenerated), with a blocking prerequisite.
+func (t *translator) tsqlComputedColumn(tbl *PGTable, i int, s *ast.CreateTable, c *ast.ColumnDef, ctx *ExprCtx, classes map[string]tsqlClass) {
+	col := &tbl.Columns[i]
+	obj := tbl.Schema + "." + tbl.Name + "." + col.Name
+	src := pgast.WriteExpr(c.Generated.Expr)
+	ovTable := tbl.Name
+	if len(t.opt.generatedOverrides(ovTable, c.Name)) == 0 {
+		ovTable = s.Name
+	}
+	if t.takeGeneratedOverride(tbl, i, ovTable, c.Name, obj, src, t.tsql.overrideUsed) {
+		return
+	}
+	// A non-PERSISTED column is computed on every read by SQL Server and
+	// a PG generated column on every write: for an expression proven
+	// immutable (same inputs, same value) both read the same value, so
+	// the proof below decides for both kinds alike.
+	kind := "PERSISTED computed column"
+	if c.Generated.Virtual {
+		kind = "non-PERSISTED computed column"
+	}
+	// The source half of the proof runs first: rewriters work in place
+	// (ast.Rewrite), the source tree is not intact afterwards.
+	p := &tsqlComputedProof{t: t, classes: classes, types: map[string]ast.DataType{}}
+	for _, sc := range s.Columns {
+		if sc.Type != nil {
+			p.types[normalizeTSQLIdent(sc.Name)] = sc.Type
+		}
+	}
+	expr := tsqlStripParens(c.Generated.Expr)
+	_, reason := p.source(expr)
+	if reason == "" {
+		expr = p.applyRounding(expr)
+	}
+	rewritten := tsqlStripParens(t.tsqlDDLExpr(expr, ctx))
+	if reason == "" && p.concat {
+		rewritten = tsqlImmutableConcat(rewritten)
+	}
+	if reason == "" && p.userFuncs {
+		// Proven but calling a function of the script: a trigger
+		// computes the column (emitTSQLComputedTriggers).
+		col.Generated = nil
+		tbl.CopiedGenerated = append(tbl.CopiedGenerated, col.Name)
+		t.tsql.computedTriggers = append(t.tsql.computedTriggers, tsqlComputedTrigger{
+			// tbl is appended to Plan.Tables once its columns are done.
+			table: len(t.res.Plan.Tables), col: col.Name, expr: rewritten, src: src,
+		})
+		return
+	}
+	if reason == "" {
+		reason = p.target(rewritten)
+	}
+	if reason != "" {
+		t.copyRefusedGenerated(tbl, i, obj, src, "table.computed_not_generated",
+			"the expression of the T-SQL "+kind+" "+obj+" is not proven immutable and identical on PostgreSQL ("+reason+")")
+		return
+	}
+	col.Generated = &PGGenerated{Expr: pgast.WriteExpr(rewritten), Stored: true}
+	source, why := "AS ("+src+") PERSISTED", "PERSISTED computed column whose expression is proven immutable and identical on PostgreSQL: PG computes it on write, like SQL Server stores it."
+	if c.Generated.Virtual {
+		source = "AS (" + src + ")"
+		why = "non-PERSISTED computed column whose expression is proven immutable and identical on PostgreSQL: SQL Server computes it on read, PG on write (PostgreSQL 17 has only STORED generated columns); an immutable expression gives the same value either way."
+	}
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: "table." + obj,
+		Source: source,
+		Target: col.Type + " GENERATED ALWAYS AS (" + col.Generated.Expr + ") STORED",
+		Reason: why,
+		Level:  "info",
+	})
+}
+
+// tsqlImmutableConcat rewrites the concat() calls of a proven computed
+// column (tsqlComputedProof accepted their arguments) into the chain
+// coalesce(a::text, '') || …: PG's concat() is only STABLE (it calls
+// the output function of any argument type), so a generated column
+// cannot use it, while T-SQL CONCAT gives exactly that chain for text,
+// integer and decimal arguments (a NULL argument is the empty string).
+func tsqlImmutableConcat(e ast.Expr) ast.Expr {
+	out, ok := ast.Rewrite(e, func(n ast.Node) ast.Node {
+		fc, ok := n.(*ast.FuncCall)
+		if !ok || !strings.EqualFold(fc.Name, "concat") {
+			return n
+		}
+		var chain ast.Expr
+		for _, a := range fc.Args {
+			var op ast.Expr
+			switch x := unwrapParens(a).(type) {
+			case *ast.Literal:
+				switch x.Kind {
+				case "null":
+					continue
+				case "string":
+					op = x
+				}
+			}
+			if op == nil {
+				op = &ast.FuncCall{Name: "coalesce", Args: []ast.Expr{
+					mysqlGenCastText(a),
+					&ast.Literal{Kind: "string", Text: "", P: fc.P},
+				}, P: fc.P}
+			}
+			if chain == nil {
+				chain = op
+				continue
+			}
+			chain = &ast.BinaryExpr{Op: "||", Lhs: chain, Rhs: op, P: fc.P}
+		}
+		if chain == nil {
+			return &ast.Literal{Kind: "string", Text: "", P: fc.P}
+		}
+		return &ast.ParenExpr{Inner: chain, P: fc.P}
+	}).(ast.Expr)
+	if !ok {
+		return e
+	}
+	return out
+}
+
+// tsqlClass is the value class of a T-SQL expression, the granularity at
+// which tsqlComputedProof proves a computed column identical on PG.
+type tsqlClass int
+
+const (
+	tsqlClassUnknown tsqlClass = iota
+	tsqlClassNull              // NULL literal
+	tsqlClassInteger
+	tsqlClassNumeric // decimal / numeric, number literals
+	tsqlClassMoney   // money / smallmoney (text form differs on PG)
+	tsqlClassFloat
+	tsqlClassBool
+	tsqlClassText  // varchar / nvarchar / text / string literals
+	tsqlClassChar  // char(n) / nchar(n): blank-padded (PG strips the pad in ||)
+	tsqlClassOther // temporal, binary, uuid, xml, …
+	// tsqlClassHierarchy is a hierarchyid value (text path on PG): only
+	// its methods (GetLevel) and equality are proven.
+	tsqlClassHierarchy
+)
+
+// tsqlClassOf classifies a T-SQL data type.
+func (t *translator) tsqlClassOf(dt ast.DataType) tsqlClass {
+	switch x := dt.(type) {
+	case *ast.IntType:
+		return tsqlClassInteger
+	case *ast.DecimalType:
+		return tsqlClassNumeric
+	case *ast.FloatType:
+		return tsqlClassFloat
+	case *ast.BitType:
+		return tsqlClassBool
+	case *ast.CharType:
+		if !x.Max && (strings.EqualFold(x.Name, "CHAR") || strings.EqualFold(x.Name, "NCHAR")) {
+			return tsqlClassChar
+		}
+		return tsqlClassText
+	case *ast.TextType:
+		return tsqlClassText
+	case *ast.TSQLType:
+		switch x.Name {
+		case "BIT":
+			return tsqlClassBool
+		case "MONEY", "SMALLMONEY":
+			return tsqlClassMoney
+		case "NTEXT", "SYSNAME":
+			return tsqlClassText
+		case "HIERARCHYID":
+			return tsqlClassHierarchy
+		}
+		return tsqlClassOther
+	case *ast.UserDefinedType:
+		if t.tsql != nil {
+			if alias := t.tsql.aliasTypes[tsqlUserTypeKey(x.Schema, x.Name)]; alias != nil && alias.BaseType != nil {
+				return t.tsqlClassOf(alias.BaseType)
+			}
+		}
+		return tsqlClassUnknown
+	case nil:
+		return tsqlClassUnknown
+	}
+	return tsqlClassOther
+}
+
+// tsqlNumericClass reports whether c takes part in arithmetic.
+func tsqlNumericClass(c tsqlClass) bool {
+	switch c {
+	case tsqlClassInteger, tsqlClassNumeric, tsqlClassMoney, tsqlClassFloat:
+		return true
+	}
+	return false
+}
+
+// tsqlComputedProof proves that a PERSISTED computed column can be a
+// PG stored generated column: source runs on the T-SQL expression
+// (parentheses stripped), target on the PG expression the SQL Server
+// rewriter produced; each returns why not ("" when it can).
+//
+// The proof is in two halves. On the SOURCE AST, in T-SQL terms: only
+// column references of the same table, literals, arithmetic on numbers,
+// `+` between two variable-length strings, CASE, ISNULL / COALESCE /
+// NULLIF / UPPER / LOWER / LTRIM / RTRIM / ABS and casts whose text form
+// is identical on both sides (integers, decimals and strings to
+// varchar; numbers between numeric types) — so the value PG computes is
+// the value SQL Server stored. On the PG AST: only immutable functions
+// (no shim, user or schema-qualified call, no subquery, sequence or
+// variable), and no string `+` left unrewritten.
+type tsqlComputedProof struct {
+	t       *translator
+	classes map[string]tsqlClass
+	// textPlus is set when the source concatenates strings with `+`
+	// (the PG expression must then hold || instead).
+	textPlus bool
+	// concat is set when the source calls CONCAT (rewritten by
+	// tsqlImmutableConcat on the PG side).
+	concat bool
+	// userFuncs is set when the source calls a deterministic scalar
+	// function of the script: the column is then computed by a trigger
+	// (tsql_computed_trigger.go) instead of a generated column.
+	userFuncs bool
+	// types maps a folded column name of the table to its T-SQL data
+	// type: the decimal(p, s) rules of tsql_computed_decimal.go need the
+	// precision and scale the class does not carry.
+	types map[string]ast.DataType
+	// roundAt maps the products of the source tree SQL Server rounds to a
+	// reduced scale (past precision 38) to that scale (applyRounding).
+	roundAt map[*ast.BinaryExpr]int
+}
+
+// source proves e on the T-SQL side and returns its class.
+func (p *tsqlComputedProof) source(e ast.Expr) (tsqlClass, string) {
+	switch x := e.(type) {
+	case *ast.Literal:
+		switch x.Kind {
+		case "number":
+			return tsqlClassNumeric, ""
+		case "string":
+			return tsqlClassText, ""
+		case "null":
+			return tsqlClassNull, ""
+		}
+		return tsqlClassUnknown, x.Kind + " literal"
+	case *ast.Ident:
+		if x.Variable || len(x.Parts) != 1 {
+			return tsqlClassUnknown, "reference " + strings.Join(x.Parts, ".")
+		}
+		c, ok := p.classes[normalizeTSQLIdent(x.Parts[0])]
+		if !ok || c == tsqlClassUnknown {
+			return tsqlClassUnknown, "column " + x.Parts[0] + " of unproven type"
+		}
+		if c == tsqlClassOther {
+			return c, "column " + x.Parts[0] + " (temporal / binary / uuid values convert differently)"
+		}
+		return c, ""
+	case *ast.ParenExpr:
+		return p.source(x.Inner)
+	case *ast.UnaryExpr:
+		c, r := p.source(x.Rhs)
+		if r != "" {
+			return c, r
+		}
+		if (x.Op == "-" || x.Op == "+") && tsqlNumericClass(c) {
+			return c, ""
+		}
+		return tsqlClassUnknown, "unary " + x.Op
+	case *ast.BinaryExpr:
+		l, r1 := p.source(x.Lhs)
+		if r1 != "" {
+			return l, r1
+		}
+		r, r2 := p.source(x.Rhs)
+		if r2 != "" {
+			return r, r2
+		}
+		switch x.Op {
+		case "+":
+			if l == tsqlClassText || r == tsqlClassText {
+				if (l == tsqlClassText || l == tsqlClassNull) && (r == tsqlClassText || r == tsqlClassNull) {
+					p.textPlus = true
+					return tsqlClassText, ""
+				}
+				return tsqlClassUnknown, "string concatenation with a non-string or fixed-length operand"
+			}
+			fallthrough
+		case "-", "*", "/", "%":
+			if (tsqlNumericClass(l) || l == tsqlClassNull) && (tsqlNumericClass(r) || r == tsqlClassNull) {
+				res := tsqlArithClass(l, r)
+				if res == tsqlClassNumeric {
+					// Exact non-integer arithmetic: SQL Server types the result
+					// decimal(p, s) and may round it (tsql_computed_decimal.go).
+					if why := p.tsqlDecimalReason(x); why != "" {
+						return tsqlClassUnknown, why
+					}
+				}
+				return res, ""
+			}
+			return tsqlClassUnknown, "operator " + x.Op + " on non-numeric operands"
+		case "<", ">", "<=", ">=":
+			if l == tsqlClassHierarchy || r == tsqlClassHierarchy {
+				// hierarchyid orders depth-first, its text path does not.
+				return tsqlClassUnknown, "hierarchyid ordering comparison"
+			}
+			return tsqlClassBool, ""
+		case "=", "<>", "!=", "AND", "OR":
+			return tsqlClassBool, ""
+		}
+		return tsqlClassUnknown, "operator " + x.Op
+	case *ast.CaseExpr:
+		if x.Operand != nil {
+			if _, r := p.source(x.Operand); r != "" {
+				return tsqlClassUnknown, r
+			}
+		}
+		res := tsqlClassUnknown
+		branch := func(e ast.Expr) string {
+			c, r := p.source(e)
+			if r != "" {
+				return r
+			}
+			switch {
+			case c == tsqlClassNull:
+			case res == tsqlClassUnknown:
+				res = c
+			case res != c && !(tsqlNumericClass(res) && tsqlNumericClass(c)):
+				return "CASE branches of different types"
+			}
+			return ""
+		}
+		for _, w := range x.Whens {
+			if _, r := p.source(w.Match); r != "" {
+				return tsqlClassUnknown, r
+			}
+			if r := branch(w.Then); r != "" {
+				return tsqlClassUnknown, r
+			}
+		}
+		if x.Else != nil {
+			if r := branch(x.Else); r != "" {
+				return tsqlClassUnknown, r
+			}
+		}
+		return res, ""
+	case *ast.CastExpr:
+		if x.ConvertStyle != nil || x.Try {
+			return tsqlClassUnknown, "CONVERT style / TRY_CAST"
+		}
+		in, r := p.source(x.Expr)
+		if r != "" {
+			return in, r
+		}
+		out := p.t.tsqlClassOf(x.Type)
+		switch {
+		case out == tsqlClassText && (in == tsqlClassInteger || in == tsqlClassNumeric || in == tsqlClassText || in == tsqlClassNull):
+			return tsqlClassText, ""
+		case tsqlNumericClass(out) && out != tsqlClassMoney && (tsqlNumericClass(in) || in == tsqlClassNull):
+			return out, ""
+		}
+		return tsqlClassUnknown, "conversion to " + tsqlTypeLabel(x.Type)
+	case *ast.FuncCall:
+		args := make([]tsqlClass, len(x.Args))
+		for i, a := range x.Args {
+			c, r := p.source(a)
+			if r != "" {
+				return c, r
+			}
+			args[i] = c
+		}
+		switch strings.ToUpper(x.Name) {
+		case "ISNULL", "COALESCE", "NULLIF":
+			if strings.EqualFold(x.Name, "ISNULL") && len(x.Args) == 2 {
+				if why := p.isnullFits(x.Args[0], x.Args[1]); why != "" {
+					return tsqlClassUnknown, why
+				}
+			}
+			res := tsqlClassUnknown
+			for _, c := range args {
+				switch {
+				case c == tsqlClassNull:
+				case res == tsqlClassUnknown:
+					res = c
+				case res != c && !(tsqlNumericClass(res) && tsqlNumericClass(c)):
+					return tsqlClassUnknown, x.Name + " over different types"
+				}
+			}
+			return res, ""
+		case "UPPER", "LOWER", "LTRIM", "RTRIM":
+			if len(args) == 1 && (args[0] == tsqlClassText || args[0] == tsqlClassNull) {
+				return tsqlClassText, ""
+			}
+		case "ABS":
+			if len(args) == 1 && tsqlNumericClass(args[0]) {
+				return args[0], ""
+			}
+		case "CONCAT":
+			// Each argument is converted to its string form (a NULL one
+			// to the empty string): the same text as ::text on PG for
+			// strings, integers and decimals. char(n) keeps its pad in
+			// T-SQL but loses it in a PG text cast; money, float, bit
+			// and temporal values print differently.
+			for i, c := range args {
+				switch c {
+				case tsqlClassText, tsqlClassInteger, tsqlClassNumeric, tsqlClassNull:
+				default:
+					return tsqlClassUnknown, "CONCAT argument " + pgast.WriteExpr(x.Args[i]) + " does not print the same text on PostgreSQL"
+				}
+			}
+			if len(args) > 0 {
+				p.concat = true
+				return tsqlClassText, ""
+			}
+		}
+		if dt := p.t.tsql.funcReturns[tsqlFuncKey(x.Name)]; dt != nil && p.t.tsqlDeterministicFunc(x.Name) {
+			p.userFuncs = true
+			return p.t.tsqlClassOf(dt), ""
+		}
+		return tsqlClassUnknown, "function " + x.Name
+	case *ast.MethodCall:
+		// hierarchyid::GetLevel() of a column: the depth of the path,
+		// computed by the IMMUTABLE tsql.hierarchyid_getlevel shim.
+		if strings.EqualFold(x.Method, "GetLevel") && x.StaticType == "" && len(x.Args) == 0 {
+			if c, r := p.source(x.Target); r == "" && c == tsqlClassHierarchy {
+				return tsqlClassInteger, ""
+			}
+		}
+		return tsqlClassUnknown, "method " + x.Method + "()"
+	}
+	return tsqlClassUnknown, "expression not proven identical"
+}
+
+// tsqlArithClass is the class of an arithmetic result.
+func tsqlArithClass(l, r tsqlClass) tsqlClass {
+	switch {
+	case l == tsqlClassFloat || r == tsqlClassFloat:
+		return tsqlClassFloat
+	case l == tsqlClassInteger && (r == tsqlClassInteger || r == tsqlClassNull):
+		return tsqlClassInteger
+	case r == tsqlClassInteger && l == tsqlClassNull:
+		return tsqlClassInteger
+	}
+	return tsqlClassNumeric
+}
+
+// tsqlImmutableFuncs are the PG functions a generated column may call:
+// immutable built-ins the SQL Server rewriter emits for the source
+// functions tsqlComputedProof accepts.
+var tsqlImmutableFuncs = map[string]bool{
+	"coalesce": true, "nullif": true, "abs": true, "upper": true, "lower": true,
+	"ltrim": true, "rtrim": true, "btrim": true,
+	// The one shim function declared IMMUTABLE for a generated column
+	// (tsql_shim/70_hierarchyid.sql): GetLevel() of a hierarchyid.
+	"tsql.hierarchyid_getlevel": true,
+}
+
+// target proves the PG expression immutable; "" when it is.
+func (p *tsqlComputedProof) target(e ast.Expr) string {
+	reason := ""
+	ast.Walk(tsqlVisitFunc(func(n ast.Node) bool {
+		if reason != "" {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.FuncCall:
+			if !tsqlImmutableFuncs[strings.ToLower(x.Name)] {
+				reason = "function " + x.Name + " is not a known immutable PostgreSQL function"
+			}
+		case *ast.BinaryExpr:
+			if x.Op == "+" && p.textPlus {
+				reason = "string + not rewritten to ||"
+			}
+		case *ast.Ident:
+			if x.Variable {
+				reason = "variable " + strings.Join(x.Parts, ".")
+			}
+		case *ast.SubqueryExpr, *ast.ExistsExpr, *ast.SequenceRef, *ast.MethodCall,
+			*ast.RawExpr, *ast.CollateExpr, *ast.WindowedAgg:
+			reason = "expression not allowed in a generated column"
+		}
+		return reason == ""
+	}), e)
+	return reason
+}
+
+// tsqlVisitFunc adapts a function to ast.Visitor (descend while it
+// returns true).
+type tsqlVisitFunc func(ast.Node) bool
+
+func (f tsqlVisitFunc) Visit(n ast.Node) ast.Visitor {
+	if n == nil || !f(n) {
+		return nil
+	}
+	return f
+}
+
+// inferTSQLExprType infers the PG type and class of a T-SQL computed
+// column from its source expression (T-SQL computed columns declare no
+// type). "" when it cannot.
+func (t *translator) inferTSQLExprType(e ast.Expr, tbl *PGTable, classes map[string]tsqlClass) (string, tsqlClass) {
+	switch x := e.(type) {
+	case *ast.ParenExpr:
+		return t.inferTSQLExprType(x.Inner, tbl, classes)
+	case *ast.Literal:
+		switch x.Kind {
+		case "number":
+			if tsqlIsIntegerToken(x.Text) {
+				return "integer", tsqlClassInteger
+			}
+			return "numeric", tsqlClassNumeric
+		case "string":
+			return "text", tsqlClassText
+		case "money":
+			return "numeric(19,4)", tsqlClassMoney
+		}
+	case *ast.Ident:
+		if len(x.Parts) == 1 && !x.Variable {
+			name := normalizeTSQLIdent(x.Parts[0])
+			if ci := columnIndex(tbl.Columns, name); ci >= 0 && tbl.Columns[ci].Type != "" {
+				return tbl.Columns[ci].Type, classes[name]
+			}
+		}
+	case *ast.UnaryExpr:
+		return t.inferTSQLExprType(x.Rhs, tbl, classes)
+	case *ast.CastExpr:
+		return MapType(t.opt.SourceKind, x.Type, "", t.caps()).PG, t.tsqlClassOf(x.Type)
+	case *ast.BinaryExpr:
+		lt, lc := t.inferTSQLExprType(x.Lhs, tbl, classes)
+		rt, rc := t.inferTSQLExprType(x.Rhs, tbl, classes)
+		if x.Op == "+" && (lc == tsqlClassText || lc == tsqlClassChar || rc == tsqlClassText || rc == tsqlClassChar) {
+			return "text", tsqlClassText
+		}
+		switch x.Op {
+		case "+", "-", "*", "/", "%":
+			switch c := tsqlArithClass(lc, rc); {
+			case lt == "" && rt == "":
+				return "", tsqlClassUnknown
+			case c == tsqlClassFloat:
+				return "double precision", c
+			case c == tsqlClassInteger:
+				if lt == "bigint" || rt == "bigint" {
+					return "bigint", c
+				}
+				return "integer", c
+			default:
+				return "numeric", tsqlClassNumeric
+			}
+		}
+	case *ast.CaseExpr:
+		for _, w := range x.Whens {
+			if pt, c := t.inferTSQLExprType(w.Then, tbl, classes); pt != "" {
+				return pt, c
+			}
+		}
+		if x.Else != nil {
+			return t.inferTSQLExprType(x.Else, tbl, classes)
+		}
+	case *ast.FuncCall:
+		switch strings.ToUpper(x.Name) {
+		case "ISNULL", "COALESCE", "NULLIF", "ABS", "ROUND", "FLOOR", "CEILING":
+			for _, a := range x.Args {
+				if pt, c := t.inferTSQLExprType(a, tbl, classes); pt != "" {
+					return pt, c
+				}
+			}
+		case "UPPER", "LOWER", "LTRIM", "RTRIM", "TRIM", "LEFT", "RIGHT", "SUBSTRING", "REPLACE",
+			"STUFF", "CONCAT", "CONCAT_WS", "FORMAT", "REPLICATE", "REVERSE", "STR", "CHAR", "NCHAR", "SPACE":
+			return "text", tsqlClassText
+		case "LEN", "DATALENGTH", "CHARINDEX", "PATINDEX", "DATEDIFF", "DATEPART", "YEAR", "MONTH", "DAY", "ASCII", "UNICODE":
+			return "integer", tsqlClassInteger
+		case "GETDATE", "SYSDATETIME", "GETUTCDATE", "SYSUTCDATETIME", "DATEADD", "CURRENT_TIMESTAMP":
+			return "timestamp(3)", tsqlClassOther
+		case "NEWID", "NEWSEQUENTIALID":
+			return "uuid", tsqlClassOther
+		}
+		// A scalar function of the script: its declared return type.
+		if dt := t.tsql.funcReturns[tsqlFuncKey(x.Name)]; dt != nil {
+			return MapType(t.opt.SourceKind, dt, "", t.caps()).PG, t.tsqlClassOf(dt)
+		}
+	case *ast.MethodCall:
+		switch strings.ToUpper(x.Method) {
+		case "GETLEVEL":
+			return "smallint", tsqlClassInteger
+		case "TOSTRING", "STASTEXT":
+			return "text", tsqlClassText
+		}
+	}
+	return "", tsqlClassUnknown
+}
+
+// tsqlFuncKey is the sourceObjectKey of a function call name (a single
+// identifier or schema.name: the T-SQL parser keeps a qualified call
+// name dotted).
+func tsqlFuncKey(name string) string {
+	schema, bare := "", name
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] == '.' {
+			schema, bare = name[:i], name[i+1:]
+			break
+		}
+	}
+	return sourceObjectKey(schema, bare)
+}
+
+// tsqlIsIntegerToken reports whether a number literal token is made of
+// decimal digits only.
+func tsqlIsIntegerToken(tok string) bool {
+	if tok == "" {
+		return false
+	}
+	for i := 0; i < len(tok); i++ {
+		if tok[i] < '0' || tok[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// T-SQL views
+// ---------------------------------------------------------------------------
+
+func (t *translator) translateTSQLView(s *ast.CreateView) {
+	st := t.tsql
+	srcSchema := s.View.Schema
+	if srcSchema == "" {
+		srcSchema = "dbo"
+	}
+	schema := t.useSchema(srcSchema)
+	name := normalizeTSQLIdent(s.View.Name)
+	obj := "view." + schema + "." + name
+	cols := make([]string, len(s.Columns))
+	for i, c := range s.Columns {
+		cols[i] = normalizeTSQLIdent(c)
+	}
+	var (
+		body   string
+		refs   []string
+		reason string
+		level  = "info"
+	)
+	if s.Select != nil {
+		sel, labels := rewriteHookedSelect(t.opt.SourceKind, s.Select, &ExprCtx{Run: st.run, Object: obj, DefaultSchema: srcSchema})
+		labels = append(labels, tsqlSelectResidue(sel)...)
+		body = pgast.WriteSelectStmt(sel)
+		refs = collectTableRefs(sel)
+		if refs == nil {
+			refs = []string{}
+		}
+		if len(labels) > 0 {
+			t.warn(obj, "view.functions",
+				"view uses T-SQL constructs the translator could not rewrite ("+strings.Join(labels, "; ")+"); manual review required")
+		}
+		reason = "View body parsed and translated on the AST (T-SQL rewrites of the registered SQL Server passes)."
+	} else {
+		body = s.SelectBody
+		cause := s.SelectParseError
+		if cause == "" {
+			cause = "no typed SELECT"
+		}
+		t.warnSev(obj, "view.parse",
+			"view body could not be parsed ("+cause+"); copied verbatim — manual review required", SeverityBlocking)
+		reason = "View body could not be parsed and is copied verbatim; manual review required."
+		level = "warn"
+	}
+	if s.SchemaBinding || len(s.ViewOptions) > 0 {
+		opts := append([]string{}, s.ViewOptions...)
+		if s.SchemaBinding {
+			opts = append([]string{"SCHEMABINDING"}, opts...)
+		}
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "WITH " + strings.Join(opts, ", "), Target: "(dropped)",
+			Reason: "PostgreSQL views always depend on the relations they read (DROP refuses while the view exists, like SCHEMABINDING); ENCRYPTION and VIEW_METADATA have no counterpart.",
+			Level:  "info",
+		})
+	}
+	node := &pgast.CreateView{Schema: schema, Name: name, Columns: cols, Body: body, CheckOption: s.CheckOption}
+	st.views[t.tableKey(schema, name)] = len(t.res.Plan.Views)
+	t.res.Plan.Views = append(t.res.Plan.Views, PGView{
+		Schema: schema, Name: name, SelectBody: s.SelectBody, CheckOption: s.CheckOption,
+		DDL:        pgast.Write([]pgast.Stmt{node}),
+		References: refs,
+	})
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: obj, Source: "CREATE VIEW", Target: "CREATE OR REPLACE VIEW", Reason: reason, Level: level,
+	})
+}
+
+// tsqlSelectResidue lists the T-SQL-only clauses still present on a
+// rewritten query that the select hook does not report itself: the PG
+// writer would drop them silently. FOR XML / JSON and TOP … PERCENT are
+// reported by the hook's residual walk at every depth of the query
+// (tsqlResidualVisitor), so they are not repeated here.
+func tsqlSelectResidue(sel *ast.SelectStmt) []string {
+	var out []string
+	if sel == nil {
+		return nil
+	}
+	if sel.OptionClause != "" {
+		out = append(out, "OPTION (…) query hints")
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// T-SQL routines
+// ---------------------------------------------------------------------------
+
+// tsqlRoutineParams builds the PG parameters of a routine. procedure
+// selects the procedure rendering (modes; OUTPUT → INOUT).
+func (t *translator) tsqlRoutineParams(params []ast.Param, procedure bool, ctx *ExprCtx) []RoutineParam {
+	out := make([]RoutineParam, 0, len(params))
+	for _, p := range params {
+		name := tsqlParamName(p.Name)
+		tr := MapType(t.opt.SourceKind, p.Type, name, t.caps())
+		typ := tr.PG
+		if ud, ok := p.Type.(*ast.UserDefinedType); ok {
+			if ref, ok := lookupTSQLUserType(t.userTypes, ud.Schema, ud.Name); ok && ref.Kind == "composite" && p.ReadOnly {
+				typ += "[]"
+			}
+		}
+		if tr.Warning != "" {
+			t.warnSev(ctx.Object+"."+name, tsqlWarningKind(tr), tr.Warning, tr.WarningSeverity)
+		}
+		mode := "IN"
+		if procedure && (p.Output || strings.EqualFold(p.Direction, "INOUT") || strings.EqualFold(p.Direction, "OUT")) {
+			mode = "INOUT"
+		}
+		rp := RoutineParam{SourceName: p.Name, Name: name, Type: typ, Mode: mode, Param: p}
+		if p.Default != nil {
+			rp.Default = t.tsqlDefault(p.Default, t.tsqlClassOf(p.Type) == tsqlClassBool, ctx)
+		}
+		out = append(out, rp)
+	}
+	// PG: once a parameter has a default every following input
+	// parameter needs one. T-SQL has no such rule (callers name the
+	// arguments they pass): pad with DEFAULT NULL.
+	seen, padded := false, false
+	for i := range out {
+		if out[i].Default != "" {
+			seen = true
+			continue
+		}
+		if seen {
+			out[i].Default = "NULL"
+			padded = true
+		}
+	}
+	if padded {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: ctx.Object, Source: "parameter defaults", Target: "DEFAULT NULL on the following parameters",
+			Reason: "PostgreSQL requires a default on every parameter after the first defaulted one; T-SQL does not. The parameters after it without a default got DEFAULT NULL: a call omitting them now passes NULL instead of failing.",
+			Level:  "info",
+		})
+	}
+	return out
+}
+
+// tsqlSignature renders routine parameters for CREATE FUNCTION /
+// PROCEDURE (procedure: with modes).
+func tsqlSignature(params []RoutineParam, procedure bool) string {
+	parts := make([]string, len(params))
+	for i, p := range params {
+		s := quoteIdent(p.Name) + " " + p.Type
+		if procedure {
+			s = p.Mode + " " + s
+		}
+		if p.Default != "" {
+			s += " DEFAULT " + p.Default
+		}
+		parts[i] = s
+	}
+	return strings.Join(parts, ", ")
+}
+
+// tsqlCommentTarget renders the COMMENT ON target of a routine:
+// `"s"."f"(integer, INOUT text)`.
+func tsqlCommentTarget(schema, name string, params []RoutineParam) string {
+	types := make([]string, len(params))
+	for i, p := range params {
+		types[i] = p.Type
+		if p.Mode == "INOUT" {
+			types[i] = "INOUT " + p.Type
+		}
+	}
+	return quoteIdent(schema) + "." + quoteIdent(name) + "(" + strings.Join(types, ", ") + ")"
+}
+
+// tsqlRoutineBody produces the PL/pgSQL body of a routine: the registered
+// SQL Server routine-body translator, else the generic PL path (T-SQL
+// parser + registered body rewriter + plTranslator), reported as such.
+func (t *translator) tsqlRoutineBody(ctx *RoutineCtx) (string, []string, []string) {
+	if fn := hookedRoutineBodyTranslator(t.opt.SourceKind); fn != nil {
+		return fn(ctx)
+	}
+	var trig ast.Rewriter
+	if ctx.Trigger != nil {
+		trig = tsqlTriggerBareReturnVisitor(ctx.Trigger.ReturnRow)
+	}
+	pgBody, untranslated, notes, _ := translateRoutineBodyCore(ctx.Body, t.opt.SourceKind, "", "", ctx.Schema, nil, trig, ctx.Expr())
+	untranslated = append([]string{"no SQL Server routine-body translator is registered: the body went through the generic PL translation, which does not handle T-SQL DECLARE, TRY…CATCH, table variables or result sets"}, untranslated...)
+	if ctx.Trigger != nil {
+		return wrapTriggerBody(pgBody, tsqlTriggerReturnStmt(ctx.Trigger.ReturnRow)), untranslated, notes
+	}
+	return wrapProcedureBody(pgBody), untranslated, notes
+}
+
+// tsqlTriggerReturnNode is `RETURN <row>;` for a trigger returning row
+// ("NULL", "NEW" or "OLD").
+func tsqlTriggerReturnNode(row string, p ast.Position) ast.PLStmt {
+	if row == "NULL" {
+		return &ast.ReturnStmt{Expr: &ast.Literal{Kind: "null", Text: "NULL", P: p}, P: p}
+	}
+	return triggerReturnNode(row, p)
+}
+
+// tsqlTriggerReturnStmt renders tsqlTriggerReturnNode.
+func tsqlTriggerReturnStmt(row string) string {
+	return strings.TrimSpace(pgast.WritePLStmt(tsqlTriggerReturnNode(row, ast.Position{})))
+}
+
+// tsqlTriggerBareReturnVisitor turns every bare `RETURN;` of a trigger
+// body into the trigger's return statement (see
+// makeTriggerBareReturnVisitor).
+func tsqlTriggerBareReturnVisitor(row string) ast.Rewriter {
+	return func(n ast.Node) ast.Node {
+		r, ok := n.(*ast.ReturnStmt)
+		if !ok || r.Expr != nil {
+			return n
+		}
+		return tsqlTriggerReturnNode(row, r.P)
+	}
+}
+
+// reportRoutineDiags records a routine translator's warnings (blocking
+// manual review) and notes (info).
+func (t *translator) reportRoutineDiags(obj string, warnings, notes []string) {
+	for _, u := range warnings {
+		t.warn(obj, "routine.untranslated_construct", u)
+	}
+	for _, n := range notes {
+		t.warnSev(obj, "routine.translated_with_remarks", n, SeverityInfo)
+	}
+}
+
+func (t *translator) translateTSQLProcedure(s *ast.CreateProcedure) {
+	st := t.tsql
+	srcSchema := s.Schema
+	if srcSchema == "" {
+		srcSchema = "dbo"
+	}
+	schema := t.useSchema(srcSchema)
+	name := normalizeTSQLIdent(s.Name)
+	obj := "procedure." + schema + "." + name
+	rctx := &RoutineCtx{
+		Run: st.run, Kind: RoutineProcedure, Object: obj,
+		SourceSchema: srcSchema, SourceName: s.Name, Schema: schema, Name: name, Body: s.Body,
+	}
+	rctx.Params = t.tsqlRoutineParams(s.Params, true, rctx.Expr())
+	// One parse of the body: tsqlResultSetCount counts the result-set
+	// SELECTs over the same containers tsqlBodyReturnsResultSet walks,
+	// so n > 0 is exactly "the body returns a result set".
+	if n, ok := t.tsqlResultSetCount(s.Body); n > 0 {
+		if ok {
+			rctx.ResultCursors = tsqlResultCursorNames(n, rctx.Params)
+			msg := "procedure " + schema + "." + name + " returns its result set(s) through INOUT refcursor parameter(s) " + strings.Join(rctx.ResultCursors, ", ") + " (DEFAULT NULL), one per result-set SELECT in source order: the body opens the cursor FOR the SELECT. A PostgreSQL procedure cannot stream rows to its caller as EXEC does: callers CALL it and FETCH ALL FROM the returned cursor name, in the same transaction (the cursor closes at commit)"
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: "SELECT … (result set)", Target: "OPEN <refcursor> FOR SELECT …", Reason: msg, Level: "info",
+			})
+			t.warnSev(obj, "routine.procedure_result_cursor", msg, SeverityInfo)
+		} else {
+			msg := "procedure " + schema + "." + name + " returns a result set (a SELECT that is not assigned to variables) from inside a loop: a PostgreSQL procedure cannot return rows to its caller, and one refcursor per SELECT cannot carry a result set per iteration. Return them through INOUT refcursor parameters, or turn the procedure into a set-returning function, and adapt the callers"
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: "SELECT … (result set)", Target: "(rows not returned)", Reason: msg, Level: "warn",
+			})
+			t.warnSev(obj, "routine.procedure_returns_resultset", msg, SeverityBlocking)
+		}
+	}
+	body, warnings, notes := t.tsqlRoutineBody(rctx)
+	for _, c := range rctx.ResultCursors {
+		rctx.Params = append(rctx.Params, RoutineParam{Name: c, Type: "refcursor", Mode: "INOUT", Default: "NULL"})
+	}
+	sig := tsqlSignature(rctx.Params, true)
+	node := &pgast.CreateProcedure{Schema: schema, Name: name, Params: sig, Body: body}
+	st.routines["PROCEDURE|"+t.tableKey(schema, name)] = tsqlRoutineRef{
+		idx: len(t.res.Plan.Routines), target: tsqlCommentTarget(schema, name, rctx.Params), object: "PROCEDURE",
+	}
+	t.res.Plan.Routines = append(t.res.Plan.Routines, PGRoutine{
+		Kind: "procedure", Schema: schema, Name: name, Signature: sig, RawBody: s.Body,
+		DDL: pgast.Write([]pgast.Stmt{node}),
+	})
+	t.tsqlRoutineOptions(obj, s.Options)
+	t.reportRoutineDiags(obj, warnings, notes)
+}
+
+// tsqlRoutineOptions reports the T-SQL routine options (WITH EXECUTE AS,
+// RECOMPILE, ENCRYPTION, SCHEMABINDING, …), none of which is carried.
+func (t *translator) tsqlRoutineOptions(obj string, opts []string) {
+	if len(opts) == 0 {
+		return
+	}
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: obj, Source: "WITH " + strings.Join(opts, ", "), Target: "(dropped)",
+		Reason: "T-SQL routine options have no PostgreSQL counterpart in the routine header (EXECUTE AS OWNER is close to SECURITY DEFINER: set it by hand if the routine relies on the owner's rights).",
+		Level:  "info",
+	})
+}
+
+// tsqlResultSetCount returns the number of result-set SELECTs of a
+// procedure body (tsqlStmtsReturnRows), false when one of them runs in a
+// loop (one cursor per statement cannot carry a result set per
+// iteration).
+func (t *translator) tsqlResultSetCount(body string) (int, bool) {
+	parse := hookedRoutineBodyParser(t.opt.SourceKind)
+	if parse == nil {
+		return 0, false
+	}
+	stmts, _ := parse(body)
+	n, ok := 0, true
+	var walk func(stmts []ast.PLStmt, inLoop bool)
+	walk = func(stmts []ast.PLStmt, inLoop bool) {
+		for _, s := range stmts {
+			switch x := s.(type) {
+			case *ast.SelectStmt:
+				if x.IntoTable == nil {
+					n++
+					if inLoop {
+						ok = false
+					}
+				}
+			case *ast.Block:
+				walk(x.Stmts, inLoop)
+				if x.Except != nil {
+					for _, h := range x.Except.Handlers {
+						walk(h.Body, inLoop)
+					}
+				}
+			case *ast.IfStmt:
+				for _, b := range x.Branches {
+					walk(b.Body, inLoop)
+				}
+				walk(x.Else, inLoop)
+			case *ast.CaseStmt:
+				for _, w := range x.When {
+					walk(w.Body, inLoop)
+				}
+				walk(x.Else, inLoop)
+			case *ast.WhileStmt:
+				walk(x.Body, true)
+			case *ast.LoopStmt:
+				walk(x.Body, true)
+			case *ast.RepeatStmt:
+				walk(x.Body, true)
+			}
+		}
+	}
+	walk(stmts, false)
+	return n, ok
+}
+
+// tsqlResultCursorNames names the n result refcursor parameters of a
+// procedure (_result, or _result1 … _resultn), clear of its parameters.
+func tsqlResultCursorNames(n int, params []RoutineParam) []string {
+	taken := map[string]bool{}
+	for _, p := range params {
+		taken[p.Name] = true
+	}
+	out := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		base := "_result"
+		if n > 1 {
+			base += strconv.Itoa(i)
+		}
+		name := base
+		for k := 2; taken[name]; k++ {
+			name = base + "_" + strconv.Itoa(k)
+		}
+		taken[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+// tsqlBodyReturnsResultSet reports whether a procedure body holds a
+// statement-level SELECT returning rows to the caller (not SELECT @v =
+// …, not SELECT … INTO table), on the parsed body.
+func (t *translator) tsqlBodyReturnsResultSet(body string) bool {
+	parse := hookedRoutineBodyParser(t.opt.SourceKind)
+	if parse == nil || strings.TrimSpace(body) == "" {
+		return false
+	}
+	stmts, _ := parse(body)
+	return tsqlStmtsReturnRows(stmts)
+}
+
+// tsqlStmtsReturnRows walks statement containers (not expressions: a
+// subquery is not a result set).
+func tsqlStmtsReturnRows(stmts []ast.PLStmt) bool {
+	for _, s := range stmts {
+		switch x := s.(type) {
+		case *ast.SelectStmt:
+			if x.IntoTable == nil {
+				return true
+			}
+		case *ast.Block:
+			if tsqlStmtsReturnRows(x.Stmts) {
+				return true
+			}
+			if x.Except != nil {
+				for _, h := range x.Except.Handlers {
+					if tsqlStmtsReturnRows(h.Body) {
+						return true
+					}
+				}
+			}
+		case *ast.IfStmt:
+			for _, b := range x.Branches {
+				if tsqlStmtsReturnRows(b.Body) {
+					return true
+				}
+			}
+			if tsqlStmtsReturnRows(x.Else) {
+				return true
+			}
+		case *ast.CaseStmt:
+			for _, w := range x.When {
+				if tsqlStmtsReturnRows(w.Body) {
+					return true
+				}
+			}
+			if tsqlStmtsReturnRows(x.Else) {
+				return true
+			}
+		case *ast.WhileStmt:
+			if tsqlStmtsReturnRows(x.Body) {
+				return true
+			}
+		case *ast.LoopStmt:
+			if tsqlStmtsReturnRows(x.Body) {
+				return true
+			}
+		case *ast.RepeatStmt:
+			if tsqlStmtsReturnRows(x.Body) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (t *translator) translateTSQLFunction(s *ast.CreateFunction) {
+	st := t.tsql
+	srcSchema := s.Schema
+	if srcSchema == "" {
+		srcSchema = "dbo"
+	}
+	schema := t.useSchema(srcSchema)
+	name := normalizeTSQLIdent(s.Name)
+	obj := "function." + schema + "." + name
+	rctx := &RoutineCtx{
+		Run: st.run, Object: obj,
+		SourceSchema: srcSchema, SourceName: s.Name, Schema: schema, Name: name, Body: s.Body,
+	}
+	rctx.Params = t.tsqlRoutineParams(s.Params, false, rctx.Expr())
+	fn := &pgast.CreateFunction{Schema: schema, Name: name, Params: tsqlSignature(rctx.Params, false), Volatile: "VOLATILE"}
+	var warnings, notes []string
+	switch {
+	case s.ReturnsInlineTable:
+		rctx.Kind = RoutineInlineTVF
+		cols, unresolved := t.tsqlInlineTVFColumns(s.Select, srcSchema)
+		fn.Language = "sql"
+		fn.Volatile = "STABLE"
+		if unresolved != "" {
+			fn.Returns = "SETOF record"
+			msg := "inline table-valued function " + schema + "." + name + ": the columns of its result could not be resolved from the RETURN query (" + unresolved + "): it is emitted RETURNS SETOF record, which every caller would have to describe with a column definition list. Write its RETURNS TABLE (…) by hand"
+			t.warnSev(obj, "routine.tvf_columns_unresolved", msg, SeverityBlocking)
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: "RETURNS TABLE AS RETURN (…)", Target: "RETURNS SETOF record", Reason: msg, Level: "warn",
+			})
+		} else {
+			fn.Returns = tsqlReturnsTable(cols)
+			rctx.TableCols = cols
+			t.tsqlRenameClashingParams(rctx, fn)
+		}
+		if s.Select != nil {
+			sel, labels := rewriteHookedSelect(t.opt.SourceKind, s.Select, rctx.Expr())
+			labels = append(labels, tsqlSelectResidue(sel)...)
+			fn.Body = pgast.WriteSelectStmt(sel) + ";"
+			for _, l := range labels {
+				warnings = append(warnings, "T-SQL construct not rewritten in the RETURN query: "+l)
+			}
+		} else {
+			fn.Body = s.Body
+			cause := s.SelectParseError
+			if cause == "" {
+				cause = "no typed query"
+			}
+			warnings = append(warnings, "the RETURN query could not be parsed ("+cause+"); the T-SQL text is copied verbatim")
+		}
+	case s.ReturnsTableVar != "":
+		rctx.Kind = RoutineMultiTVF
+		rctx.TableVar = s.ReturnsTableVar
+		for _, c := range s.ReturnsTableCols {
+			if c.Type == nil {
+				continue
+			}
+			cn := normalizeTSQLIdent(c.Name)
+			rctx.TableCols = append(rctx.TableCols, RoutineColumn{
+				SourceName: c.Name, Name: cn, Type: MapType(t.opt.SourceKind, c.Type, cn, t.caps()).PG,
+			})
+		}
+		fn.Returns = tsqlReturnsTable(rctx.TableCols)
+		t.tsqlRenameClashingParams(rctx, fn)
+		fn.Body, warnings, notes = t.tsqlRoutineBody(rctx)
+	default:
+		rctx.Kind = RoutineScalarFunction
+		tr := MapType(t.opt.SourceKind, s.Returns, "ret", t.caps())
+		rctx.Returns = tr.PG
+		fn.Returns = tr.PG
+		if tr.Warning != "" {
+			t.warnSev(obj, tsqlWarningKind(tr), tr.Warning, tr.WarningSeverity)
+		}
+		fn.Body, warnings, notes = t.tsqlRoutineBody(rctx)
+	}
+	st.routines["FUNCTION|"+t.tableKey(schema, name)] = tsqlRoutineRef{
+		idx: len(t.res.Plan.Routines), target: tsqlCommentTarget(schema, name, rctx.Params), object: "FUNCTION",
+	}
+	t.res.Plan.Routines = append(t.res.Plan.Routines, PGRoutine{
+		Kind: "function", Schema: schema, Name: name, Signature: fn.Params, Returns: fn.Returns,
+		Volatile: fn.Volatile, RawBody: s.Body,
+		DDL: pgast.Write([]pgast.Stmt{fn}),
+	})
+	t.tsqlRoutineOptions(obj, s.Options)
+	t.reportRoutineDiags(obj, warnings, notes)
+}
+
+
+// tsqlRenameClashingParams renames the parameters of a table-valued
+// function whose PG name is also a column of its RETURNS TABLE: PG
+// declares those columns as OUT parameters, so `f("personid" integer)
+// RETURNS TABLE ("personid" integer, …)` is refused ("parameter name
+// used more than once"). T-SQL functions are always called with
+// positional arguments, so a renamed parameter changes no caller; the
+// body passes follow RoutineParam.Name. fn's signature is rebuilt.
+func (t *translator) tsqlRenameClashingParams(rctx *RoutineCtx, fn *pgast.CreateFunction) {
+	taken := map[string]bool{}
+	for _, c := range rctx.TableCols {
+		taken[c.Name] = true
+	}
+	clash := false
+	for _, p := range rctx.Params {
+		if taken[p.Name] {
+			clash = true
+		}
+	}
+	if !clash {
+		return
+	}
+	for _, p := range rctx.Params {
+		taken[p.Name] = true
+	}
+	for i := range rctx.Params {
+		p := &rctx.Params[i]
+		if !tsqlHasColumn(rctx.TableCols, p.Name) {
+			continue
+		}
+		name := "p_" + p.Name
+		for n := 2; taken[name]; n++ {
+			name = fmt.Sprintf("p%d_%s", n, p.Name)
+		}
+		taken[name] = true
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: rctx.Object, Source: p.SourceName, Target: quoteIdent(name),
+			Reason: "parameter renamed: PostgreSQL declares the RETURNS TABLE column " + quoteIdent(p.Name) + " as an OUT parameter of the same name (T-SQL functions are called with positional arguments, so no caller changes)",
+			Level:  "info",
+		})
+		p.Name = name
+	}
+	fn.Params = tsqlSignature(rctx.Params, false)
+}
+
+// tsqlHasColumn reports whether cols has a column named name (PG name).
+func tsqlHasColumn(cols []RoutineColumn, name string) bool {
+	for _, c := range cols {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// tsqlReturnsTable renders `TABLE ("c" type, …)`.
+func tsqlReturnsTable(cols []RoutineColumn) string {
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		parts[i] = quoteIdent(c.Name) + " " + c.Type
+	}
+	return "TABLE (" + strings.Join(parts, ", ") + ")"
+}
+
+// tsqlInlineTVFColumns resolves the result columns of an inline TVF from
+// its typed RETURN query: every projected item must be a column of a
+// migrated table of the FROM clause (`c`, `t.c`, `t.*`, `*` over one
+// table) or an aliased CAST / CONVERT. unresolved names the first item
+// that is not ("" when every one is).
+func (t *translator) tsqlInlineTVFColumns(sel *ast.SelectStmt, defaultSchema string) (cols []RoutineColumn, unresolved string) {
+	if sel == nil {
+		return nil, "the query did not parse"
+	}
+	// alias (lower-case; table name when unaliased) → table index.
+	rels := map[string]int{}
+	var order []int
+	var walkFrom func(fi ast.FromItem)
+	walkFrom = func(fi ast.FromItem) {
+		switch x := fi.(type) {
+		case *ast.FromTable:
+			idx := t.tsqlTable(x.Schema, x.Name, defaultSchema)
+			if idx < 0 {
+				return
+			}
+			alias := x.Alias
+			if alias == "" {
+				alias = x.Name
+			}
+			rels[normalizeTSQLIdent(alias)] = idx
+			order = append(order, idx)
+		case *ast.FromJoin:
+			walkFrom(x.Left)
+			walkFrom(x.Right)
+		}
+	}
+	for _, fi := range sel.From {
+		walkFrom(fi)
+	}
+	column := func(qual, col string) (RoutineColumn, bool) {
+		cn := normalizeTSQLIdent(col)
+		try := func(idx int) (RoutineColumn, bool) {
+			tbl := &t.res.Plan.Tables[idx]
+			if ci := columnIndex(tbl.Columns, cn); ci >= 0 {
+				return RoutineColumn{SourceName: col, Name: cn, Type: tbl.Columns[ci].Type}, true
+			}
+			return RoutineColumn{}, false
+		}
+		if qual != "" {
+			if idx, ok := rels[normalizeTSQLIdent(qual)]; ok {
+				return try(idx)
+			}
+			return RoutineColumn{}, false
+		}
+		var found RoutineColumn
+		n := 0
+		for _, idx := range order {
+			if c, ok := try(idx); ok {
+				found = c
+				n++
+			}
+		}
+		return found, n == 1
+	}
+	for _, it := range sel.Cols {
+		switch {
+		case it.Star:
+			var idxs []int
+			if it.Qualifier != "" {
+				idx, ok := rels[normalizeTSQLIdent(it.Qualifier)]
+				if !ok {
+					return nil, it.Qualifier + ".*"
+				}
+				idxs = []int{idx}
+			} else {
+				if len(order) != 1 || len(sel.From) != 1 {
+					return nil, "* over several relations"
+				}
+				idxs = order
+			}
+			for _, idx := range idxs {
+				for _, c := range t.res.Plan.Tables[idx].Columns {
+					cols = append(cols, RoutineColumn{SourceName: c.Name, Name: c.Name, Type: c.Type})
+				}
+			}
+			continue
+		}
+		var rc RoutineColumn
+		ok := false
+		switch x := tsqlStripParens(it.Expr).(type) {
+		case *ast.Ident:
+			if !x.Variable && len(x.Parts) >= 1 && len(x.Parts) <= 2 {
+				qual := ""
+				if len(x.Parts) == 2 {
+					qual = x.Parts[0]
+				}
+				rc, ok = column(qual, x.Parts[len(x.Parts)-1])
+			}
+		case *ast.CastExpr:
+			if it.Alias != "" {
+				rc, ok = RoutineColumn{Type: MapType(t.opt.SourceKind, x.Type, "", t.caps()).PG}, true
+			}
+		}
+		if !ok {
+			label := it.Alias
+			if label == "" {
+				label = pgast.WriteExpr(it.Expr)
+			}
+			return nil, label
+		}
+		if it.Alias != "" {
+			rc.SourceName, rc.Name = it.Alias, normalizeTSQLIdent(it.Alias)
+		}
+		cols = append(cols, rc)
+	}
+	return cols, ""
+}
+
+// ---------------------------------------------------------------------------
+// T-SQL triggers
+// ---------------------------------------------------------------------------
+
+// translateTSQLTrigger translates a DML trigger.
+//
+//   - AFTER (FOR) on a table → a statement-level AFTER trigger whose
+//     transition tables are named like T-SQL's pseudo-tables:
+//     REFERENCING NEW TABLE AS inserted (INSERT, UPDATE) OLD TABLE AS
+//     deleted (UPDATE, DELETE). PostgreSQL refuses transition tables on
+//     a multi-event trigger, so an `AFTER INSERT, UPDATE` trigger becomes
+//     one PG trigger (and function) per event, each with the tables that
+//     event has.
+//   - INSTEAD OF on a view → INSTEAD OF … FOR EACH ROW (PG has no
+//     statement-level INSTEAD OF): inserted / deleted are the NEW / OLD
+//     row.
+//   - INSTEAD OF on a table (PG only allows INSTEAD OF on views) →
+//     BEFORE … FOR EACH ROW returning NULL, which runs the body instead
+//     of the row operation.
+func (t *translator) translateTSQLTrigger(s *ast.CreateTrigger) {
+	st := t.tsql
+	trgSchema := s.Schema
+	if trgSchema == "" {
+		trgSchema = s.Table.Schema
+	}
+	relSchema, relName := st.run.ResolveRelation(s.Table.Schema, s.Table.Name, trgSchema)
+	key := t.tableKey(relSchema, relName)
+	_, isTable := st.tables[key]
+	_, isView := st.views[key]
+	name := normalizeTSQLIdent(s.Name)
+	obj := "trigger." + relSchema + "." + name
+	if !isTable && !isView {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "CREATE TRIGGER " + s.Name + " ON " + s.Table.Name, Target: "(skipped)",
+			Reason: "the trigger's relation " + relSchema + "." + relName + " is not migrated",
+			Level:  "info",
+		})
+		return
+	}
+	events := make([]string, 0, len(s.Events))
+	for _, e := range s.Events {
+		events = append(events, strings.ToUpper(e))
+	}
+	if len(events) == 0 && s.Event != "" {
+		events = []string{strings.ToUpper(s.Event)}
+	}
+	instead := strings.EqualFold(s.Time, "INSTEAD OF")
+	if !instead && isView {
+		t.warnSev(obj, "routine.untranslated_construct", "AFTER trigger on view "+relSchema+"."+relName+" has no PostgreSQL counterpart; skipped", SeverityBlocking)
+		return
+	}
+	type pgTrig struct {
+		name, fn string
+		info     *TriggerInfo
+	}
+	var trigs []pgTrig
+	switch {
+	case instead && isView:
+		ret := "NEW"
+		if len(events) == 1 && events[0] == "DELETE" {
+			ret = "OLD"
+		}
+		trigs = append(trigs, pgTrig{name, name + "_fn", &TriggerInfo{
+			Timing: "INSTEAD OF", Events: events, ForEach: "ROW", OnView: true,
+			Schema: relSchema, Table: relName, ReturnRow: ret,
+		}})
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "INSTEAD OF " + strings.Join(events, ", ") + " ON view", Target: "INSTEAD OF … FOR EACH ROW",
+			Reason: "PostgreSQL INSTEAD OF triggers are row-level: the body runs once per row, with inserted / deleted holding that single row (NEW / OLD), instead of once per statement over every affected row.",
+			Level:  "info",
+		})
+	case instead:
+		trigs = append(trigs, pgTrig{name, name + "_fn", &TriggerInfo{
+			Timing: "BEFORE", Events: events, ForEach: "ROW",
+			Schema: relSchema, Table: relName, ReturnRow: "NULL", InsteadGuard: true,
+		}})
+		msg := "INSTEAD OF trigger " + name + " on table " + relSchema + "." + relName + " is emulated by a BEFORE … FOR EACH ROW trigger returning NULL (PostgreSQL only has INSTEAD OF triggers on views): the body runs once per row with inserted / deleted holding that single row, and the row operation is skipped. The DML the body runs on " + relSchema + "." + relName + " itself goes through as a plain row operation (a guard setting), since SQL Server does not fire the INSTEAD OF trigger again for it. Review set-based logic (counts, aggregates over inserted / deleted)"
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "INSTEAD OF " + strings.Join(events, ", ") + " ON table", Target: "BEFORE … FOR EACH ROW … RETURN NULL",
+			Reason: msg, Level: "warn",
+		})
+		t.warnSev(obj, "trigger.instead_of_table", msg, SeverityInfo)
+	default:
+		for _, ev := range events {
+			info := &TriggerInfo{Timing: "AFTER", Events: []string{ev}, ForEach: "STATEMENT",
+				Schema: relSchema, Table: relName, ReturnRow: "NULL"}
+			if ev == "INSERT" || ev == "UPDATE" {
+				info.NewTable = "inserted"
+			}
+			if ev == "UPDATE" || ev == "DELETE" {
+				info.OldTable = "deleted"
+			}
+			trgName, fnName := name, name+"_fn"
+			if len(events) > 1 {
+				suffix := "_" + strings.ToLower(ev)
+				trgName, fnName = name+suffix, name+suffix+"_fn"
+			}
+			trigs = append(trigs, pgTrig{trgName, fnName, info})
+		}
+		if len(events) > 1 {
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: "AFTER " + strings.Join(events, ", "), Target: fmt.Sprintf("%d statement-level PG triggers (one per event)", len(events)),
+				Reason: "PostgreSQL refuses transition tables (inserted / deleted) on a trigger with more than one event: each event gets its own trigger and function, translated with the pseudo-tables that event has (an INSERT has no deleted rows, a DELETE no inserted ones).",
+				Level:  "info",
+			})
+		}
+	}
+	if s.NotForReplication || len(s.Options) > 0 {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: obj, Source: "trigger options", Target: "(dropped)",
+			Reason: "NOT FOR REPLICATION and the WITH options (EXECUTE AS, ENCRYPTION, APPEND) of a T-SQL trigger have no PostgreSQL counterpart.",
+			Level:  "info",
+		})
+	}
+	var stmts []pgast.Stmt
+	var warnings, notes []string
+	for _, tg := range trigs {
+		rctx := &RoutineCtx{
+			Run: st.run, Kind: RoutineTrigger, Object: obj,
+			SourceSchema: trgSchema, SourceName: s.Name, Schema: relSchema, Name: tg.name,
+			Body: s.Body, Trigger: tg.info,
+		}
+		if rctx.SourceSchema == "" {
+			rctx.SourceSchema = "dbo"
+		}
+		body, w, n := t.tsqlRoutineBody(rctx)
+		warnings = append(warnings, w...)
+		notes = append(notes, n...)
+		for ci, col := range tg.info.UpdatedColumns {
+			mark := tsqlUpdateMarkTrigger(tg.name, ci)
+			stmts = append(stmts, &pgast.CreateTrigger{
+				Name: mark, Timing: "AFTER", Events: []string{"UPDATE"}, UpdateOf: []string{col},
+				Schema: relSchema, Table: relName, ForEach: "STATEMENT",
+				FnSchema: "tsql", FnName: "mark_column_updated", FnArgs: []string{tg.name, col},
+			})
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: "UPDATE(" + col + ")", Target: "trigger " + mark + " AFTER UPDATE OF " + pgQuote(col) + " + tsql.take_column_updated()",
+				Reason: "PostgreSQL fires an UPDATE OF " + col + " trigger exactly when the UPDATE statement's SET list names " + col + ", T-SQL's rule for UPDATE(" + col + "). A trigger with transition tables cannot have a column list, so the helper statement-level trigger " + mark + " (named to fire before " + tg.name + ") marks the statement, and the translated body reads and clears the mark when it starts.",
+				Level:  "info",
+			})
+		}
+		stmts = append(stmts,
+			&pgast.CreateFunction{Schema: relSchema, Name: tg.fn, Returns: "trigger", Body: body},
+			&pgast.CreateTrigger{
+				Name: tg.name, Timing: tg.info.Timing, Events: tg.info.Events,
+				Schema: relSchema, Table: relName, FnName: tg.fn, ForEach: tg.info.ForEach,
+				NewTable: tg.info.NewTable, OldTable: tg.info.OldTable,
+			})
+	}
+	st.triggerRoutines[t.tableKey(relSchema, name)] = append(st.triggerRoutines[t.tableKey(relSchema, name)], len(t.res.Plan.Routines))
+	for _, tg := range trigs {
+		st.triggerNames[len(t.res.Plan.Routines)] = append(st.triggerNames[len(t.res.Plan.Routines)], tg.name)
+		for ci := range tg.info.UpdatedColumns {
+			st.triggerNames[len(t.res.Plan.Routines)] = append(st.triggerNames[len(t.res.Plan.Routines)], tsqlUpdateMarkTrigger(tg.name, ci))
+		}
+	}
+	t.res.Plan.Routines = append(t.res.Plan.Routines, PGRoutine{
+		Kind: "trigger", Schema: relSchema, Name: name, RawBody: s.Body,
+		DDL:   pgast.Write(stmts),
+		Table: relName, FnName: trigs[0].fn,
+	})
+	t.rememberTrigger(name, relName)
+	t.reportRoutineDiags(obj, dedupStrings(warnings), dedupStrings(notes))
+}
+
+// dedupStrings drops repeated entries, keeping the first occurrence.
+func dedupStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := in[:0:0]
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// T-SQL sequences, no-op statements, comments
+// ---------------------------------------------------------------------------
+
+func (t *translator) translateTSQLSequence(s *ast.CreateSequence) {
+	schema := t.useSchema(s.Schema)
+	name := normalizeTSQLIdent(s.Name)
+	as := "bigint" // T-SQL default
+	if s.AsType != nil {
+		switch x := s.AsType.(type) {
+		case *ast.IntType:
+			switch strings.ToUpper(x.Name) {
+			case "TINYINT", "SMALLINT":
+				as = "smallint"
+			case "INT":
+				as = "integer"
+			}
+		case *ast.DecimalType:
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: "sequence." + schema + "." + name, Source: "AS " + tsqlTypeLabel(x), Target: "AS bigint",
+				Reason: "PostgreSQL sequences are smallint, integer or bigint: a decimal / numeric sequence becomes bigint (values beyond 2^63-1 cannot be generated).",
+				Level:  "warn",
+			})
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE SEQUENCE IF NOT EXISTS %s.%s AS %s", quoteIdent(schema), quoteIdent(name), as)
+	if s.HasIncr {
+		fmt.Fprintf(&b, " INCREMENT BY %d", s.Increment)
+	}
+	switch {
+	case s.NoMin:
+		b.WriteString(" NO MINVALUE")
+	case s.HasMin:
+		fmt.Fprintf(&b, " MINVALUE %d", s.MinValue)
+	}
+	switch {
+	case s.NoMax:
+		b.WriteString(" NO MAXVALUE")
+	case s.HasMax:
+		fmt.Fprintf(&b, " MAXVALUE %d", s.MaxValue)
+	}
+	if s.HasStart {
+		fmt.Fprintf(&b, " START WITH %d", s.Start)
+	}
+	if s.HasCache && s.Cache > 0 {
+		fmt.Fprintf(&b, " CACHE %d", s.Cache)
+	}
+	if s.HasCycle && s.Cycle {
+		b.WriteString(" CYCLE")
+	} else {
+		b.WriteString(" NO CYCLE")
+	}
+	b.WriteString(";")
+	t.res.Plan.PreActions = append(t.res.Plan.PreActions, b.String())
+	t.sequenceNames = append(t.sequenceNames, name)
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: "sequence." + schema + "." + name, Source: "CREATE SEQUENCE", Target: "CREATE SEQUENCE … AS " + as,
+		Reason: "T-SQL sequences map 1:1 (START WITH is the next value the source would hand out).",
+		Level:  "info",
+	})
+}
+
+// translateTSQLNoop reports the T-SQL objects the parser keeps as no-ops
+// that a user may expect on PG. Script plumbing (USE, SET, PRINT, EXEC,
+// GO, sqlcmd directives, BULK INSERT, …) is dropped silently.
+func (t *translator) translateTSQLNoop(s *ast.NoopStmt) {
+	reason := ""
+	sev := Severity("")
+	switch s.Kind {
+	case "CREATE SYNONYM":
+		reason = "PostgreSQL has no synonyms: create a view (or put the target schema on search_path) where the application uses it."
+	case "CREATE XML SCHEMA COLLECTION":
+		reason = "PostgreSQL does not validate XML against schema collections: typed xml columns become plain xml."
+	case "CREATE FULLTEXT INDEX", "CREATE FULLTEXT CATALOG", "CREATE FULLTEXT STOPLIST":
+		reason = "SQL Server full-text search is not migrated: create GIN indexes on to_tsvector(…) and rewrite CONTAINS / FREETEXT queries with @@ to_tsquery(…)."
+	case "CREATE PRIMARY XML INDEX", "CREATE XML INDEX":
+		reason = "PostgreSQL has no XML indexes: index the xpath() expressions the queries use."
+	case "CREATE SPATIAL INDEX":
+		reason = "Spatial index not migrated: create a GiST index on the PostGIS column."
+	case "CREATE COLUMNSTORE INDEX":
+		reason = "PostgreSQL has no columnstore indexes (a B-tree or BRIN index, or a columnar extension, may replace it)."
+	case "CREATE PARTITION FUNCTION", "CREATE PARTITION SCHEME":
+		reason = "T-SQL partitioning is not migrated: tables are created unpartitioned; use PostgreSQL declarative partitioning if needed."
+	case "CREATE DDL TRIGGER":
+		reason = "Database / server DDL triggers are not migrated: PostgreSQL event triggers (CREATE EVENT TRIGGER) cover DDL events with a different API."
+		sev = SeverityInfo
+	default:
+		return
+	}
+	obj := "noop." + strings.ToLower(s.Kind)
+	t.res.Explanations = append(t.res.Explanations, Explanation{
+		Object: obj, Source: s.Kind, Target: "(not migrated)", Reason: reason, Level: "info",
+	})
+	if sev != "" {
+		t.warnSev(obj, "trigger.ddl_not_migrated", reason, sev)
+	}
+}
+
+// applyTSQLComments turns the MS_Description extended properties into
+// COMMENT ON statements, once every object is known: table and column
+// comments go into the CREATE TABLE script; view, routine and trigger
+// comments follow their CREATE in the object's own DDL; index and
+// constraint comments run after the post-copy indexes / FKs; schema,
+// type and sequence comments run with the pre-actions.
+func (t *translator) applyTSQLComments() {
+	st := t.tsql
+	write := func(object, target, body string) string {
+		return pgast.Write([]pgast.Stmt{&pgast.CommentOn{Object: object, Target: target, Body: body}})
+	}
+	notMigrated := func(c *ast.CommentStmt, why string) {
+		t.res.Explanations = append(t.res.Explanations, Explanation{
+			Object: "comment." + strings.ToLower(c.ObjectKind) + "." + c.Schema + "." + c.Object + tsqlDotted(c.Column),
+			Source: "MS_Description", Target: "(not migrated)", Reason: why, Level: "info",
+		})
+	}
+	for _, c := range st.comments {
+		if c.IsNull {
+			continue
+		}
+		schema := t.schemaFor(c.Schema)
+		obj := normalizeTSQLIdent(c.Object)
+		key := t.tableKey(schema, obj)
+		qual := quoteIdent(schema) + "." + quoteIdent(obj)
+		switch c.ObjectKind {
+		case "SCHEMA":
+			if c.Schema == "" {
+				notMigrated(c, "schema comment without a schema name")
+				continue
+			}
+			if !st.schemaSeen[schema] {
+				notMigrated(c, "the schema holds no migrated object")
+				continue
+			}
+			t.res.Plan.PreActions = append(t.res.Plan.PreActions, strings.TrimSuffix(write("SCHEMA", quoteIdent(schema), c.Text), "\n"))
+		case "TABLE":
+			if idx, ok := st.tables[key]; ok {
+				t.res.Plan.Tables[idx].Comment = c.Text
+			} else if vi, ok := st.views[key]; ok {
+				t.res.Plan.Views[vi].DDL += write("VIEW", qual, c.Text)
+			} else {
+				notMigrated(c, "the table is not migrated")
+			}
+		case "VIEW":
+			if vi, ok := st.views[key]; ok {
+				t.res.Plan.Views[vi].DDL += write("VIEW", qual, c.Text)
+			} else {
+				notMigrated(c, "the view is not migrated")
+			}
+		case "COLUMN":
+			col := normalizeTSQLIdent(c.Column)
+			if idx, ok := st.tables[key]; ok {
+				tbl := &t.res.Plan.Tables[idx]
+				if ci := columnIndex(tbl.Columns, col); ci >= 0 {
+					tbl.Columns[ci].Comment = c.Text
+					continue
+				}
+			}
+			if vi, ok := st.views[key]; ok {
+				t.res.Plan.Views[vi].DDL += write("COLUMN", qual+"."+quoteIdent(col), c.Text)
+				continue
+			}
+			notMigrated(c, "the column is not migrated")
+		case "PROCEDURE", "FUNCTION":
+			if r, ok := st.routines[c.ObjectKind+"|"+key]; ok {
+				t.res.Plan.Routines[r.idx].DDL += write(r.object, r.target, c.Text)
+			} else {
+				notMigrated(c, "the routine is not migrated")
+			}
+		case "TRIGGER":
+			idxs := st.triggerRoutines[t.tableKey(schema, normalizeTSQLIdent(c.Column))]
+			if len(idxs) == 0 {
+				notMigrated(c, "the trigger is not migrated")
+				continue
+			}
+			for _, ri := range idxs {
+				r := &t.res.Plan.Routines[ri]
+				for _, name := range st.triggerNames[ri] {
+					r.DDL += write("TRIGGER", quoteIdent(name)+" ON "+quoteIdent(r.Schema)+"."+quoteIdent(r.Table), c.Text)
+				}
+			}
+		case "INDEX", "CONSTRAINT":
+			idx, ok := st.tables[key]
+			if !ok {
+				notMigrated(c, "the table is not migrated")
+				continue
+			}
+			name := normalizeTSQLIdent(c.Column)
+			if target, kind := t.tsqlConstraintTarget(idx, name); kind != "" {
+				t.res.Plan.PostActions = append(t.res.Plan.PostActions, strings.TrimSuffix(write(kind, target, c.Text), "\n"))
+			} else {
+				notMigrated(c, "no migrated index or constraint has this name (a DEFAULT constraint has no PostgreSQL object)")
+			}
+		case "TYPE":
+			if ref, ok := lookupTSQLUserType(t.userTypes, c.Schema, c.Object); ok && (ref.Kind == "domain" || ref.Kind == "composite") {
+				kind := "TYPE"
+				if ref.Kind == "domain" {
+					kind = "DOMAIN"
+				}
+				t.res.Plan.PreActions = append(t.res.Plan.PreActions, strings.TrimSuffix(write(kind, quoteIdent(ref.Schema)+"."+quoteIdent(ref.Name), c.Text), "\n"))
+			} else {
+				notMigrated(c, "the type is not migrated")
+			}
+		case "SEQUENCE":
+			t.res.Plan.PreActions = append(t.res.Plan.PreActions, strings.TrimSuffix(write("SEQUENCE", qual, c.Text), "\n"))
+		default:
+			notMigrated(c, "PostgreSQL has no comment on a T-SQL "+strings.ToLower(c.ObjectKind)+" (or the object is not migrated)")
+		}
+	}
+}
+
+// tsqlDotted returns "."+s, or "" for an empty s.
+func tsqlDotted(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "." + s
+}
+
+
+// tsqlConstraintTarget returns the COMMENT ON target and object kind of
+// the index or constraint named name on the table at Plan.Tables index
+// idx ("" kind when none has that name).
+func (t *translator) tsqlConstraintTarget(idx int, name string) (string, string) {
+	tbl := &t.res.Plan.Tables[idx]
+	on := " ON " + quoteIdent(tbl.Schema) + "." + quoteIdent(tbl.Name)
+	if tbl.PKName == name && name != "" {
+		return quoteIdent(name) + on, "CONSTRAINT"
+	}
+	for _, n := range tbl.CheckNames {
+		if n == name && n != "" {
+			return quoteIdent(name) + on, "CONSTRAINT"
+		}
+	}
+	for _, fk := range t.res.Plan.ForeignKeys {
+		if fk.Schema == tbl.Schema && fk.Table == tbl.Name && fk.Name == name {
+			return quoteIdent(name) + on, "CONSTRAINT"
+		}
+	}
+	for _, ix := range t.res.Plan.Indexes {
+		if ix.Schema == tbl.Schema && ix.Table == tbl.Name && ix.Name == name {
+			return quoteIdent(tbl.Schema) + "." + quoteIdent(name), "INDEX"
+		}
+	}
+	return "", ""
+}
+
+// tsqlDropFoldedColumnDups returns s without the columns whose folded
+// name (normalizeTSQLIdent) repeats an earlier column's — [ID] and [id]
+// of a case-sensitive database, or two names equal over their first 63
+// bytes — each reported as a blocking collision: PG cannot hold both
+// under one name, and keeping the second would make CREATE TABLE fail.
+// The passes over s.Columns index tbl.Columns in step, so the duplicates
+// are dropped before them. The table at Plan.Tables index idx then needs
+// an explicit copy list (computeTSQLCopyColumns): the copier's catalog
+// default would still select both source columns, which fold to the
+// same PG column.
+func (t *translator) tsqlDropFoldedColumnDups(idx int, s *ast.CreateTable, schema, name, srcSchema string) *ast.CreateTable {
+	seen := map[string]string{}
+	var keep []*ast.ColumnDef
+	for _, c := range s.Columns {
+		f := normalizeTSQLIdent(c.Name)
+		if prev, dup := seen[f]; dup {
+			t.tsqlFoldCollision("table."+schema+"."+name+"."+f,
+				"columns "+prev+" and "+c.Name+" of "+srcSchema+"."+s.Name+" both become the PostgreSQL column "+f+
+					" (identifiers are folded to lower case and cut to 63 bytes): only the first is created and copied. Rename one of them on the source before the migration")
+			continue
+		}
+		seen[f] = c.Name
+		keep = append(keep, c)
+	}
+	if len(keep) == len(s.Columns) {
+		return s
+	}
+	t.tsql.explicitCopy[idx] = true
+	cp := *s
+	cp.Columns = keep
+	return &cp
+}
+
+// tsqlFoldCollisionTitle is the title of the blocking prerequisite
+// gathering the name.fold_collision warnings.
+const tsqlFoldCollisionTitle = "Rename SQL Server objects whose names fold to one PostgreSQL name"
+
+// tsqlFoldCollision reports two source objects (tables, columns of one
+// table) folding to one PG name: a blocking name.fold_collision warning
+// and its blocking prerequisite (one for every collision, the objects
+// accumulating on it), so the run is gated until it is acknowledged —
+// only the first object is migrated.
+func (t *translator) tsqlFoldCollision(object, msg string) {
+	t.warnSev(object, tsqlWarnFoldCollision, msg, SeverityBlocking)
+	for i := range t.res.Prerequisites {
+		if p := &t.res.Prerequisites[i]; p.Title == tsqlFoldCollisionTitle {
+			p.Object += ", " + object
+			p.Description += "\n  • " + msg
+			return
+		}
+	}
+	t.res.Prerequisites = append(t.res.Prerequisites, Prerequisite{
+		Severity: SeverityBlocking,
+		Category: CatManualReview,
+		Object:   object,
+		Title:    tsqlFoldCollisionTitle,
+		Description: "PostgreSQL folds the SQL Server identifiers to lower case and keeps 63 bytes of them; in a case-sensitive (_CS_ / _BIN2) database, or past 63 bytes, two source names become one:\n\n  • " + msg +
+			"\n\nOnly the first object of each pair is created and copied; the other one is not migrated.",
+		Remediation: "Rename one object of each pair on the source (sp_rename) and re-plan, or migrate the other one separately. Acknowledge this prerequisite to migrate without it.",
+	})
 }

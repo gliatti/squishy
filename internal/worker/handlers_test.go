@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"gitlab.com/dalibo/squishy/internal/dataxfer"
 	oracle "gitlab.com/dalibo/squishy/internal/dialects/oracle"
 )
 
@@ -77,5 +78,28 @@ func TestRetryWithTypeFallback(t *testing.T) {
 			require.Equal(t, tc.want, got)
 			require.Equal(t, tc.changed, changed)
 		})
+	}
+}
+
+// pgNormalizeIdent must give the copy the same PG names as the copier's
+// normalizeDstIdent: SQL Server identifiers lowercased whole, Oracle
+// all-caps folded, the rest untouched.
+func TestPgNormalizeIdentSQLServer(t *testing.T) {
+	cases := []struct{ kind, in, want string }{
+		{"sqlserver", "SalesOrderHeader", "salesorderheader"},
+		{"sqlserver", "Order Details", "order details"},
+		{"sqlserver", "", ""},
+		{"oracle", "CUSTOMERS", "customers"},
+		{"oracle", "t_Case", "t_Case"},
+		{"oracle", "EMP#HIST", "emp_hist"},
+		{"mysql", "Customers", "Customers"},
+		{"mysql", "a#b", "a#b"},
+	}
+	for _, c := range cases {
+		require.Equal(t, c.want, pgNormalizeIdent(c.kind, c.in), c.kind+"/"+c.in)
+		require.Equal(t, dataxfer.NormalizeDstIdent(c.kind, c.in), pgNormalizeIdent(c.kind, c.in))
+		if c.kind == "sqlserver" {
+			require.Equal(t, dataxfer.FoldSQLServerIdent(c.in), pgNormalizeIdent(c.kind, c.in))
+		}
 	}
 }

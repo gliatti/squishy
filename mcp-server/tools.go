@@ -45,15 +45,15 @@ func registerTools(s *server.MCPServer) {
 	), listInstancesHandler)
 
 	s.AddTool(mcp.NewTool("create_instance",
-		mcp.WithDescription("Create an instance for a project: bundles the SOURCE super-user DSN of an Oracle/MySQL/MariaDB endpoint with the TARGET PG super-user DSN where migrated objects land, plus a mapping strategy. Connects to the source, enumerates non-system schemas/databases, and inserts one draft migration per discovered schema. Returns the new instance and its draft migrations."),
+		mcp.WithDescription("Create an instance for a project: bundles the SOURCE super-user DSN of an Oracle/MySQL/MariaDB/DB2/SQL Server endpoint with the TARGET PG super-user DSN where migrated objects land, plus a mapping strategy. Connects to the source, enumerates non-system schemas/databases, and inserts one draft migration per discovered schema. Returns the new instance and its draft migrations."),
 		mcp.WithString("project_id", mcp.Required(), mcp.Description("Project UUID")),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Display name for the instance (e.g. 'oracle-prod')")),
 
-		mcp.WithString("kind", mcp.Required(), mcp.Description("Source DB kind"), mcp.Enum("mysql", "mariadb", "oracle", "oracle19", "db2", "db2zos")),
+		mcp.WithString("kind", mcp.Required(), mcp.Description("Source DB kind"), mcp.Enum("mysql", "mariadb", "oracle", "oracle19", "db2", "db2zos", "sqlserver")),
 		mcp.WithString("host", mcp.Required(), mcp.Description("Source hostname or IP")),
 		mcp.WithNumber("port", mcp.Required(), mcp.Description("Source TCP port")),
-		mcp.WithString("database", mcp.Required(), mcp.Description("Default database (MySQL/MariaDB) or service/SID (Oracle) — used for the initial source connection; the per-migration source schema is selected later")),
-		mcp.WithString("username", mcp.Required(), mcp.Description("Source super-user login (Oracle SYSTEM, MySQL root, …)")),
+		mcp.WithString("database", mcp.Required(), mcp.Description("Default database (MySQL/MariaDB, SQL Server — e.g. master; each SQL Server database is discovered as one migration) or service/SID (Oracle) — used for the initial source connection; the per-migration source schema is selected later")),
+		mcp.WithString("username", mcp.Required(), mcp.Description("Source super-user login (Oracle SYSTEM, MySQL root, SQL Server sa, …)")),
 		mcp.WithString("password", mcp.Description("Source password")),
 		mcp.WithString("ssl_mode", mcp.Description("Source SSL mode (driver-specific, default 'disable')")),
 

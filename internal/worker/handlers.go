@@ -164,6 +164,38 @@ type copyBatchPayload struct {
 	SourceVariant string   `json:"source_variant"`
 	RowEndCol     string   `json:"row_end_col"`
 	Columns       []string `json:"columns,omitempty"`
+
+	// Per-table source metadata resolved once at partition time
+	// (withPlanMeta), so a batch makes no catalog round trip for it.
+	// CopyMetaResolved false — a job enqueued before these fields
+	// existed — makes the copier look them up as before.
+	CopyMetaResolved bool              `json:"copy_meta_resolved,omitempty"`
+	OrderKey         []string          `json:"order_key,omitempty"`
+	SourceTypes      map[string]string `json:"source_types,omitempty"`
+}
+
+// withPlanMeta carries the partition plan's per-table source metadata
+// (keyed OFFSET order key, server-side column conversions) into the
+// batch payload.
+func (b copyBatchPayload) withPlanMeta(plan *dataxfer.PartitionPlan) copyBatchPayload {
+	b.CopyMetaResolved = true
+	b.OrderKey = plan.OrderKey
+	b.SourceTypes = plan.SourceTypes
+	return b
+}
+
+// copyOpts maps the payload onto the copier's options (connections left
+// to the caller).
+func (b copyBatchPayload) copyOpts() dataxfer.CopyOpts {
+	return dataxfer.CopyOpts{
+		SrcSchema: b.SrcSchema, SrcTable: b.SrcTable,
+		DstSchema: b.DstSchema, DstTable: b.DstTable,
+		RangeKind: b.RangeKind, Low: b.Low, High: b.High,
+		Columns:      b.Columns,
+		MetaResolved: b.CopyMetaResolved,
+		OrderKey:     b.OrderKey,
+		SourceTypes:  b.SourceTypes,
+	}
 }
 
 // newCopyBatchPayload builds the copy_batch payload of one range of a
@@ -235,7 +267,7 @@ func (d *Deps) hCopyTable(ctx context.Context, j *queue.Job) error {
 			batchID, j.StepID, r.Seq, pkCols, low, high, plan.RangeKind, r.RowCount); err != nil {
 			return err
 		}
-		payload, _ := json.Marshal(newCopyBatchPayload(p, dstTable, plan.RangeKind, r))
+		payload, _ := json.Marshal(newCopyBatchPayload(p, dstTable, plan.RangeKind, r).withPlanMeta(plan))
 		if _, err := q.Enqueue(ctx, tx, queue.Job{
 			RunID: j.RunID, StepID: j.StepID, BatchID: &batchID,
 			Kind: "copy_batch", Payload: payload, Priority: 100,
@@ -267,13 +299,9 @@ func (d *Deps) hCopyBatch(ctx context.Context, j *queue.Job) error {
 			p.High[k] = int64(f)
 		}
 	}
-	n, err := dataxfer.CopyBatch(ctx, dataxfer.CopyOpts{
-		SourceDB: d.SourceDB, SourceDialect: dial, TargetPool: d.TargetPool,
-		SrcSchema: p.SrcSchema, SrcTable: p.SrcTable,
-		DstSchema: p.DstSchema, DstTable: p.DstTable,
-		RangeKind: p.RangeKind, Low: p.Low, High: p.High,
-		Columns: p.Columns,
-	})
+	opts := p.copyOpts()
+	opts.SourceDB, opts.SourceDialect, opts.TargetPool = d.SourceDB, dial, d.TargetPool
+	n, err := dataxfer.CopyBatch(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -606,14 +634,27 @@ type validatePayload struct {
 	} `json:"history_tables"`
 	SourceSchema string `json:"source_schema"`
 	TargetSchema string `json:"target_schema"`
+	// TableChecks (SQL Server, planner.ValidateTableCheck) carry their
+	// own source and target schema per table: a SQL Server database
+	// spans several T-SQL schemas, each mapped to its PG schema, which
+	// the single SourceSchema / TargetSchema pair cannot express.
+	TableChecks []struct {
+		SourceSchema string `json:"source_schema"`
+		SourceTable  string `json:"source_table"`
+		TargetSchema string `json:"target_schema"`
+		TargetTable  string `json:"target_table"`
+	} `json:"table_checks"`
 }
 
 // countCheck is one row-count comparison of the validate step: the rows
-// src reads from SourceTable against the rows of TargetTable.
+// src reads from SourceTable against the rows of TargetTable. The
+// schemas, when set, replace the payload's SourceSchema / TargetSchema.
 type countCheck struct {
-	src         dataxfer.SourceDialect
-	SourceTable string
-	TargetTable string
+	src          dataxfer.SourceDialect
+	SourceSchema string
+	SourceTable  string
+	TargetSchema string
+	TargetTable  string
 }
 
 // validateChecks lists the row-count comparisons of a validate payload:
@@ -640,6 +681,16 @@ func (d *Deps) validateChecks(p validatePayload) ([]countCheck, error) {
 		}
 		out = append(out, countCheck{src: hist, SourceTable: h.SourceTable, TargetTable: h.TargetTable})
 	}
+	for _, tc := range p.TableChecks {
+		if tc.SourceTable == "" || tc.TargetTable == "" || tc.SourceSchema == "" || tc.TargetSchema == "" {
+			return nil, fmt.Errorf("validate: table check needs source and target schema and table, got %+v", tc)
+		}
+		out = append(out, countCheck{
+			src:          dial,
+			SourceSchema: tc.SourceSchema, SourceTable: tc.SourceTable,
+			TargetSchema: tc.TargetSchema, TargetTable: tc.TargetTable,
+		})
+	}
 	return out, nil
 }
 
@@ -656,12 +707,19 @@ func (d *Deps) hValidate(ctx context.Context, j *queue.Job) error {
 		return err
 	}
 	for _, c := range checks {
+		srcSchema, dstSchema := p.SourceSchema, p.TargetSchema
+		if c.SourceSchema != "" {
+			srcSchema = c.SourceSchema
+		}
+		if c.TargetSchema != "" {
+			dstSchema = c.TargetSchema
+		}
 		var srcN int64
-		if err := d.SourceDB.QueryRowContext(ctx, c.src.CountQuery(p.SourceSchema, c.SourceTable)).Scan(&srcN); err != nil {
+		if err := d.SourceDB.QueryRowContext(ctx, c.src.CountQuery(srcSchema, c.SourceTable)).Scan(&srcN); err != nil {
 			return fmt.Errorf("count source %s (for %s): %w", c.SourceTable, c.TargetTable, err)
 		}
 		var dstN int64
-		if err := d.TargetPool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{p.TargetSchema, c.TargetTable}.Sanitize()).Scan(&dstN); err != nil {
+		if err := d.TargetPool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{dstSchema, c.TargetTable}.Sanitize()).Scan(&dstN); err != nil {
 			return fmt.Errorf("count pg %s: %w", c.TargetTable, err)
 		}
 		if srcN != dstN {
@@ -715,33 +773,12 @@ func (d *Deps) copySourceDialect(variant, rowEndCol string) (dataxfer.SourceDial
 	return nil, fmt.Errorf("unknown copy source variant %q", variant)
 }
 
-// pgNormalizeIdent mirrors translate.normalizeOracleIdent: all-caps Oracle
-// identifiers get lowercased so they match the PG side emitted unquoted,
-// while mixed-case ("t_Case_sensitive") round-trips verbatim. Applied to
-// destination table + column names before COPY FROM.
+// pgNormalizeIdent maps a source table name onto the PG table the
+// translator created: dataxfer.NormalizeDstIdent, the one fold the
+// copier applies to the same names (Oracle all-caps lowercased and `#`
+// → `_` like translate.normalizeOracleIdent, SQL Server folded whole
+// through FoldSQLServerIdent, other kinds untouched), so the worker and
+// the copier cannot drift apart.
 func pgNormalizeIdent(kind, s string) string {
-	if kind != "oracle" || s == "" {
-		return s
-	}
-	hasLower := false
-	hasUpper := false
-	for _, r := range s {
-		if r >= 'a' && r <= 'z' {
-			hasLower = true
-		}
-		if r >= 'A' && r <= 'Z' {
-			hasUpper = true
-		}
-	}
-	if hasUpper && !hasLower {
-		out := make([]byte, 0, len(s))
-		for _, r := range s {
-			if r >= 'A' && r <= 'Z' {
-				r += 'a' - 'A'
-			}
-			out = append(out, byte(r))
-		}
-		return string(out)
-	}
-	return s
+	return dataxfer.NormalizeDstIdent(kind, s)
 }

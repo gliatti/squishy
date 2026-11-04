@@ -86,3 +86,19 @@ func TestHasInternalPrefix(t *testing.T) {
 		}
 	}
 }
+
+// System and service databases are dropped whatever their case (CI
+// collation); user databases keep their spelling and come out sorted.
+func TestFilterSQLServer(t *testing.T) {
+	in := []string{
+		"master", "TempDB", "model", "msdb",
+		"ReportServer", "ReportServerTempDB", "distribution", "SSISDB",
+		"DWConfiguration", "DWDiagnostics", "DWQueue",
+		"Northwind", "AdventureWorks", "pubs",
+	}
+	got := filterSQLServer(in)
+	want := []string{"AdventureWorks", "Northwind", "pubs"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("filterSQLServer = %v, want %v", got, want)
+	}
+}

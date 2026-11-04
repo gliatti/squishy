@@ -101,8 +101,8 @@ func rewriteOracleASTBase() []ast.Rewriter {
 		VisitOracleIdentCaseFold,
 		// (VisitOracleLiteralTypeMap was added then removed: while
 		// it correctly maps `varchar2(7)` → `VARCHAR(7)` in trigger
-		// fragments, it also rewrites the *value* literals that APP-
-		// class procedures use to simulate the Oracle data dictionary
+		// fragments, it also rewrites the *value* literals that legacy
+		// maintenance-style procedures use to simulate the Oracle data dictionary
 		// in PG — `CASE WHEN typname = 'varchar' THEN 'VARCHAR2'`
 		// would become `THEN 'VARCHAR'`, breaking the downstream
 		// CASE WHEN data_type = 'VARCHAR2' check. Use the dyn-DDL

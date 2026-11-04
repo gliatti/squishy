@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -18,6 +19,7 @@ import (
 	_ "gitlab.com/dalibo/squishy/internal/dialects/mysql"    // registers mysql + mariadb
 	_ "gitlab.com/dalibo/squishy/internal/dialects/oracle"   // registers oracle
 	_ "gitlab.com/dalibo/squishy/internal/dialects/postgres" // registers postgres (target)
+	_ "gitlab.com/dalibo/squishy/internal/dialects/tsql"     // registers sqlserver
 	"gitlab.com/dalibo/squishy/internal/inspect"
 	"gitlab.com/dalibo/squishy/internal/planner"
 	"gitlab.com/dalibo/squishy/internal/project"
@@ -36,6 +38,10 @@ func inspectSourceForSchema(ctx context.Context, db *sql.DB, kind, sourceSchema 
 		return inspect.InspectOracle(ctx, db, sourceSchema, log)
 	case "db2", "db2zos":
 		return inspect.InspectDB2(ctx, db, sourceSchema, log)
+	case "sqlserver":
+		// The migration's source "schema" is a SQL Server database; its
+		// T-SQL schemas come back on each snapshot (ObjectSnapshot.Schema).
+		return inspect.InspectSQLServer(ctx, db, sourceSchema, log)
 	}
 	return nil, nil, errors.New("unsupported source kind: " + kind)
 }
@@ -146,27 +152,8 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Probe extensions on the instance's admin PG (the per-migration target
-	// DB may not exist yet for the dedicated_db strategy).
 	probeStart := time.Now()
-	var targetExts []string
-	if pool, err := connection.OpenPostgres(ctx, connection.Params{
-		Kind: "postgres", Host: inst.TargetHost, Port: inst.TargetPort,
-		Database: inst.TargetDatabase, Username: inst.TargetUsername,
-		Password: inst.TargetPassword, SSLMode: inst.TargetSSLMode,
-	}); err == nil {
-		rows, err := pool.Query(ctx, `SELECT extname FROM pg_extension`)
-		if err == nil {
-			for rows.Next() {
-				var n string
-				if err := rows.Scan(&n); err == nil {
-					targetExts = append(targetExts, n)
-				}
-			}
-			rows.Close()
-		}
-		pool.Close()
-	}
+	targetExts := probeTargetExtensions(ctx, inst, mig)
 	timings.ProbeExts = time.Since(probeStart)
 
 	dia, err := dialects.Get(inst.Kind)
@@ -176,19 +163,36 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	parseStart := time.Now()
+	// T-SQL modules (views, procedures, functions, triggers) need no `;` and
+	// their body runs to the next GO batch separator, so a `;` between two
+	// snapshots would silently fold every following object into the first
+	// module's body. SQL Server snapshots are separated by GO instead.
+	snapSep := []byte(";\n\n")
+	if dialects.IsSQLServer(dialects.Kind(inst.Kind)) {
+		snapSep = []byte("\nGO\n\n")
+	}
 	var allDDL []byte
 	for _, snaps := range [][]inspect.ObjectSnapshot{
 		schema.Tables, schema.Views, schema.Triggers, schema.Procedures, schema.Functions, schema.Events,
 	} {
 		for _, s := range snaps {
 			allDDL = append(allDDL, s.DDL...)
-			allDDL = append(allDDL, ';', '\n', '\n')
+			allDDL = append(allDDL, snapSep...)
 		}
 	}
 	stmts, parseErr := dia.Parse(string(allDDL))
 	timings.Parse = time.Since(parseStart)
 
 	translateStart := time.Now()
+	// A SQL Server database spans several T-SQL schemas (AdventureWorks:
+	// Person, Sales, …): every object keeps its schema on PG, prefixed by
+	// the database name when the migration shares its target database
+	// with others (dedicated_schema), as is otherwise (dedicated_db).
+	preserveSchemas := dialects.IsSQLServer(dialects.Kind(inst.Kind))
+	schemaPrefix := ""
+	if preserveSchemas && inst.TargetStrategy == "dedicated_schema" {
+		schemaPrefix = strings.ToLower(mig.SourceSchemaName) + "_"
+	}
 	result := translate.Translate(stmts, translate.Options{
 		TargetSchema:     mig.TargetSchemaName,
 		SourceKind:       dialects.Kind(inst.Kind),
@@ -197,6 +201,9 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		ParseError:       parseErr,
 
 		GeneratedOverrides: overrides,
+
+		PreserveSourceSchemas: preserveSchemas,
+		SchemaPrefix:          schemaPrefix,
 	})
 	if parseErr != nil {
 		result.Warnings = append(result.Warnings, translate.Warning{
@@ -213,6 +220,8 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		TargetSchema:   mig.TargetSchemaName,
 		TargetDBName:   mig.TargetDBName,
 		CreateTargetDB: inst.TargetStrategy == "dedicated_db",
+
+		PreserveSourceSchemas: preserveSchemas,
 	})
 	timings.PlannerBuild = time.Since(plannerStart)
 
@@ -313,4 +322,44 @@ func writeMigErr(w http.ResponseWriter, err error) {
 	default:
 		errJSON(w, http.StatusInternalServerError, err.Error())
 	}
+}
+
+// probeTargetExtensions lists the extensions installed where the
+// migration's DDL will run: the instance's admin PG and, for the
+// dedicated_db strategy, the migration's own target database when it
+// already exists. An extension installed in the target database ahead
+// of the run (the remediation of an install_extension prerequisite:
+// "CREATE EXTENSION postgis on the target database, then re-plan") is
+// otherwise invisible, since a new database does not inherit the
+// extensions of the admin one. Unreachable databases add nothing.
+func probeTargetExtensions(ctx context.Context, inst *project.Instance, mig *project.Migration) []string {
+	dbs := []string{inst.TargetDatabase}
+	if inst.TargetStrategy == "dedicated_db" && mig.TargetDBName != "" && mig.TargetDBName != inst.TargetDatabase {
+		dbs = append(dbs, mig.TargetDBName)
+	}
+	seen := map[string]bool{}
+	var exts []string
+	for _, db := range dbs {
+		pool, err := connection.OpenPostgres(ctx, connection.Params{
+			Kind: "postgres", Host: inst.TargetHost, Port: inst.TargetPort,
+			Database: db, Username: inst.TargetUsername,
+			Password: inst.TargetPassword, SSLMode: inst.TargetSSLMode,
+		})
+		if err != nil {
+			continue
+		}
+		rows, err := pool.Query(ctx, `SELECT extname FROM pg_extension`)
+		if err == nil {
+			for rows.Next() {
+				var n string
+				if err := rows.Scan(&n); err == nil && !seen[n] {
+					seen[n] = true
+					exts = append(exts, n)
+				}
+			}
+			rows.Close()
+		}
+		pool.Close()
+	}
+	return exts
 }

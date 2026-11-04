@@ -105,6 +105,11 @@ type sourceSpec struct {
 	Password     string
 	SourceSchema string // discovered schema to migrate
 	TargetDB     string
+	// Strategy is the instance target strategy: dedicated_schema (the
+	// default) puts one PG schema per source schema inside TargetDB;
+	// dedicated_db creates one PG database per source schema (named by
+	// the migration), TargetDB being the admin database.
+	Strategy string
 }
 
 // setupMigration mirrors the wizard / MCP flow: create a project, create
@@ -113,6 +118,10 @@ type sourceSpec struct {
 // return the draft migration of spec.SourceSchema.
 func setupMigration(t *testing.T, spec sourceSpec) string {
 	t.Helper()
+	strategy := spec.Strategy
+	if strategy == "" {
+		strategy = "dedicated_schema"
+	}
 	project := postJSON(t, "/api/v1/projects", map[string]any{
 		"name":        spec.ProjectName,
 		"description": "integration test",
@@ -129,7 +138,7 @@ func setupMigration(t *testing.T, spec sourceSpec) string {
 		"username":         spec.Username,
 		"password":         spec.Password,
 		"ssl_mode":         "disable",
-		"target_strategy":  "dedicated_schema",
+		"target_strategy":  strategy,
 		"target_host":      "postgres",
 		"target_port":      5432,
 		"target_database":  spec.TargetDB,
