@@ -238,6 +238,8 @@ func writeFromItem(f ast.FromItem) string {
 			out += " " + qIdent(x.Alias)
 		}
 		return out + writeColumnAliasList(x.Cols)
+	case *ast.FromXMLTable:
+		return writeFromXMLTable(x)
 	case *ast.FromValues:
 		rows := make([]string, len(x.Rows))
 		for i, row := range x.Rows {

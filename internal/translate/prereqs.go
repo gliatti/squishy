@@ -591,7 +591,7 @@ func tsqlPrerequisite(w Warning) (Prerequisite, bool) {
 			Object:      w.Object,
 			Title:       "hierarchyid columns migrated as text paths",
 			Description: w.Message,
-			Remediation: "The values are the canonical paths ('/1/3/'), whose text order is not the hierarchy order for multi-digit nodes. To query the hierarchy, convert them to ltree (CREATE EXTENSION ltree; replace the '/' separators by '.') or compare path arrays (string_to_array).",
+			Remediation: "The values are the canonical paths ('/1/3/'). The translated code calls the hierarchyid methods through the tsql.hierarchyid_* functions (tsql schema), which read those paths. Their text order is not the hierarchy order for multi-digit nodes ('/10/' < '/2/'): an ORDER BY or a range comparison on the column needs a hierarchy-ordered key, e.g. ltree (CREATE EXTENSION ltree) or string_to_array(trim(both '/' from col), '/')::int[] for integer labels.",
 		}, true
 	case tsqlWarnSQLVariant:
 		return Prerequisite{

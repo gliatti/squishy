@@ -6599,6 +6599,16 @@ type tsqlState struct {
 	// funcReturns records the return type of every scalar function of
 	// the script (sourceObjectKey), for computed-column type inference.
 	funcReturns map[string]ast.DataType
+	// funcDefs are the functions of the script (sourceObjectKey), and
+	// deterministic caches tsqlDeterministicFunc.
+	funcDefs      map[string]*ast.CreateFunction
+	deterministic map[string]bool
+	// procDefs are the procedures of the script (sourceObjectKey), for
+	// the INOUT arguments of their callers (tsql_call_args.go).
+	procDefs map[string]*ast.CreateProcedure
+	// computedTriggers are the computed columns emulated by a trigger
+	// (tsql_computed_trigger.go).
+	computedTriggers []tsqlComputedTrigger
 	// schemas lists the PG schemas objects were emitted in, in first-use
 	// order (buildDDL creates them).
 	schemas    []string
@@ -6682,6 +6692,9 @@ func (t *translator) translateTSQLScript(stmts []ast.Stmt) {
 		aliasTypes:      map[string]*ast.CreateType{},
 		domainBase:      map[string]string{},
 		funcReturns:     map[string]ast.DataType{},
+		funcDefs:        map[string]*ast.CreateFunction{},
+		procDefs:        map[string]*ast.CreateProcedure{},
+		deterministic:   map[string]bool{},
 		schemaSeen:      map[string]bool{},
 		views:           map[string]int{},
 		routines:        map[string]tsqlRoutineRef{},
@@ -6728,6 +6741,7 @@ func (t *translator) translateTSQLScript(stmts []ast.Stmt) {
 	// After the triggers: the versioning trigger names are kept clear
 	// of theirs.
 	t.emitTSQLTemporal()
+	t.emitTSQLComputedTriggers()
 	t.fillTSQLFKRefColumns()
 	t.applyTSQLComments()
 	t.reportUnusedGeneratedOverrides(st.overrideUsed)
@@ -6753,8 +6767,10 @@ func (t *translator) collectTSQLSourceObjects(stmts []ast.Stmt) {
 			add(x.View.Schema, x.View.Name)
 		case *ast.CreateProcedure:
 			add(x.Schema, x.Name)
+			t.tsql.procDefs[sourceObjectKey(x.Schema, x.Name)] = x
 		case *ast.CreateFunction:
 			add(x.Schema, x.Name)
+			t.tsql.funcDefs[sourceObjectKey(x.Schema, x.Name)] = x
 			if x.Returns != nil && x.ReturnsTableVar == "" && !x.ReturnsInlineTable {
 				t.tsql.funcReturns[sourceObjectKey(x.Schema, x.Name)] = x.Returns
 			}
@@ -7560,6 +7576,17 @@ func (t *translator) tsqlComputedColumn(tbl *PGTable, i int, s *ast.CreateTable,
 	if reason == "" && p.concat {
 		rewritten = tsqlImmutableConcat(rewritten)
 	}
+	if reason == "" && p.userFuncs {
+		// Proven but calling a function of the script: a trigger
+		// computes the column (emitTSQLComputedTriggers).
+		col.Generated = nil
+		tbl.CopiedGenerated = append(tbl.CopiedGenerated, col.Name)
+		t.tsql.computedTriggers = append(t.tsql.computedTriggers, tsqlComputedTrigger{
+			// tbl is appended to Plan.Tables once its columns are done.
+			table: len(t.res.Plan.Tables), col: col.Name, expr: rewritten, src: src,
+		})
+		return
+	}
 	if reason == "" {
 		reason = p.target(rewritten)
 	}
@@ -7645,6 +7672,9 @@ const (
 	tsqlClassText  // varchar / nvarchar / text / string literals
 	tsqlClassChar  // char(n) / nchar(n): blank-padded (PG strips the pad in ||)
 	tsqlClassOther // temporal, binary, uuid, xml, …
+	// tsqlClassHierarchy is a hierarchyid value (text path on PG): only
+	// its methods (GetLevel) and equality are proven.
+	tsqlClassHierarchy
 )
 
 // tsqlClassOf classifies a T-SQL data type.
@@ -7673,6 +7703,8 @@ func (t *translator) tsqlClassOf(dt ast.DataType) tsqlClass {
 			return tsqlClassMoney
 		case "NTEXT", "SYSNAME":
 			return tsqlClassText
+		case "HIERARCHYID":
+			return tsqlClassHierarchy
 		}
 		return tsqlClassOther
 	case *ast.UserDefinedType:
@@ -7720,6 +7752,10 @@ type tsqlComputedProof struct {
 	// concat is set when the source calls CONCAT (rewritten by
 	// tsqlImmutableConcat on the PG side).
 	concat bool
+	// userFuncs is set when the source calls a deterministic scalar
+	// function of the script: the column is then computed by a trigger
+	// (tsql_computed_trigger.go) instead of a generated column.
+	userFuncs bool
 }
 
 // source proves e on the T-SQL side and returns its class.
@@ -7782,7 +7818,13 @@ func (p *tsqlComputedProof) source(e ast.Expr) (tsqlClass, string) {
 				return tsqlArithClass(l, r), ""
 			}
 			return tsqlClassUnknown, "operator " + x.Op + " on non-numeric operands"
-		case "=", "<>", "!=", "<", ">", "<=", ">=", "AND", "OR":
+		case "<", ">", "<=", ">=":
+			if l == tsqlClassHierarchy || r == tsqlClassHierarchy {
+				// hierarchyid orders depth-first, its text path does not.
+				return tsqlClassUnknown, "hierarchyid ordering comparison"
+			}
+			return tsqlClassBool, ""
+		case "=", "<>", "!=", "AND", "OR":
 			return tsqlClassBool, ""
 		}
 		return tsqlClassUnknown, "operator " + x.Op
@@ -7885,7 +7927,20 @@ func (p *tsqlComputedProof) source(e ast.Expr) (tsqlClass, string) {
 				return tsqlClassText, ""
 			}
 		}
+		if dt := p.t.tsql.funcReturns[tsqlFuncKey(x.Name)]; dt != nil && p.t.tsqlDeterministicFunc(x.Name) {
+			p.userFuncs = true
+			return p.t.tsqlClassOf(dt), ""
+		}
 		return tsqlClassUnknown, "function " + x.Name
+	case *ast.MethodCall:
+		// hierarchyid::GetLevel() of a column: the depth of the path,
+		// computed by the IMMUTABLE tsql.hierarchyid_getlevel shim.
+		if strings.EqualFold(x.Method, "GetLevel") && x.StaticType == "" && len(x.Args) == 0 {
+			if c, r := p.source(x.Target); r == "" && c == tsqlClassHierarchy {
+				return tsqlClassInteger, ""
+			}
+		}
+		return tsqlClassUnknown, "method " + x.Method + "()"
 	}
 	return tsqlClassUnknown, "expression not proven identical"
 }
@@ -7909,6 +7964,9 @@ func tsqlArithClass(l, r tsqlClass) tsqlClass {
 var tsqlImmutableFuncs = map[string]bool{
 	"coalesce": true, "nullif": true, "abs": true, "upper": true, "lower": true,
 	"ltrim": true, "rtrim": true, "btrim": true,
+	// The one shim function declared IMMUTABLE for a generated column
+	// (tsql_shim/70_hierarchyid.sql): GetLevel() of a hierarchyid.
+	"tsql.hierarchyid_getlevel": true,
 }
 
 // target proves the PG expression immutable; "" when it is.

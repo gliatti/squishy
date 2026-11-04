@@ -118,7 +118,8 @@ func TestTSQLVisitors_Expressions(t *testing.T) {
 		{name: "cast nvarchar max", src: "CAST(x AS nvarchar(max))", want: `CAST("x" AS text)`},
 		{name: "cast bit", src: "CAST(1 AS bit)", want: `CAST(true AS boolean)`},
 		{name: "convert style 112", src: "CONVERT(varchar(8), d, 112)", cols: typed, want: `CAST(tsql.convert_style("d", 112) AS varchar(8))`, note: "convert_style"},
-		{name: "convert style 103 to date", src: "CONVERT(datetime, '01/02/2003', 103)", want: `CAST(to_timestamp('01/02/2003', 'DD/MM/YYYY') AS timestamp(3))`},
+		{name: "convert style 103 to date", src: "CONVERT(datetime, '01/02/2003', 103)", want: `CAST(tsql.str_to_timestamp_dmy('01/02/2003') AS timestamp(3))`},
+		{name: "convert style 101 to date", src: "CONVERT(datetime, REPLACE(s, 'Z', ''), 101)", want: `CAST(tsql.str_to_timestamp_mdy(replace(CAST("s" AS text), 'Z', '')) AS timestamp(3))`},
 		{name: "convert style on date input", src: "CONVERT(date, d, 112)", cols: typed, want: `CAST("d" AS date)`},
 		{name: "convert unknown style", src: "CONVERT(varchar(30), d, 9)", cols: typed, want: `CAST("d" AS varchar(30))`, label: "style 9"},
 		{name: "try_convert", src: "TRY_CONVERT(int, s)", want: `CAST("s" AS integer)`, note: "TRY_CAST"},
@@ -185,7 +186,24 @@ func TestTSQLVisitors_Expressions(t *testing.T) {
 		{name: "checksum residual", src: "CHECKSUM(a, b)", want: `checksum("a", "b")`, label: "CHECKSUM"},
 		{name: "hashbytes residual", src: "HASHBYTES('SHA2_256', a)", want: `hashbytes('SHA2_256', "a")`, label: "HASHBYTES"},
 		{name: "error residual", src: "@@ERROR", want: `"@@ERROR"`, label: "@@ERROR"},
-		{name: "method residual", src: "e.[OrganizationNode].GetAncestor(1)", want: ``, label: "GetAncestor"},
+		{name: "method residual", src: "g.STDistance(h)", want: ``, label: "STDistance"},
+		{name: "hierarchyid ancestor", src: "e.[OrganizationNode].GetAncestor(1)", want: `tsql.hierarchyid_getancestor("e"."organizationnode", 1)`},
+		{name: "hierarchyid level", src: "OrganizationNode.GetLevel()", want: `tsql.hierarchyid_getlevel("organizationnode")`},
+		{name: "hierarchyid descendant", src: "n.IsDescendantOf(@p) = 1", want: `tsql.hierarchyid_isdescendantof("n", "p") = true`},
+		{name: "hierarchyid tostring", src: "n.ToString()", want: `CAST("n" AS text)`},
+		{name: "hierarchyid root", src: "hierarchyid::GetRoot()", want: `'/'`},
+		{name: "hierarchyid parse", src: "hierarchyid::Parse('/1/')", want: `CAST('/1/' AS text)`},
+		{name: "xml value", src: `Demographics.value('declare default element namespace "urn:s"; (/StoreSurvey/AnnualSales)[1]', 'money')`,
+			want: `CAST((SELECT "v" FROM XMLTABLE(XMLNAMESPACES('urn:s' AS "dns"), '/' PASSING ("demographics") COLUMNS "v" numeric(19,4) PATH '(/dns:StoreSurvey/dns:AnnualSales)[1]') AS "_x") AS numeric(19,4))`},
+		{name: "xml exist", src: `x.exist('declare namespace p="urn:p"; /p:a/@b') = 1`,
+			want: `CAST((SELECT "v" FROM XMLTABLE(XMLNAMESPACES('urn:p' AS "p"), '/' PASSING ("x") COLUMNS "v" boolean PATH 'boolean(/p:a/@b)') AS "_x") AS boolean) = true`},
+		{name: "xml query", src: `x.query('/a/b')`,
+			want: `(SELECT xmlagg("v") FROM XMLTABLE('/a/b' PASSING ("x") COLUMNS "v" xml PATH '.') AS "_x")`},
+		{name: "xml data", src: `x.value('data(/a)', 'int')`,
+			want: `CAST((SELECT "v" FROM XMLTABLE('/' PASSING ("x") COLUMNS "v" integer PATH 'string(/a)') AS "_x") AS integer)`},
+		{name: "xml modify residual", src: `x.modify('insert <a/> into (/r)[1]')`, label: "XML DML"},
+		{name: "xml flwor residual", src: `x.query('for $i in /a return $i')`, label: "FLWOR"},
+		{name: "xml non-xpath function", src: `x.value('fn:upper-case((/a)[1])', 'varchar(9)')`, label: "upper-case"},
 		{name: "at time zone windows", src: "d AT TIME ZONE 'Pacific Standard Time'", cols: typed, want: `"d" AT TIME ZONE 'Pacific Standard Time'`, label: "Windows"},
 		{name: "precedence after rewrite", src: "a & b + c", want: `("a" & "b") + "c"`, label: "could not be proven text"},
 		{name: "precedence typed", src: "qty & 3 + qty", cols: typed, want: `("qty" & 3) + "qty"`},
@@ -254,7 +272,9 @@ func TestTSQLVisitors_Selects(t *testing.T) {
 			want: `SELECT "c"."name" || "c"."name" AS "n" FROM "aw_dbo"."customers" "c" WHERE "c"."active" = true`},
 		{name: "option clause dropped", src: "SELECT Name FROM Customers OPTION (MAXRECURSION 10)",
 			want: `SELECT "name" FROM "aw_dbo"."customers"`},
-		{name: "pivot residual", src: "SELECT * FROM (SELECT a, b FROM t) s PIVOT (SUM(b) FOR a IN ([x], [y])) p", label: "PIVOT"},
+		{name: "pivot", src: "SELECT * FROM (SELECT a, b FROM t) s PIVOT (SUM(b) FOR a IN ([x], [y])) p",
+			want: `SELECT * FROM (SELECT sum(CASE WHEN "s"."a" = 'x' THEN "s"."b" END) AS "x", sum(CASE WHEN "s"."a" = 'y' THEN "s"."b" END) AS "y" FROM (SELECT "a", "b" FROM "t") "s") "p"`},
+		{name: "unpivot residual", src: "SELECT * FROM t UNPIVOT (v FOR k IN ([x], [y])) u", label: "UNPIVOT"},
 		{name: "select into residual", src: "SELECT a INTO #tmp FROM t", label: "SELECT … INTO"},
 	}
 	for _, c := range cases {
@@ -420,11 +440,11 @@ func TestTSQLVisitors_DoNotMutateLeaves(t *testing.T) {
 }
 
 func TestTSQLResidualIdioms(t *testing.T) {
-	s, errs := tsqldialect.ParseSelect("SELECT CHECKSUM(a), x.value('(/a)[1]', 'int'), @@ERROR FROM t FOR XML PATH('')")
+	s, errs := tsqldialect.ParseSelect("SELECT CHECKSUM(a), x.query('for $i in /a return $i'), @@ERROR FROM t FOR XML PATH('')")
 	require.Empty(t, errs)
 	labels := tsqlResidualIdioms(ast.Rewrite(s, RewriteTSQLAST))
 	require.Contains(t, labels, "CHECKSUM() (SQL Server hash, no PG equivalent)")
-	require.Contains(t, labels, "XML data-type method (value / query / exist / nodes / modify)")
+	require.Contains(t, labels, "XML data-type method query() (XQuery: FLWOR expression is not supported)")
 	require.Contains(t, labels, "@@ERROR system variable")
 	require.Contains(t, labels, "FOR XML clause")
 

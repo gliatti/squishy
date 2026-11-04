@@ -173,6 +173,10 @@ type tsqlRW struct {
 	// core skips, in the residual report, the clauses the translator
 	// reports itself on view / TVF queries (FOR XML, TOP … PERCENT).
 	core bool
+	// xmlRefs are the row columns of the xml nodes() sources in scope
+	// (`… CROSS APPLY x.nodes('/a') AS T(c)` → "t.c"), see
+	// tsql_methods.go.
+	xmlRefs map[string]tsqlXMLRef
 }
 
 func newTSQLRW(ctx *ExprCtx) *tsqlRW {
@@ -183,6 +187,8 @@ func newTSQLRW(ctx *ExprCtx) *tsqlRW {
 		loose: map[string]string{},
 		vars:  map[string]string{},
 		seen:  map[string]bool{},
+
+		xmlRefs: map[string]tsqlXMLRef{},
 	}
 	if ctx != nil {
 		rw.run = ctx.Run
@@ -397,6 +403,8 @@ func (c *tsqlScopeCollector) Visit(n ast.Node) ast.Visitor {
 		c.with(x.With)
 	case *ast.FromTable:
 		c.rels = append(c.rels, tsqlRelRef{x.Schema, x.Name, x.Alias})
+	case *ast.FromFunc:
+		c.rw.collectXMLRef(x)
 	case *ast.InsertStmt:
 		c.with(x.With)
 		c.rels = append(c.rels, tsqlRelRef{x.Table.Schema, x.Table.Name, ""})
@@ -589,9 +597,8 @@ func (rw *tsqlRW) systemVar(id *ast.Ident) ast.Node {
 //	CROSS APPLY (SELECT …)                   → alias apply_sub added when missing
 //	FROM STRING_SPLIT(@s, ',') AS t          → FROM string_to_table(s, ',') t (value)
 //
-// Table hints were already dropped by the parser. PIVOT / UNPIVOT
-// have no PG counterpart (crosstab needs tablefunc and a different
-// query shape) and are reported.
+// Table hints were already dropped by the parser. PIVOT / UNPIVOT and
+// xml nodes() sources are rewritten by visitSelectShape.
 func (rw *tsqlRW) visitRelations(n ast.Node) ast.Node {
 	switch x := n.(type) {
 	case *ast.FromTable:
@@ -619,8 +626,6 @@ func (rw *tsqlRW) visitRelations(n ast.Node) ast.Node {
 			if f.Name == "string_to_table" && len(cp.Cols) == 0 {
 				cp.Cols = []string{"value"}
 			}
-		case *ast.RawExpr:
-			rw.label("XML nodes() table source")
 		}
 		return &cp
 	case *ast.FromValues:
@@ -629,11 +634,9 @@ func (rw *tsqlRW) visitRelations(n ast.Node) ast.Node {
 		cp.Cols = foldTSQLNames(x.Cols)
 		return &cp
 	case *ast.FromPivot:
-		if x.Unpivot {
-			rw.label("UNPIVOT")
-		} else {
-			rw.label("PIVOT")
-		}
+		// PIVOT is rewritten by visitSelectShape (tsql_pivot.go); an
+		// UNPIVOT, or a PIVOT it cannot rewrite, is reported by the
+		// residual pass.
 		cp := *x
 		cp.Alias = normalizeTSQLIdent(x.Alias)
 		return &cp
@@ -1102,6 +1105,13 @@ var tsqlPGTextFuncs = map[string]bool{
 	"quote_ident": true, "quote_literal": true, "md5": true, "current_database": true,
 	"pg_catalog.current_user": true, "pg_catalog.session_user": true, "version": true,
 	"tsql.convert_style": true, "tsql.datename": true,
+	"tsql.hierarchyid_getancestor": true, "tsql.hierarchyid_getreparentedvalue": true,
+	"tsql.hierarchyid_getdescendant": true, "st_astext": true,
+}
+
+// tsqlPGBoolFuncs return booleans (T-SQL bit results compared with 0 / 1).
+var tsqlPGBoolFuncs = map[string]bool{
+	"tsql.hierarchyid_isdescendantof": true,
 }
 
 // tsqlPGNumberFuncs return numbers.
@@ -1113,13 +1123,14 @@ var tsqlPGNumberFuncs = map[string]bool{
 	"nextval": true, "currval": true, "pg_backend_pid": true, "row_number": true, "rank": true,
 	"dense_rank": true, "ntile": true, "atan2": true, "pi": true, "pg_sequence_last_value": true,
 	"tsql.datediff": true, "tsql.datepart": true, "tsql.isnumeric": true, "tsql.isdate": true,
+	"tsql.hierarchyid_getlevel": true,
 }
 
 // tsqlPGTimeFuncs return dates / timestamps.
 var tsqlPGTimeFuncs = map[string]bool{
 	"now": true, "timezone": true, "make_date": true, "make_timestamp": true, "make_time": true,
 	"date_trunc": true, "localtimestamp": true, "current_timestamp": true, "current_date": true,
-	"tsql.dateadd": true,
+	"tsql.dateadd": true, "tsql.str_to_timestamp_mdy": true, "tsql.str_to_timestamp_dmy": true,
 }
 
 // tsqlResidualFuncs are the T-SQL built-ins left untranslated (lower
@@ -1228,17 +1239,12 @@ func (rw *tsqlRW) visitFuncs(n ast.Node) ast.Node {
 	case *ast.WindowedAgg:
 		return rw.windowedAgg(x)
 	case *ast.MethodCall:
-		target := x.StaticType
-		if target == "" {
-			target = "column"
+		if strings.EqualFold(x.Method, "nodes") && x.StaticType == "" {
+			// A row source: rewritten with its FROM item
+			// (visitSelectShape → xmlNodesSource).
+			return n
 		}
-		rw.label("CLR method " + target + "." + x.Method + "() (hierarchyid / spatial / xml type methods have no PG equivalent)")
-		return n
-	case *ast.RawExpr:
-		if x.Kind == "XML_METHOD" {
-			rw.label("XML data-type method (value / query / exist / nodes / modify)")
-		}
-		return n
+		return rw.methodCall(x)
 	case *ast.FuncCall:
 		return rw.funcCall(x)
 	}
@@ -1877,8 +1883,12 @@ func (rw *tsqlRW) visitCasts(n ast.Node) ast.Node {
 			return out
 		}
 		switch style.Text {
-		case "101", "103", "104", "105", "110", "111":
-			out.Expr = rw.fc("to_timestamp", c.P, c.Expr, ast.BuildStringLit(tsqlConvertStyles[style.Text]))
+		case "101", "110", "111":
+			// The style orders month and day (tsql_shim/
+			// 51_convert_datetime.sql): PG's parser under DateStyle MDY.
+			out.Expr = rw.fc("tsql.str_to_timestamp_mdy", c.P, rw.textify(c.Expr))
+		case "103", "104", "105":
+			out.Expr = rw.fc("tsql.str_to_timestamp_dmy", c.P, rw.textify(c.Expr))
 		case "0", "112", "120", "121", "126", "127", "23":
 			// ISO forms (and the default) PG parses as they are.
 		default:
@@ -2035,6 +2045,8 @@ func (rw *tsqlRW) exprVal(e ast.Expr) tsqlVal {
 			return tsqlValNumber
 		case tsqlPGTimeFuncs[name]:
 			return tsqlValTime
+		case tsqlPGBoolFuncs[name]:
+			return tsqlValBool
 		case name == "coalesce" || name == "nullif" || name == "greatest" || name == "least" || name == "min" || name == "max":
 			return rw.commonVal(x.Args)
 		case name == "gen_random_uuid":
@@ -2300,6 +2312,10 @@ func (rw *tsqlRW) like(x *ast.BinaryExpr, not bool) ast.Node {
 // SELECT … INTO a new table have no PG statement form and are reported.
 func (rw *tsqlRW) visitSelectShape(n ast.Node) ast.Node {
 	switch x := n.(type) {
+	case *ast.FromFunc:
+		return rw.xmlNodesSource(x)
+	case *ast.FromPivot:
+		return rw.pivot(x)
 	case *ast.SelectStmt:
 		cp := *x
 		changed := false
@@ -2484,15 +2500,9 @@ func (v *tsqlResidualVisitor) Visit(n ast.Node) ast.Visitor {
 			v.add(l)
 		}
 	case *ast.MethodCall:
-		target := x.StaticType
-		if target == "" {
-			target = "column"
-		}
-		v.add("CLR method " + target + "." + x.Method + "() (hierarchyid / spatial / xml type methods have no PG equivalent)")
+		v.add(tsqlMethodResidue(x))
 	case *ast.RawExpr:
-		if x.Kind == "XML_METHOD" {
-			v.add("XML data-type method (value / query / exist / nodes / modify)")
-		} else if x.Kind != "" {
+		if x.Kind != "" {
 			v.add(x.Kind + " clause")
 		}
 	case *ast.FromPivot:

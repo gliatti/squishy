@@ -25,15 +25,22 @@ func (e *CollateExpr) exprNode()     {}
 // MethodCall — a CLR type method call: `col.GetAncestor(1)`,
 // `@h.ToString()`, `geo.STDistance(@p)` (Target set), or a static method
 // `hierarchyid::GetRoot()` / `geography::Point(…)` (StaticType set,
-// Target nil). Method keeps its source spelling. XML data-type methods
-// (value / query / exist / nodes / modify) are not MethodCalls: their
-// XQuery arguments are opaque, so the parser keeps them as a RawExpr
-// with Kind "XML_METHOD".
+// Target nil). Method keeps its source spelling.
+//
+// The xml data-type methods (value / query / exist / nodes / modify) are
+// MethodCalls too. When the XQuery argument is a string literal the
+// parser understands, XQuery holds its parsed tree (XQueryErr says why
+// not otherwise: XML DML of modify(), an unsupported construct); for
+// value(), ValueType is the parsed SQL type of its second argument
+// (`'nvarchar(30)'`).
 type MethodCall struct {
 	Target     Expr
 	StaticType string
 	Method     string
 	Args       []Expr
+	XQuery     *XQuery
+	XQueryErr  string
+	ValueType  DataType
 	P          Position
 }
 
@@ -61,8 +68,7 @@ func (e *NamedArg) exprNode()     {}
 // FromFunc — a table-valued function in a FROM clause / APPLY:
 // `dbo.ufnGetContactInformation(@id) AS c`, `OPENJSON(@j) WITH (…)`,
 // `CONTAINSTABLE(t, *, @s) AS k`, or an XML `x.nodes('/a') AS T(c)` (Func
-// is then a RawExpr with Kind "XML_METHOD"). Cols is the optional column
-// alias list.
+// is then a MethodCall "nodes"). Cols is the optional column alias list.
 type FromFunc struct {
 	Func  Expr
 	Alias string

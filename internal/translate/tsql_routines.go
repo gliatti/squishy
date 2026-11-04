@@ -131,10 +131,16 @@ type tsqlBody struct {
 	// permanentInto is set when a SELECT … INTO targets a permanent
 	// table (the visitors' label then stands).
 	permanentInto bool
+	// xmlDMLGuarded is set when an UPDATE … SET col.modify(…) was
+	// turned into its raising guard (xmlModifyGuard), which reports it.
+	xmlDMLGuarded bool
 
 	dmlSeen bool // a statement setting @@ROWCOUNT ran before (source order)
 	inTry   int
 	inCatch int
+	// errCtx are the locals holding the error context the enclosing
+	// CATCH blocks replaced (innermost last), see catchHandler.
+	errCtx []*tsqlVar
 }
 
 // translateTSQLRoutineBody is the SQL Server RoutineBodyTranslator: it
@@ -164,6 +170,9 @@ func translateTSQLRoutineBody(ctx *RoutineCtx) (string, []string, []string) {
 	text := b.render(stmts)
 	for _, l := range labels {
 		if l == tsqlSelectIntoLabel && !b.permanentInto {
+			continue
+		}
+		if l == tsqlXMLModifyLabel && b.xmlDMLGuarded {
 			continue
 		}
 		b.warn("T-SQL construct not translated: " + l)
@@ -817,22 +826,19 @@ func tsqlUpdateMarkTrigger(trigger string, i int) string {
 // errorFunc translates ERROR_MESSAGE() & co. Inside a CATCH block they
 // read the error PL/pgSQL exposes in the EXCEPTION handler; outside one
 // (a routine called from its caller's CATCH, like AdventureWorks'
-// uspLogError) PG has no access to the caller's error at all.
+// uspLogError) they read the error context the caller's translated CATCH
+// block published (tsql_error_context.go).
 func (b *tsqlBody) errorFunc(name string, p ast.Position) ast.Expr {
 	if b.inCatch == 0 {
-		b.warn("ERROR_MESSAGE() / ERROR_NUMBER() / … are read outside a CATCH block (to report the error that made the caller jump to its CATCH): a PostgreSQL routine cannot see its caller's error, SQLERRM / SQLSTATE exist only inside the EXCEPTION handler that caught it. They read NULL here; pass the error details as parameters")
-		switch name {
-		case "ERROR_MESSAGE", "ERROR_PROCEDURE":
-			return tsqlTypedNull("text", p)
-		}
-		return tsqlTypedNull("integer", p)
+		return b.errorContextFunc(name, p)
 	}
 	switch name {
 	case "ERROR_MESSAGE":
 		return &ast.Ident{Parts: []string{"sqlerrm"}, P: p}
 	case "ERROR_NUMBER":
-		b.note("ERROR_NUMBER() is translated to SQLSTATE, the five-character PostgreSQL error code (text, not the T-SQL error number)")
-		return &ast.Ident{Parts: []string{"sqlstate"}, P: p}
+		b.note(tsqlErrorNumberNote)
+		b.use("tsql.error_number_of")
+		return &ast.FuncCall{Name: "tsql.error_number_of", Args: []ast.Expr{&ast.Ident{Parts: []string{"sqlstate"}, P: p}}, P: p}
 	case "ERROR_SEVERITY":
 		b.note("ERROR_SEVERITY() reads 16 (PostgreSQL errors have no severity; every error reaching an EXCEPTION handler is an error)")
 		return &ast.Literal{Kind: "number", Text: "16", P: p}
@@ -1048,7 +1054,7 @@ func (b *tsqlBody) stmt(n ast.PLStmt, next ast.PLStmt) []pgast.PLStmt {
 		if x.Except != nil {
 			b.inCatch++
 			for _, h := range x.Except.Handlers {
-				blk.Handlers = append(blk.Handlers, pgast.PLHandler{Conditions: []string{"OTHERS"}, Body: tsqlNonEmpty(b.stmts(h.Body))})
+				blk.Handlers = append(blk.Handlers, pgast.PLHandler{Conditions: []string{"OTHERS"}, Body: tsqlNonEmpty(b.catchHandler(h.Body))})
 			}
 			b.inCatch--
 		}
@@ -1275,6 +1281,9 @@ func (b *tsqlBody) dmlStmt(n ast.PLStmt) []pgast.PLStmt {
 				return nil
 			}
 		}
+		if g := b.xmlModifyGuard(x); g != nil {
+			return g
+		}
 	}
 	stmt, _ := n.(ast.Stmt)
 	return b.withRowcount(tsqlRaw(b.dml(stmt)))
@@ -1283,7 +1292,7 @@ func (b *tsqlBody) dmlStmt(n ast.PLStmt) []pgast.PLStmt {
 func (b *tsqlBody) returnStmt(x *ast.ReturnStmt) []pgast.PLStmt {
 	switch {
 	case b.ctx.Trigger != nil:
-		return []pgast.PLStmt{&pgast.PLReturn{Expr: b.ctx.Trigger.ReturnRow}}
+		return append(b.leaveErrorContext(), &pgast.PLReturn{Expr: b.ctx.Trigger.ReturnRow})
 	case b.ctx.Kind == RoutineMultiTVF:
 		return b.tvfReturn()
 	case b.ctx.Kind == RoutineScalarFunction:
@@ -1295,7 +1304,7 @@ func (b *tsqlBody) returnStmt(x *ast.ReturnStmt) []pgast.PLStmt {
 	if x.Expr != nil {
 		b.note("RETURN <status> of a procedure: the return status is dropped (a PostgreSQL procedure returns no value; pass it through an INOUT parameter)")
 	}
-	return []pgast.PLStmt{&pgast.PLReturn{}}
+	return append(b.leaveErrorContext(), &pgast.PLReturn{})
 }
 
 // tvfReturn ends a multi-statement table-valued function: the rows of the
@@ -1482,31 +1491,9 @@ func (b *tsqlBody) call(x *ast.CallStmt) []pgast.PLStmt {
 		return nil
 	}
 	schema, name := b.resolve(x.Schema, x.Name)
-	var args []string
-	for i, a := range x.Args {
-		if na, ok := a.(*ast.NamedArg); ok {
-			if tsqlIsDefault(na.Value) {
-				if na.Name == "" {
-					b.warn("EXEC " + x.Name + ": a positional DEFAULT argument has no PostgreSQL counterpart")
-				}
-				continue
-			}
-			val := b.expr(na.Value)
-			if na.Name != "" {
-				val = quoteIdent(tsqlVarName(na.Name)) + " => " + val
-			}
-			args = append(args, val)
-			continue
-		}
-		if tsqlIsDefault(a) {
-			if !tsqlAllDefault(x.Args[i:]) {
-				b.warn("EXEC " + x.Name + ": a positional DEFAULT argument before other arguments has no PostgreSQL counterpart")
-			}
-			break
-		}
-		args = append(args, b.expr(a))
-	}
-	out := []pgast.PLStmt{&pgast.PLCall{Schema: schema, Name: name, Args: args}}
+	// INOUT parameters need writable arguments (tsql_call_args.go).
+	args, pre := b.callArgs(x)
+	out := append(pre, &pgast.PLCall{Schema: schema, Name: name, Args: args})
 	if x.ReturnVar != "" {
 		b.warn("EXEC " + x.ReturnVar + " = " + x.Name + ": a PostgreSQL procedure has no return status; " + x.ReturnVar + " is set to 0 (success) after the CALL")
 		if v := b.vars[tsqlVarName(x.ReturnVar)]; v != nil {

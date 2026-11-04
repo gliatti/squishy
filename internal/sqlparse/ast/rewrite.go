@@ -200,6 +200,9 @@ func Rewrite(n Node, fn Rewriter) Node {
 			}
 		}
 		return fn(x)
+	case *FromXMLTable:
+		x.Passing = rewriteExpr(x.Passing, fn)
+		return fn(x)
 	case *InsertStmt:
 		rewriteWith(x.With, fn)
 		x.Top = rewriteExpr(x.Top, fn)

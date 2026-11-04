@@ -207,6 +207,29 @@ func TestTSQLShim_PG(t *testing.T) {
 		{`tsql.convert_style(timestamp '2024-03-05 14:07:09', 126)`, "2024-03-05T14:07:09"},
 		{`tsql.convert_style(date '2024-03-05', 112)`, "20240305"},
 		{`tsql.convert_style(timestamptz '2024-03-05 14:07:09+00', 120)`, "2024-03-05 14:07:09"},
+		// hierarchyid over its canonical path
+		{`tsql.hierarchyid_getlevel('/')`, "0"},
+		{`tsql.hierarchyid_getlevel('/1/3/')`, "2"},
+		{`tsql.hierarchyid_getlevel('/2.1/')`, "1"},
+		{`tsql.hierarchyid_getancestor('/1/3/', 1)`, "/1/"},
+		{`tsql.hierarchyid_getancestor('/1/3/', 2)`, "/"},
+		{`coalesce(tsql.hierarchyid_getancestor('/1/3/', 3), 'null')`, "null"},
+		{`tsql.hierarchyid_isdescendantof('/1/3/', '/1/')`, "true"},
+		{`tsql.hierarchyid_isdescendantof('/1/', '/1/')`, "true"},
+		{`tsql.hierarchyid_isdescendantof('/10/', '/1/')`, "false"},
+		{`tsql.hierarchyid_getreparentedvalue('/1/3/4/', '/1/3/', '/2/')`, "/2/4/"},
+		{`tsql.hierarchyid_getdescendant('/1/', NULL, NULL)`, "/1/1/"},
+		{`tsql.hierarchyid_getdescendant('/1/', '/1/3/', NULL)`, "/1/4/"},
+		{`tsql.hierarchyid_getdescendant('/1/', '/1/3/', '/1/7/')`, "/1/4/"},
+		// error context of a CATCH block (published, read, restored)
+		{`coalesce(tsql.error_field('message'), 'null')`, "null"},
+		{`(SELECT tsql.error_field('message') FROM (SELECT tsql.error_enter('23505', 'dup key') AS prev) p)`, "dup key"},
+		{`tsql.error_number_of('23505')`, "2627"},
+		{`tsql.error_number_of('P0001')`, "50000"},
+		// CONVERT(datetime, s, style): DateStyle-ordered parsing
+		{`tsql.str_to_timestamp_mdy('02/03/2004')`, "2004-02-03 00:00:00"},
+		{`tsql.str_to_timestamp_dmy('02/03/2004')`, "2004-03-02 00:00:00"},
+		{`tsql.str_to_timestamp_mdy('2004-02-21')`, "2004-02-21 00:00:00"},
 	}
 	for _, c := range shim {
 		check(t, c.expr, c.want)
@@ -239,6 +262,11 @@ func TestTSQLShim_PG(t *testing.T) {
 		{"CONVERT(varchar(10), CAST('2024-03-05 10:11:12' AS datetime), 103)", "05/03/2024"},
 		{"CONVERT(varchar(8), CAST('2024-03-05' AS datetime), 112)", "20240305"},
 		{"CONVERT(datetime, '05/03/2024', 103)", "2024-03-05 00:00:00"},
+		{"CONVERT(datetime, '2004-02-21', 101)", "2004-02-21 00:00:00"},
+		{"CONVERT(datetime, '02/03/2004', 101)", "2004-02-03 00:00:00"},
+		{"CONVERT(datetime, '2/3/2004 10:30', 101)", "2004-02-03 10:30:00"},
+		{"CONVERT(datetime, '21.02.2004', 104)", "2004-02-21 00:00:00"},
+		{"CONVERT(datetime, '20040203', 103)", "2004-02-03 00:00:00"},
 		{"CAST(12.5 AS nvarchar)", "12.5"},
 		{"5 ^ 3", "6"},
 		{"~5", "-6"},
@@ -258,6 +286,11 @@ func TestTSQLShim_PG(t *testing.T) {
 		{"LEFT(12345, 2)", "12"},
 		{"UPPER(N'abc') + 'd'", "ABCd"},
 		{"QUOTENAME('a b')", `"a b"`},
+		{"hierarchyid::GetRoot()", "/"},
+		{"CAST('/1/2/' AS varchar(20))", "/1/2/"},
+		{`CAST('<r xmlns="urn:x"><a>7</a></r>' AS xml).value('declare default element namespace "urn:x"; (/r/a)[1]', 'int') + 1`, "8"},
+		{`CAST('<r><a b="x"/></r>' AS xml).exist('/r/a[@b="x"]')`, "true"},
+		{`CAST('<r><a b="x"/></r>' AS xml).exist('/r/c')`, "false"},
 	}
 	for _, c := range exprs {
 		e, errs := tsqldialect.ParseExpr(c.tsql)

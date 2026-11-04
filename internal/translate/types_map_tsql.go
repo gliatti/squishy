@@ -184,7 +184,7 @@ func mapTSQLBuiltin(x *ast.TSQLType, caps Caps) typeResult {
 		return typeResult{
 			PG:              "text",
 			Note:            "hierarchyid → text (canonical '/1/2/' path form)",
-			Warning:         "hierarchyid column mapped to text holding the canonical path ('/1/3/'): the hierarchy methods (GetAncestor, IsDescendantOf, GetLevel, …) are not available on PostgreSQL",
+			Warning:         "hierarchyid column mapped to text holding the canonical path ('/1/3/'): the hierarchy methods (GetLevel, GetAncestor, IsDescendantOf, GetReparentedValue, GetDescendant with integer labels) are translated to the tsql.hierarchyid_* functions over that text, but ORDER BY / < / > compare the text, not the depth-first hierarchy order",
 			WarningSeverity: SeverityInfo,
 			WarningKind:     tsqlWarnHierarchy,
 		}

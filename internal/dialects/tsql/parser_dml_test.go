@@ -100,7 +100,7 @@ FROM [Person].[Person] AS p WITH (NOLOCK)
 			}
 		case ast.OuterApply:
 			ff := as[*ast.FromFunc](t, j.Right)
-			if as[*ast.RawExpr](t, ff.Func).Kind != "XML_METHOD" || ff.Alias != "T" || len(ff.Cols) != 1 {
+			if m := as[*ast.MethodCall](t, ff.Func); m.Method != "nodes" || m.XQuery == nil || ff.Alias != "T" || len(ff.Cols) != 1 {
 				t.Errorf("OUTER APPLY nodes(): %+v", ff)
 			}
 			if j.On != nil {
@@ -242,7 +242,7 @@ WHERE [Person].[Person].[BusinessEntityID] = inserted.[BusinessEntityID]`)
 	if inc.Op != "+" || identText(t, inc.Lhs) != "Count" {
 		t.Errorf("compound assignment: %+v", inc)
 	}
-	if m := as[*ast.RawExpr](t, u.Sets[3].Expr); m.Kind != "XML_METHOD" || u.Sets[3].Col != "Demographics" {
+	if m := as[*ast.MethodCall](t, u.Sets[3].Expr); m.Method != "modify" || m.XQuery != nil || m.XQueryErr == "" || u.Sets[3].Col != "Demographics" {
 		t.Errorf("xml modify(): %+v %+v", u.Sets[3], m)
 	}
 	c, errs := ParseUpdate("UPDATE t SET a = 1 WHERE CURRENT OF c")

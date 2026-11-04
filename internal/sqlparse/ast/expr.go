@@ -96,9 +96,8 @@ func (e *ParenExpr) exprNode()     {}
 type RawExpr struct {
 	Text string
 	// Kind classifies a RawExpr that a parser produced on purpose for a
-	// construct it deliberately keeps opaque (T-SQL: "XML_METHOD" for
-	// xml.value() / query() / exist() / nodes() / modify(), whose
-	// arguments are XQuery text). "" for the legacy untyped fallback.
+	// construct it deliberately keeps opaque (T-SQL: "OPTION" clauses
+	// and the like). "" for the legacy untyped fallback.
 	Kind string
 	P    Position
 }

@@ -39,8 +39,22 @@ var tsqlShimFuncs = map[string][]string{
 	"tsql.isnumeric":     {"40_isnumeric.sql"},
 	"tsql.isdate":        {"41_isdate.sql"},
 	"tsql.convert_style": {"50_convert_style.sql"},
+	// CONVERT(datetime, string, style) (tsql_visitors.go visitCasts).
+	"tsql.str_to_timestamp_mdy": {"51_convert_datetime.sql"},
+	"tsql.str_to_timestamp_dmy": {"51_convert_datetime.sql"},
 	// UPDATE(col) in an AFTER UPDATE trigger (tsql_routines.go).
 	"tsql.take_column_updated": {"60_column_updated.sql"},
+	// hierarchyid methods over the canonical text path (tsql_methods.go).
+	"tsql.hierarchyid_getlevel":           {"70_hierarchyid.sql"},
+	"tsql.hierarchyid_getancestor":        {"70_hierarchyid.sql"},
+	"tsql.hierarchyid_isdescendantof":     {"70_hierarchyid.sql"},
+	"tsql.hierarchyid_getreparentedvalue": {"70_hierarchyid.sql"},
+	"tsql.hierarchyid_getdescendant":      {"70_hierarchyid.sql"},
+	// ERROR_*() of a routine called by a CATCH block
+	// (tsql_error_context.go).
+	"tsql.error_enter":     {"80_error_context.sql"},
+	"tsql.error_field":     {"80_error_context.sql"},
+	"tsql.error_number_of": {"80_error_context.sql"},
 }
 
 // tsqlShimFileNames returns the shim pieces in file-name order (the

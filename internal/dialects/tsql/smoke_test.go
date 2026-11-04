@@ -133,7 +133,7 @@ GO
 
 func TestSmokeScript(t *testing.T) {
 	stmts := mustParse(t, smokeScript)
-	allowed := map[string]bool{"XML_METHOD": true}
+	allowed := map[string]bool{}
 	kinds := map[string]int{}
 	for _, s := range stmts {
 		switch x := s.(type) {

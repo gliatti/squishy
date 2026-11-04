@@ -124,7 +124,7 @@ func TestCorpus(t *testing.T) {
 			}
 			want := creates(src)
 			got := map[string]int{}
-			allowed := map[string]bool{"XML_METHOD": true}
+			allowed := map[string]bool{}
 			for _, s := range stmts {
 				switch x := s.(type) {
 				case *ast.CreateTable:

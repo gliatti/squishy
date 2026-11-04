@@ -171,6 +171,8 @@ func Walk(v Visitor, n Node) {
 				Walk(v, e)
 			}
 		}
+	case *FromXMLTable:
+		Walk(v, x.Passing)
 	case *InsertStmt:
 		walkWith(v, x.With)
 		Walk(v, x.Top)

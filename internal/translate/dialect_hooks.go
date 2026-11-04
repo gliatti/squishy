@@ -184,6 +184,26 @@ func (r *HookRun) TableColumns(pgSchema, pgTable string) map[string]string {
 	return nil
 }
 
+// TableColumnNames returns the PG column names of a table already
+// translated in this run, in table order (nil when the run has no such
+// table).
+func (r *HookRun) TableColumnNames(pgSchema, pgTable string) []string {
+	if r.t == nil {
+		return nil
+	}
+	for i := range r.t.res.Plan.Tables {
+		tbl := &r.t.res.Plan.Tables[i]
+		if tbl.Schema == pgSchema && tbl.Name == pgTable {
+			out := make([]string, len(tbl.Columns))
+			for j, c := range tbl.Columns {
+				out[j] = c.Name
+			}
+			return out
+		}
+	}
+	return nil
+}
+
 // MapType renders a source data type as its PG type text, with the
 // run's capabilities (alias types resolve to their domains).
 func (r *HookRun) MapType(dt ast.DataType) string {

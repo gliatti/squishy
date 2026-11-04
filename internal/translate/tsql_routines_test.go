@@ -128,30 +128,35 @@ func TestTSQLRoutines_ErrorLogProcedures(t *testing.T) {
 	logErr := tsqlRoutineDDL(t, res, "procedure", "dbo", "usplogerror")
 	for _, frag := range []string{
 		`CREATE OR REPLACE PROCEDURE "dbo"."usplogerror"(INOUT "errorlogid" integer DEFAULT 0)`,
-		"$body$\n#variable_conflict use_column\nBEGIN\n",
+		"$body$\n#variable_conflict use_column\n<<_tsql>>\nDECLARE\n  \"_error_context\" text;\nBEGIN\n",
 		`  "usplogerror"."errorlogid" := 0;`,
-		// TRY … CATCH → a nested block with an EXCEPTION handler.
-		"  BEGIN\n    IF CAST(NULL AS integer) IS NULL THEN\n      RETURN;\n    END IF;",
-		"  EXCEPTION\n    WHEN OTHERS THEN\n      RAISE NOTICE '%', 'An error occurred in stored procedure uspLogError: ';\n      CALL \"dbo\".\"uspprinterror\"();\n      RETURN;\n  END;",
+		// TRY … CATCH → a nested block with an EXCEPTION handler. The
+		// ERROR_*() of the TRY part read the error of the caller's CATCH
+		// block (tsql.error_field).
+		"  BEGIN\n    IF tsql.error_number_of(tsql.error_field('state')) IS NULL THEN\n      RETURN;\n    END IF;",
+		`tsql.error_number_of(tsql.error_field('state')), CASE WHEN tsql.error_field('state') IS NOT NULL THEN 16 END, CASE WHEN tsql.error_field('state') IS NOT NULL THEN 1 END, CAST(NULL AS text), CAST(NULL AS integer), tsql.error_field('message'));`,
+		// Its CATCH block calls uspPrintError: it publishes its own error
+		// first, and restores the caller's before RETURN.
+		"  EXCEPTION\n    WHEN OTHERS THEN\n      \"_tsql\".\"_error_context\" := tsql.error_enter(SQLSTATE, SQLERRM);\n      RAISE NOTICE '%', 'An error occurred in stored procedure uspLogError: ';\n      CALL \"dbo\".\"uspprinterror\"();\n      PERFORM tsql.error_leave(\"_tsql\".\"_error_context\");\n      RETURN;\n  END;",
 		`IF 1 = -1 THEN`,
 		`"usplogerror"."errorlogid" := lastval();`,
 	} {
 		require.Contains(t, logErr, frag)
 	}
-	// ERROR_*() in the TRY part read the caller's error: no PG
-	// counterpart, one blocking entry.
-	ws := tsqlObjectWarnings(res, "procedure.dbo.usplogerror", "routine.untranslated_construct")
-	require.Len(t, ws, 1, "%v", ws)
-	require.Contains(t, ws[0], "outside a CATCH block")
+	// ERROR_*() in the TRY part read the caller's error through the error
+	// context: translated, with a remark.
+	require.Empty(t, tsqlObjectWarnings(res, "procedure.dbo.usplogerror", "routine.untranslated_construct"))
 	notes := tsqlObjectWarnings(res, "procedure.dbo.usplogerror", "routine.translated_with_remarks")
+	require.Contains(t, strings.Join(notes, "\n"), "outside a CATCH block read the error of the CATCH block that called this routine")
 	require.Contains(t, strings.Join(notes, "\n"), "XACT_STATE() reads 1")
 	require.Contains(t, strings.Join(notes, "\n"), "return status is dropped")
 
 	printErr := tsqlRoutineDDL(t, res, "procedure", "dbo", "uspprinterror")
-	require.Contains(t, printErr, "RAISE NOTICE '%', 'Error ' || CAST(CAST(NULL AS integer) AS varchar(50)) || ', Severity '")
-	require.Contains(t, printErr, "RAISE NOTICE '%', CAST(NULL AS text);")
+	require.Contains(t, printErr, "RAISE NOTICE '%', 'Error ' || CAST(tsql.error_number_of(tsql.error_field('state')) AS varchar(50)) || ', Severity '")
+	require.Contains(t, printErr, "RAISE NOTICE '%', tsql.error_field('message');")
 	require.NotContains(t, printErr, "#variable_conflict", "no variable, no directive")
-	require.Len(t, tsqlObjectWarnings(res, "procedure.dbo.uspprinterror", "routine.untranslated_construct"), 1)
+	require.Empty(t, tsqlObjectWarnings(res, "procedure.dbo.uspprinterror", "routine.untranslated_construct"))
+	require.Contains(t, strings.Join(res.Plan.PreActions, "\n"), "CREATE OR REPLACE FUNCTION tsql.error_enter(state text, message text)", "the error-context shim is emitted")
 }
 
 func TestTSQLRoutines_ErrorFunctionsInCatch(t *testing.T) {
@@ -170,11 +175,11 @@ END;
 GO
 `)
 	ddl := tsqlRoutineDDL(t, res, "procedure", "dbo", "logit")
-	require.Contains(t, ddl, `VALUES ('x', "sqlstate", 16, 1, CAST(NULL AS text), CAST(NULL AS integer), "sqlerrm");`)
+	require.Contains(t, ddl, `VALUES ('x', tsql.error_number_of("sqlstate"), 16, 1, CAST(NULL AS text), CAST(NULL AS integer), "sqlerrm");`)
 	require.Contains(t, ddl, "      RAISE;\n")
 	require.Empty(t, tsqlObjectWarnings(res, "procedure.dbo.logit", "routine.untranslated_construct"))
 	notes := strings.Join(tsqlObjectWarnings(res, "procedure.dbo.logit", "routine.translated_with_remarks"), "\n")
-	require.Contains(t, notes, "ERROR_NUMBER() is translated to SQLSTATE")
+	require.Contains(t, notes, "ERROR_NUMBER() maps the PostgreSQL SQLSTATE")
 }
 
 func TestTSQLRoutines_Functions(t *testing.T) {
@@ -381,7 +386,10 @@ func TestTSQLRoutines_Triggers(t *testing.T) {
 		`"_tsql"."count" := (SELECT count(*) FROM "deleted");`,
 		"IF FALSE OR FALSE OR FALSE THEN",
 		`FROM (SELECT * FROM "sales"."salesorderdetail" WHERE false) "inserted" INNER JOIN "sales"."salesorderheader"`,
-		"  EXCEPTION\n    WHEN OTHERS THEN\n      CALL \"dbo\".\"uspprinterror\"();\n      IF 1 > 0 THEN\n        RAISE EXCEPTION 'transaction rolled back by trigger %: %', TG_NAME, SQLERRM;\n      END IF;\n      CALL \"dbo\".\"usplogerror\"();\n  END;",
+		"  EXCEPTION\n    WHEN OTHERS THEN\n      \"_tsql\".\"_error_context\" := tsql.error_enter(SQLSTATE, SQLERRM);\n      CALL \"dbo\".\"uspprinterror\"();\n      IF 1 > 0 THEN\n        RAISE EXCEPTION 'transaction rolled back by trigger %: %', TG_NAME, SQLERRM;\n      END IF;\n      \"_tsql\".\"_usplogerror_errorlogid\" := 0;\n      CALL \"dbo\".\"usplogerror\"(\"_tsql\".\"_usplogerror_errorlogid\");\n      PERFORM tsql.error_leave(\"_tsql\".\"_error_context\");\n  END;",
+		// The omitted OUTPUT parameter of uspLogError (DEFAULT 0) gets a
+		// writable local holding its default.
+		"  \"_usplogerror_errorlogid\" integer;\n",
 		"REFERENCING OLD TABLE AS \"deleted\"",
 	} {
 		require.Contains(t, idu, frag)
@@ -846,4 +854,71 @@ GO
 	require.Len(t, branchy, 1)
 	require.Contains(t, branchy[0], "inside IF")
 	require.NotContains(t, tsqlRoutineDDL(t, res, "procedure", "dbo", "branchy"), "LIMIT")
+}
+
+// UPDATE … SET col.modify(…) (XML DML) becomes a guard raising when the
+// UPDATE would modify a row; its exist() predicate is translated.
+func TestTSQLRoutines_XMLModifyGuard(t *testing.T) {
+	res := tsqlRoutinesTranslate(t, tsqlAWSchema+`
+CREATE TRIGGER Person.iuPersonXML ON Person.Person AFTER INSERT AS
+BEGIN
+    UPDATE [Person].[Person]
+    SET [Demographics].modify(N'declare default element namespace "urn:s";
+        insert <TotalPurchaseYTD>0.00</TotalPurchaseYTD> as first into (/IndividualSurvey)[1]')
+    FROM inserted
+    WHERE [Person].[Person].[BusinessEntityID] = inserted.[BusinessEntityID]
+        AND inserted.[Demographics] IS NOT NULL
+        AND inserted.[Demographics].exist(N'declare default element namespace "urn:s"; /IndividualSurvey/TotalPurchaseYTD') <> 1;
+END;
+GO
+`)
+	ddl := tsqlRoutineDDL(t, res, "trigger", "person", "iupersonxml")
+	require.Contains(t, ddl, `IF EXISTS (SELECT 1 FROM "person"."person", "inserted" WHERE "person"."person"."businessentityid" = "inserted"."businessentityid" AND "inserted"."demographics" IS NOT NULL AND `+
+		`CAST((SELECT "v" FROM XMLTABLE(XMLNAMESPACES('urn:s' AS "dns"), '/' PASSING ("inserted"."demographics") COLUMNS "v" boolean PATH 'boolean(/dns:IndividualSurvey/dns:TotalPurchaseYTD)') AS "_x") AS boolean) <> true) THEN`)
+	require.Contains(t, ddl, `RAISE EXCEPTION 'T-SQL XML DML person.person.demographics.modify() of trigger.person.iupersonxml is not supported on PostgreSQL' USING ERRCODE = 'feature_not_supported';`)
+	require.NotContains(t, ddl, "insert <TotalPurchaseYTD>", "the XML DML is not emitted")
+	w := tsqlObjectWarnings(res, "trigger.person.iupersonxml", "routine.untranslated_construct")
+	require.Len(t, w, 1, "one blocking entry, the guard's: %q", w)
+	require.Contains(t, w[0], "raises an error whenever it would modify a row")
+}
+
+// INOUT parameters of a called procedure always get a writable argument:
+// an omitted OUTPUT parameter, a constant or a variable passed without
+// OUTPUT go through a local; an OUTPUT variable is passed as is; the
+// result cursors of a procedure returning rows are passed by name.
+func TestTSQLRoutines_CallInoutArguments(t *testing.T) {
+	res := tsqlRoutinesTranslate(t, `
+CREATE PROCEDURE dbo.Callee @a int, @b int = 7 OUTPUT, @c int = 0 OUTPUT AS
+BEGIN
+    SET @b = @a + 1;
+    SELECT @a AS a;
+END;
+GO
+CREATE PROCEDURE dbo.Caller AS
+BEGIN
+    DECLARE @x int = 1, @y int;
+    EXEC dbo.Callee 1;
+    EXEC dbo.Callee @x, @y OUTPUT;
+    EXEC dbo.Callee @a = 2, @b = 5;
+    EXEC dbo.Callee @x, @x;
+END;
+GO
+`)
+	ddl := tsqlRoutineDDL(t, res, "procedure", "dbo", "caller")
+	for _, frag := range []string{
+		// Omitted @b / @c: locals holding their defaults; the result
+		// cursor by name.
+		`"_tsql"."_callee_b" := 7;`,
+		`"_tsql"."_callee_c" := 0;`,
+		`CALL "dbo"."callee"(1, "_tsql"."_callee_b", "_tsql"."_callee_c", "_result" => "_tsql"."_callee__result");`,
+		// @y OUTPUT: passed as is.
+		`CALL "dbo"."callee"("_tsql"."x", "_tsql"."y", "_tsql"."_callee_c_1", "_result" => "_tsql"."_callee__result_1");`,
+		// A constant to an OUTPUT parameter: through a local.
+		`"_tsql"."_callee_b_1" := 5;`,
+		`CALL "dbo"."callee"("a" => 2, "b" => "_tsql"."_callee_b_1", "c" => "_tsql"."_callee_c_2", "_result" => "_tsql"."_callee__result_2");`,
+		// A variable without OUTPUT is not written back (T-SQL).
+		`"_tsql"."_callee_b_2" := "_tsql"."x";`,
+	} {
+		require.Contains(t, ddl, frag)
+	}
 }

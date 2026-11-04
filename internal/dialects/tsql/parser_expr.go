@@ -243,9 +243,8 @@ func isMethodTarget(e ast.Expr) bool {
 	return false
 }
 
-// xmlMethods are the xml data-type methods. Their arguments are XQuery /
-// XML DML text the migration cannot translate, so a call is kept as an
-// opaque RawExpr (Kind "XML_METHOD").
+// xmlMethods are the xml data-type methods. Their XQuery argument is
+// parsed into typed nodes (ParseXQuery) by finishMethodCall.
 var xmlMethods = map[string]bool{"value": true, "query": true, "exist": true, "nodes": true, "modify": true}
 
 // clrMethods are the hierarchyid / geography / geometry CLR methods
@@ -266,15 +265,59 @@ var clrMethods = map[string]bool{
 }
 
 // finishMethodCall parses the parenthesised arguments of `target.method(…)`
-// (the current token is '(') and returns the XML RawExpr or the MethodCall.
+// (the current token is '(') and returns the MethodCall. For an xml
+// method whose XQuery argument is a string literal, the XQuery is parsed
+// (MethodCall.XQuery, or XQueryErr when outside the supported subset;
+// modify()'s XML DML is never parsed), and the SQL type literal of
+// value() is parsed as a T-SQL data type (MethodCall.ValueType).
 func (p *Parser) finishMethodCall(start Token, target ast.Expr, method string) ast.Expr {
-	if xmlMethods[strings.ToLower(method)] {
-		p.skipBalancedParens()
-		return &ast.RawExpr{Kind: "XML_METHOD", Text: p.textFrom(start), P: astPos(start.Pos)}
-	}
 	mc := &ast.MethodCall{Target: target, Method: method, P: astPos(start.Pos)}
 	mc.Args = p.parseCallArgs()
+	lower := strings.ToLower(method)
+	if !xmlMethods[lower] {
+		return mc
+	}
+	if lower == "modify" {
+		mc.XQueryErr = "XML DML (modify()) has no PostgreSQL counterpart"
+		return mc
+	}
+	if len(mc.Args) == 0 {
+		mc.XQueryErr = "missing XQuery argument"
+		return mc
+	}
+	lit, ok := mc.Args[0].(*ast.Literal)
+	if !ok || lit.Kind != "string" {
+		mc.XQueryErr = "the XQuery argument is not a string literal"
+		return mc
+	}
+	q, err := ParseXQuery(lit.Text)
+	if err != nil {
+		mc.XQueryErr = err.Error()
+	} else {
+		mc.XQuery = q
+	}
+	if lower == "value" && len(mc.Args) == 2 {
+		if tl, ok := mc.Args[1].(*ast.Literal); ok && tl.Kind == "string" {
+			mc.ValueType = parseTypeLiteral(tl.Text)
+		}
+	}
 	return mc
+}
+
+// parseTypeLiteral parses the SQL type named by the second argument of
+// xml.value() (`'nvarchar(30)'`, `'decimal(9, 4)'`): the literal's
+// content is T-SQL type syntax, lexed and parsed like a declaration's
+// type. nil when it is not exactly one data type.
+func parseTypeLiteral(src string) ast.DataType {
+	sp := newParser(src)
+	if len(sp.errs) > 0 {
+		return nil
+	}
+	dt := sp.parseDataType()
+	if dt == nil || len(sp.errs) > 0 || sp.cur.Kind != TOK_EOF {
+		return nil
+	}
+	return dt
 }
 
 // parseCallArgs parses `( [arg, …] )` with plain expression arguments.

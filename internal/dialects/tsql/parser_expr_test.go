@@ -159,13 +159,20 @@ func TestExpr_Functions(t *testing.T) {
 }
 
 func TestExpr_Methods(t *testing.T) {
-	x := as[*ast.RawExpr](t, mustExpr(t, "[ContactInfo].ref.value(N'(/a)[1]', 'nvarchar(50)')"))
-	if x.Kind != "XML_METHOD" || x.Text != "[ContactInfo].ref.value(N'(/a)[1]', 'nvarchar(50)')" {
+	x := as[*ast.MethodCall](t, mustExpr(t, "[ContactInfo].ref.value(N'(/a)[1]', 'nvarchar(50)')"))
+	if x.Method != "value" || identText(t, x.Target) != "ContactInfo.ref" || x.XQuery == nil || len(x.Args) != 2 {
 		t.Errorf("xml value(): %+v", x)
 	}
-	xv := as[*ast.RawExpr](t, mustExpr(t, "@data.value('(/E)[1]', 'sysname')"))
-	if xv.Kind != "XML_METHOD" {
+	if ct, ok := x.ValueType.(*ast.CharType); !ok || ct.Length != 50 {
+		t.Errorf("xml value() type: %#v", x.ValueType)
+	}
+	xv := as[*ast.MethodCall](t, mustExpr(t, "@data.value('(/E)[1]', 'sysname')"))
+	if xv.Method != "value" || xv.XQuery == nil || xv.ValueType == nil {
 		t.Errorf("xml method on a variable: %+v", xv)
+	}
+	bad := as[*ast.MethodCall](t, mustExpr(t, "x.query('for $i in /a return $i')"))
+	if bad.XQuery != nil || bad.XQueryErr == "" {
+		t.Errorf("unsupported XQuery must be reported: %+v", bad)
 	}
 	h := as[*ast.MethodCall](t, mustExpr(t, "e.[OrganizationNode].GetAncestor(1)"))
 	if h.Method != "GetAncestor" || len(h.Args) != 1 || identText(t, h.Target) != "e.OrganizationNode" {
