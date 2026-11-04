@@ -3,6 +3,7 @@ package translate
 import (
 	"os"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -201,4 +202,29 @@ func planView(res *Result, schema, name string) *PGView {
 		}
 	}
 	return nil
+}
+
+// TestTSQLNorthwind_TranslateClean translates the Northwind install
+// script (dialects/tsql/testdata, when the dumps are fetched) with every
+// SQL Server hook: the campaign target is a plan with info-level
+// warnings only. Its seven result-set procedures return their rows
+// through an INOUT refcursor, and "Ten Most Expensive Products" turns
+// its SET ROWCOUNT 10 into LIMIT 10.
+func TestTSQLNorthwind_TranslateClean(t *testing.T) {
+	src, err := os.ReadFile("../dialects/tsql/testdata/instnwnd.sql")
+	if err != nil {
+		t.Skip("Northwind script not present: " + err.Error())
+	}
+	res := tsqlRoutinesTranslate(t, string(src))
+	for _, w := range res.Warnings {
+		require.Equal(t, string(SeverityInfo), w.Severity, "%s on %s: %s", w.Kind, w.Object, w.Message)
+	}
+	cursors := 0
+	for _, r := range res.Plan.Routines {
+		if r.Kind == "procedure" && strings.Contains(r.Signature, `INOUT "_result" refcursor DEFAULT NULL`) {
+			cursors++
+		}
+	}
+	require.Equal(t, 7, cursors)
+	require.Contains(t, tsqlRoutineDDL(t, res, "procedure", "dbo", "ten most expensive products"), "LIMIT 10;")
 }

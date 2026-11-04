@@ -345,7 +345,13 @@ services:
       SQUISHY_API_TOKEN: ${SQUISHY_API_TOKEN:-}
       SQUISHY_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
       SQUISHY_MYSQL_DSN: sakila:sakila@tcp(mysql-sample:3306)/sakila?parseTime=true&multiStatements=true
-      # Opt-in SQL Server scenario (SQUISHY_E2E_SQLSERVER=1, see run_e2e.sh).
+      # Opt-in scenarios, passed through from the host (run_e2e.sh also
+      # forwards them with -e): SQUISHY_E2E_DB2=1 (db2 profile) and
+      # SQUISHY_E2E_SQLSERVER=1 (sqlserver profile, test/integration/
+      # sqlserver_e2e_test.go, which compares SQL Server and PG row counts
+      # through SQUISHY_SQLSERVER_DSN).
+      SQUISHY_E2E_DB2: ${SQUISHY_E2E_DB2:-0}
+      SQUISHY_E2E_SQLSERVER: ${SQUISHY_E2E_SQLSERVER:-0}
       SQUISHY_SQLSERVER_DSN: sqlserver://sa:Squishy_2026x@sqlserver-sample:1433?database=squishy_sample&encrypt=disable
       TARGET_PG_DSN: postgres://squishy:squishy@postgres:5432/squishy?sslmode=disable
     depends_on:
