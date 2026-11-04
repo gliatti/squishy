@@ -29,6 +29,7 @@ const (
 	KindOracle19 Kind = "oracle19"
 	KindDB2      Kind = "db2"    // DB2 LUW 11.5
 	KindDB2zOS   Kind = "db2zos" // DB2 for z/OS
+	KindSQLServer Kind = "sqlserver" // Microsoft SQL Server 2016-2022 (T-SQL)
 	KindPostgres Kind = "postgres"
 )
 
@@ -53,6 +54,13 @@ func IsMySQLFamily(k Kind) bool {
 // the type mapper via Kind equality.
 func IsDB2Family(k Kind) bool {
 	return k == KindDB2 || k == KindDB2zOS
+}
+
+// IsSQLServer reports whether k is the SQL Server (T-SQL) dialect. The
+// T-SQL path is modelled on the MySQL/MariaDB AST-only pipeline
+// (dialects/tsql parser -> ast -> translate/tsql_visitors.go -> dialects/postgres).
+func IsSQLServer(k Kind) bool {
+	return k == KindSQLServer
 }
 
 // Dialect is the integration contract for a supported SQL dialect.
