@@ -115,6 +115,16 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 	if !opts.SkipData {
 		for _, tbl := range source.Tables {
 			pgTbl := translatedTable(pg, tbl)
+			if tbl.Schema != "" && pgTbl == nil {
+				// A SQL Server table the translator did not create — the
+				// loser of a fold collision ([Orders] vs [orders] in a
+				// case-sensitive database, reported as the blocking
+				// name.fold_collision) or a table it skipped — has no PG
+				// table of its own: copying it would target another
+				// table (or none). No copy_table, hence no create_index,
+				// and no validate check (tableChecks skips it too).
+				continue
+			}
 			// A SQL Server snapshot carries its T-SQL schema (the pool is
 			// opened on the database): the source table is schema.table,
 			// and its rows go to the PG schema the translator mapped it
@@ -182,12 +192,20 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 				continue
 			}
 			target := tv.HistorySourceSchema + "." + tv.HistorySourceTable
-			id := addStep("copy_table", target, 100, map[string]any{
+			histPayload := map[string]any{
 				"schema":        tv.HistorySourceSchema,
 				"table":         tv.HistorySourceTable,
 				"target_schema": tv.HistorySchema,
 				"target_table":  tv.HistoryTable,
-			}, ddlID)
+			}
+			// The history table's explicit source column list: every
+			// column of the current table, rowversion / spatial ones
+			// included, which the copier's catalog default leaves out
+			// while the PG history table declares them.
+			if h := pgTableNamed(pg, tv.HistorySchema, tv.HistoryTable); h != nil && len(h.CopyColumns) > 0 {
+				histPayload["columns"] = append([]string{}, h.CopyColumns...)
+			}
+			id := addStep("copy_table", target, 100, histPayload, ddlID)
 			copyIDs[target] = id
 			copySchemas[target] = tv.HistorySchema
 		}
@@ -409,33 +427,38 @@ func assignLevels(steps []Step) {
 // inspector's snapshot, and two tables may differ only by case on a
 // case-sensitive source (lower_case_table_names=0). A SQL Server
 // snapshot (Schema set) is matched against the source schema and name
-// the translator recorded (PGTable.SourceSchema / SourceName),
-// case-insensitively like SQL Server's default collation, since the PG
-// names are folded and the schema mapped.
+// the translator recorded (PGTable.SourceSchema / SourceName), exactly:
+// the inspector synthesizes the DDL from the same sys.* names, and in a
+// case-sensitive database [Orders] and [orders] are two tables of which
+// only the one the translator created (the other is a reported fold
+// collision) has a PGTable — a case-insensitive fallback would map the
+// dropped one onto the survivor and copy both into one PG table.
 func translatedTable(pg *translate.Result, snap inspect.ObjectSnapshot) *translate.PGTable {
 	if pg == nil {
 		return nil
 	}
-	// An exact match first: in a case-sensitive SQL Server database
-	// [Orders] and [orders] are two tables, and only the one the
-	// translator created (the other is a reported fold collision) is
-	// its PGTable.
-	if snap.Schema != "" {
-		for i := range pg.Plan.Tables {
-			if t := &pg.Plan.Tables[i]; t.SourceName == snap.Name && t.SourceSchema == snap.Schema {
-				return t
-			}
-		}
-	}
 	for i := range pg.Plan.Tables {
 		t := &pg.Plan.Tables[i]
 		if snap.Schema != "" {
-			if t.SourceName != "" && strings.EqualFold(t.SourceName, snap.Name) && strings.EqualFold(t.SourceSchema, snap.Schema) {
+			if t.SourceName == snap.Name && t.SourceSchema == snap.Schema {
 				return t
 			}
 			continue
 		}
 		if t.Name == snap.Name {
+			return t
+		}
+	}
+	return nil
+}
+
+// pgTableNamed returns the PG table schema.name of the plan, or nil.
+func pgTableNamed(pg *translate.Result, schema, name string) *translate.PGTable {
+	if pg == nil {
+		return nil
+	}
+	for i := range pg.Plan.Tables {
+		if t := &pg.Plan.Tables[i]; t.Schema == schema && t.Name == name {
 			return t
 		}
 	}

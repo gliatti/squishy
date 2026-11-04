@@ -164,6 +164,38 @@ type copyBatchPayload struct {
 	SourceVariant string   `json:"source_variant"`
 	RowEndCol     string   `json:"row_end_col"`
 	Columns       []string `json:"columns,omitempty"`
+
+	// Per-table source metadata resolved once at partition time
+	// (withPlanMeta), so a batch makes no catalog round trip for it.
+	// CopyMetaResolved false — a job enqueued before these fields
+	// existed — makes the copier look them up as before.
+	CopyMetaResolved bool              `json:"copy_meta_resolved,omitempty"`
+	OrderKey         []string          `json:"order_key,omitempty"`
+	SourceTypes      map[string]string `json:"source_types,omitempty"`
+}
+
+// withPlanMeta carries the partition plan's per-table source metadata
+// (keyed OFFSET order key, server-side column conversions) into the
+// batch payload.
+func (b copyBatchPayload) withPlanMeta(plan *dataxfer.PartitionPlan) copyBatchPayload {
+	b.CopyMetaResolved = true
+	b.OrderKey = plan.OrderKey
+	b.SourceTypes = plan.SourceTypes
+	return b
+}
+
+// copyOpts maps the payload onto the copier's options (connections left
+// to the caller).
+func (b copyBatchPayload) copyOpts() dataxfer.CopyOpts {
+	return dataxfer.CopyOpts{
+		SrcSchema: b.SrcSchema, SrcTable: b.SrcTable,
+		DstSchema: b.DstSchema, DstTable: b.DstTable,
+		RangeKind: b.RangeKind, Low: b.Low, High: b.High,
+		Columns:      b.Columns,
+		MetaResolved: b.CopyMetaResolved,
+		OrderKey:     b.OrderKey,
+		SourceTypes:  b.SourceTypes,
+	}
 }
 
 // newCopyBatchPayload builds the copy_batch payload of one range of a
@@ -235,7 +267,7 @@ func (d *Deps) hCopyTable(ctx context.Context, j *queue.Job) error {
 			batchID, j.StepID, r.Seq, pkCols, low, high, plan.RangeKind, r.RowCount); err != nil {
 			return err
 		}
-		payload, _ := json.Marshal(newCopyBatchPayload(p, dstTable, plan.RangeKind, r))
+		payload, _ := json.Marshal(newCopyBatchPayload(p, dstTable, plan.RangeKind, r).withPlanMeta(plan))
 		if _, err := q.Enqueue(ctx, tx, queue.Job{
 			RunID: j.RunID, StepID: j.StepID, BatchID: &batchID,
 			Kind: "copy_batch", Payload: payload, Priority: 100,
@@ -267,13 +299,9 @@ func (d *Deps) hCopyBatch(ctx context.Context, j *queue.Job) error {
 			p.High[k] = int64(f)
 		}
 	}
-	n, err := dataxfer.CopyBatch(ctx, dataxfer.CopyOpts{
-		SourceDB: d.SourceDB, SourceDialect: dial, TargetPool: d.TargetPool,
-		SrcSchema: p.SrcSchema, SrcTable: p.SrcTable,
-		DstSchema: p.DstSchema, DstTable: p.DstTable,
-		RangeKind: p.RangeKind, Low: p.Low, High: p.High,
-		Columns: p.Columns,
-	})
+	opts := p.copyOpts()
+	opts.SourceDB, opts.SourceDialect, opts.TargetPool = d.SourceDB, dial, d.TargetPool
+	n, err := dataxfer.CopyBatch(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -745,41 +773,12 @@ func (d *Deps) copySourceDialect(variant, rowEndCol string) (dataxfer.SourceDial
 	return nil, fmt.Errorf("unknown copy source variant %q", variant)
 }
 
-// pgNormalizeIdent mirrors translate.normalizeOracleIdent: all-caps Oracle
-// identifiers get lowercased so they match the PG side emitted unquoted,
-// while mixed-case ("t_Case_sensitive") round-trips verbatim. Applied to
-// destination table + column names before COPY FROM.
-//
-// SQL Server identifiers are folded whole to lowercase (default CI
-// collation: `[SalesOrderHeader]` and `salesorderheader` name the same
-// table) through dataxfer.FoldSQLServerIdent, the one fold the copier
-// uses too, so the worker and the copier cannot drift apart.
+// pgNormalizeIdent maps a source table name onto the PG table the
+// translator created: dataxfer.NormalizeDstIdent, the one fold the
+// copier applies to the same names (Oracle all-caps lowercased and `#`
+// → `_` like translate.normalizeOracleIdent, SQL Server folded whole
+// through FoldSQLServerIdent, other kinds untouched), so the worker and
+// the copier cannot drift apart.
 func pgNormalizeIdent(kind, s string) string {
-	if kind == "sqlserver" {
-		return dataxfer.FoldSQLServerIdent(s)
-	}
-	if kind != "oracle" || s == "" {
-		return s
-	}
-	hasLower := false
-	hasUpper := false
-	for _, r := range s {
-		if r >= 'a' && r <= 'z' {
-			hasLower = true
-		}
-		if r >= 'A' && r <= 'Z' {
-			hasUpper = true
-		}
-	}
-	if hasUpper && !hasLower {
-		out := make([]byte, 0, len(s))
-		for _, r := range s {
-			if r >= 'A' && r <= 'Z' {
-				r += 'a' - 'A'
-			}
-			out = append(out, byte(r))
-		}
-		return string(out)
-	}
-	return s
+	return dataxfer.NormalizeDstIdent(kind, s)
 }

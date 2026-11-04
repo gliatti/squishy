@@ -21,6 +21,18 @@ type PartitionPlan struct {
 	TotalRows int64
 	BatchSize int
 	Ranges    []Range // len(Ranges) == number of batches
+
+	// Per-table source metadata every batch shares, resolved here once
+	// so the batches need no catalog round trip (CopyOpts.MetaResolved).
+	//
+	// OrderKey orders the keyed OFFSET batches (keyedOffsetDialect,
+	// RangeKind "offset"): the primary key, else a unique index key;
+	// empty otherwise.
+	OrderKey []string
+	// SourceTypes maps each column a selectExprDialect converts
+	// server-side to its source data type (selectExprDialect.ColumnTypes);
+	// nil for the other dialects.
+	SourceTypes map[string]string
 }
 
 type Range struct {
@@ -53,6 +65,14 @@ func BuildPartitionPlan(ctx context.Context, db *sql.DB, d SourceDialect, schema
 	}
 	pp.PK = pk
 
+	if sd, ok := d.(selectExprDialect); ok {
+		types, err := sd.ColumnTypes(ctx, db, schema, table)
+		if err != nil {
+			return nil, err
+		}
+		pp.SourceTypes = types
+	}
+
 	if pp.TotalRows == 0 {
 		pp.RangeKind = "pk"
 		return pp, nil
@@ -73,7 +93,11 @@ func BuildPartitionPlan(ctx context.Context, db *sql.DB, d SourceDialect, schema
 
 	// fallback: OFFSET/LIMIT
 	pp.RangeKind = "offset"
-	if _, keyed := d.(keyedOffsetDialect); keyed && len(pp.PK) == 0 {
+	_, keyed := d.(keyedOffsetDialect)
+	if keyed {
+		pp.OrderKey = pp.PK
+	}
+	if keyed && len(pp.PK) == 0 {
 		// SQL Server pages OFFSET batches in key order. A heap with
 		// neither primary key nor unique index has no order two batch
 		// SELECTs agree on (a parallel plan or a shared scan may return
@@ -84,6 +108,7 @@ func BuildPartitionPlan(ctx context.Context, db *sql.DB, d SourceDialect, schema
 		if err != nil {
 			return nil, fmt.Errorf("order key: %w", err)
 		}
+		pp.OrderKey = key
 		if len(key) == 0 {
 			pp.Ranges = []Range{{
 				Seq:      0,

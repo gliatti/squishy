@@ -3,7 +3,6 @@ package translate
 import (
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"gitlab.com/dalibo/squishy/internal/dialects"
 	pgast "gitlab.com/dalibo/squishy/internal/dialects/postgres"
@@ -52,9 +51,6 @@ import (
 // column first under #variable_conflict use_column).
 const tsqlLocalsLabel = "_tsql"
 
-// tsqlMaxIdent is PostgreSQL's identifier length limit (NAMEDATALEN-1).
-const tsqlMaxIdent = 63
-
 // tsqlSelectIntoLabel is the label the visitors' residual pass gives a
 // SELECT … INTO new_table. The routine translator turns SELECT … INTO
 // #temp into CREATE TEMP TABLE … AS itself, so it drops that label when
@@ -93,6 +89,10 @@ type tsqlTableVar struct {
 // opened with `OPEN c FOR <query>` where T-SQL opens it (T-SQL evaluates
 // the variables of the cursor query at OPEN too).
 type tsqlCursor struct {
+	// key is the folded T-SQL name (normalizeTSQLIdent), the key of
+	// tsqlBody.cursors and tsqlBody.scrollUse; name is the PG local,
+	// which differs when another variable already took the folded name.
+	key    string
 	name   string
 	decl   *ast.DeclareCursor
 	scroll bool
@@ -114,16 +114,16 @@ type tsqlBody struct {
 	tempNames  map[string]bool // PG names of the table-variable temp tables
 	cursors    map[string]*tsqlCursor
 	cursorList []*tsqlCursor
-	scrollUse  map[string]bool // cursors fetched in another direction than NEXT
+	scrollUse  map[string]bool // folded T-SQL names of the cursors fetched in another direction than NEXT
 	savepoints map[string]bool
 
-	resultSets  int      // result-set SELECTs opened on ctx.ResultCursors so far
+	resultSets int // result-set SELECTs opened on ctx.ResultCursors so far
 	// rowcountDone lists the SET ROWCOUNT statements applySetRowcount
 	// translated; rowcountWhy says why the others are not.
 	rowcountDone map[*ast.SetRowcountStmt]bool
 	rowcountWhy  string
-	rowcount    *tsqlVar // _rowcount, when @@ROWCOUNT is read after DML
-	fetchStatus *tsqlVar // _fetch_status, when @@FETCH_STATUS is read
+	rowcount     *tsqlVar // _rowcount, when @@ROWCOUNT is read after DML
+	fetchStatus  *tsqlVar // _fetch_status, when @@FETCH_STATUS is read
 	// updated maps a column tested by UPDATE(col) in a statement-level
 	// UPDATE trigger to its _updated_<col> local (see updatedMark).
 	updated map[string]*tsqlVar
@@ -360,7 +360,7 @@ func (b *tsqlBody) collect(stmts []ast.PLStmt) {
 		}
 	})
 	for _, c := range b.cursorList {
-		if b.scrollUse[c.name] {
+		if b.scrollUse[c.key] {
 			c.scroll = true
 		}
 	}
@@ -420,7 +420,7 @@ func (b *tsqlBody) declareCursor(dc *ast.DeclareCursor) {
 	if b.cursors[key] != nil {
 		return
 	}
-	c := &tsqlCursor{name: b.localName(key), decl: dc}
+	c := &tsqlCursor{key: key, name: b.localName(key), decl: dc}
 	for _, o := range dc.Options {
 		switch o {
 		case "SCROLL":
@@ -472,17 +472,9 @@ func (b *tsqlBody) tempTableName(src string) string {
 }
 
 // tsqlTruncIdent cuts an identifier to PostgreSQL's 63 bytes, on a rune
-// boundary.
-func tsqlTruncIdent(s string) string {
-	if len(s) <= tsqlMaxIdent {
-		return s
-	}
-	cut := tsqlMaxIdent
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
-}
+// boundary — the package's single cut (clipUTF8 / pgMaxIdentLen), the
+// one normalizeTSQLIdent applies.
+func tsqlTruncIdent(s string) string { return clipUTF8(s, pgMaxIdentLen) }
 
 // tsqlTempName is the PG name of a #temp / ##global temp table name.
 func tsqlTempName(name string) (string, bool) {

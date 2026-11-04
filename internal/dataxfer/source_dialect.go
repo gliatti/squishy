@@ -45,8 +45,8 @@ type mysqlDialect struct{}
 
 func MySQLSource() SourceDialect { return mysqlDialect{} }
 
-func (mysqlDialect) Kind() string            { return "mysql" }
-func (mysqlDialect) Quote(id string) string  { return "`" + strings.ReplaceAll(id, "`", "``") + "`" }
+func (mysqlDialect) Kind() string               { return "mysql" }
+func (mysqlDialect) Quote(id string) string     { return "`" + strings.ReplaceAll(id, "`", "``") + "`" }
 func (mysqlDialect) PlaceholderAt(n int) string { return "?" }
 func (d mysqlDialect) Qualify(schema, name string) string {
 	if schema == "" {
@@ -207,6 +207,10 @@ func (d oracleDialect) SelectRangeQuery(schema, table string, cols []string, ran
 		joinQuoted(d, cols), d.Qualify(schema, table),
 		d.Quote(rangeCol), d.PlaceholderAt(1), d.PlaceholderAt(2), d.Quote(rangeCol))
 }
+
+// OffsetArgsFirst: OFFSET :1 ROWS FETCH NEXT :2 ROWS binds (offset, limit).
+func (oracleDialect) OffsetArgsFirst() bool { return true }
+
 func (d oracleDialect) SelectOffsetQuery(schema, table string, cols []string) string {
 	// Oracle 12c+ ISO-syntax. Arg order: 1=offset, 2=limit — so the caller
 	// must pass (low["offset"], high["limit"]) in that order.
@@ -303,6 +307,12 @@ func (d db2Dialect) SelectOffsetQuery(schema, table string, cols []string) strin
 		joinQuoted(d, cols), d.Qualify(schema, table),
 		d.PlaceholderAt(1), d.PlaceholderAt(2))
 }
+
+// OffsetArgsFirst: the ISO OFFSET ? ROWS FETCH NEXT ? ROWS form above
+// binds (offset, limit). Before this method the copier bound DB2 like
+// MySQL, (limit, offset), so the first OFFSET batch of a DB2 table
+// without a single numeric PK read `OFFSET 10000 ROWS FETCH NEXT 0 ROWS`.
+func (db2Dialect) OffsetArgsFirst() bool { return true }
 
 // ---- Catalog queries — branches LUW (SYSCAT.*) vs z/OS (SYSIBM.*) ----
 
@@ -431,12 +441,23 @@ func sqlserverSelectExpr(quoted, dataType, targetUDT string) string {
 
 // ForColumns returns the dialect to SELECT cols of schema.table with: the
 // columns needing a server-side conversion (sqlserverSelectExpr) are
-// looked up once per batch in INFORMATION_SCHEMA.COLUMNS (DATA_TYPE is
-// the base type, so alias types convert like their base).
+// looked up in INFORMATION_SCHEMA.COLUMNS (ColumnTypes). The copier only
+// calls it for a batch whose payload lacks the types resolved at
+// partition time (PartitionPlan.SourceTypes → CopyOpts.SourceTypes).
 func (d sqlserverDialect) ForColumns(ctx context.Context, db *sql.DB, schema, table string, cols, targetTypes []string) (SourceDialect, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
-		 WHERE TABLE_SCHEMA = @p1 AND TABLE_NAME = @p2`, schema, table)
+	types, err := d.ColumnTypes(ctx, db, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	return d.withTypes(cols, types, targetTypes), nil
+}
+
+// ColumnTypes reads the DATA_TYPE of the table's columns that
+// sqlserverSelectExpr converts (DATA_TYPE is the base type, so alias
+// types convert like their base). The other columns are left out, which
+// keeps the map small enough to ride in every copy_batch payload.
+func (d sqlserverDialect) ColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map[string]string, error) {
+	rows, err := db.QueryContext(ctx, sqlserverColumnTypesQuery, schema, table)
 	if err != nil {
 		return nil, fmt.Errorf("column types: %w", err)
 	}
@@ -447,12 +468,27 @@ func (d sqlserverDialect) ForColumns(ctx context.Context, db *sql.DB, schema, ta
 		if err := rows.Scan(&n, &dt); err != nil {
 			return nil, err
 		}
-		types[n] = dt
+		// A type converted for one target is converted for every target
+		// (geography / geometry only pick their form from it), so the
+		// empty target is enough to tell.
+		if sqlserverSelectExpr(d.Quote(n), dt, "") != "" {
+			types[n] = dt
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return d.withTypes(cols, types, targetTypes), nil
+	return types, nil
+}
+
+// sqlserverColumnTypesQuery lists the columns of @p1.@p2 with their type.
+const sqlserverColumnTypesQuery = `
+		SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+		 WHERE TABLE_SCHEMA = @p1 AND TABLE_NAME = @p2`
+
+// WithColumnTypes is ForColumns with types already read by ColumnTypes.
+func (d sqlserverDialect) WithColumnTypes(cols []string, types map[string]string, targetTypes []string) SourceDialect {
+	return d.withTypes(cols, types, targetTypes)
 }
 
 // withTypes is ForColumns without the catalog lookup.
@@ -507,6 +543,9 @@ func (d sqlserverDialect) SelectRangeQuery(schema, table string, cols []string, 
 // therefore prefers SelectOffsetOrderedQuery (ORDER BY the primary key)
 // whenever the table has one; this form only serves heaps without a
 // primary key. Arg order: 1=offset, 2=limit (like Oracle).
+// OffsetArgsFirst: OFFSET @p1 ROWS FETCH NEXT @p2 ROWS binds (offset, limit).
+func (sqlserverDialect) OffsetArgsFirst() bool { return true }
+
 func (d sqlserverDialect) SelectOffsetQuery(schema, table string, cols []string) string {
 	return fmt.Sprintf("SELECT %s FROM %s ORDER BY (SELECT NULL) OFFSET %s ROWS FETCH NEXT %s ROWS ONLY",
 		d.selectList(cols), d.Qualify(schema, table),

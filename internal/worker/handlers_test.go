@@ -91,10 +91,13 @@ func TestPgNormalizeIdentSQLServer(t *testing.T) {
 		{"sqlserver", "", ""},
 		{"oracle", "CUSTOMERS", "customers"},
 		{"oracle", "t_Case", "t_Case"},
+		{"oracle", "EMP#HIST", "emp_hist"},
 		{"mysql", "Customers", "Customers"},
+		{"mysql", "a#b", "a#b"},
 	}
 	for _, c := range cases {
 		require.Equal(t, c.want, pgNormalizeIdent(c.kind, c.in), c.kind+"/"+c.in)
+		require.Equal(t, dataxfer.NormalizeDstIdent(c.kind, c.in), pgNormalizeIdent(c.kind, c.in))
 		if c.kind == "sqlserver" {
 			require.Equal(t, dataxfer.FoldSQLServerIdent(c.in), pgNormalizeIdent(c.kind, c.in))
 		}

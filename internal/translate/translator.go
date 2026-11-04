@@ -3696,7 +3696,7 @@ func (t *translator) translateAlterTrigger(s *ast.AlterTrigger) {
 	} else {
 		// No matching routine in this dump — the CREATE TRIGGER lives
 		// elsewhere or is created at runtime (e.g. by an application
-		// procedure like REFRESH_AUDIT). Wrap in a runtime DO block that
+		// maintenance procedure). Wrap in a runtime DO block that
 		// no-ops if the trigger doesn't exist, so we don't sink the
 		// migration with `relation does not exist` when the static
 		// ALTER tries to run before the trigger is created. Lands in
@@ -6958,9 +6958,9 @@ func (t *translator) translateTSQLTable(s *ast.CreateTable) {
 			// (a case-sensitive _CS_ / _BIN2 database) or only past the
 			// 63 bytes PG keeps. Migrating one silently would drop the
 			// other, and both copies would target the same PG table.
-			t.warnSev("table."+schema+"."+name, tsqlWarnFoldCollision,
+			t.tsqlFoldCollision("table."+schema+"."+name,
 				"source tables "+first.SourceSchema+"."+first.SourceName+" and "+srcSchema+"."+s.Name+" both become the PostgreSQL table "+schema+"."+name+
-					" (identifiers are folded to lower case and cut to 63 bytes): only the first is created. Rename one of them on the source (or migrate it separately) before the migration", SeverityBlocking)
+					" (identifiers are folded to lower case and cut to 63 bytes): only the first is created. Rename one of them on the source (or migrate it separately) before the migration")
 			return
 		}
 		t.warnSev("table."+schema+"."+name, "table.duplicate",
@@ -6973,7 +6973,7 @@ func (t *translator) translateTSQLTable(s *ast.CreateTable) {
 	classes := map[string]tsqlClass{}
 
 	// Pass 1: column shapes (types, nullability, identity).
-	s = t.tsqlDropFoldedColumnDups(s, schema, name, srcSchema)
+	s = t.tsqlDropFoldedColumnDups(idx, s, schema, name, srcSchema)
 	for _, c := range s.Columns {
 		col := t.tsqlColumnShape(idx, &tbl, c)
 		srcCols[col.Name] = c.Name
@@ -7469,6 +7469,33 @@ func (t *translator) computeTSQLCopyColumns() {
 			cols = append(cols, name)
 		}
 		tbl.CopyColumns = cols
+	}
+	// The history table emitTSQLTemporal appended for an emulated
+	// system-versioned table copies every column of the current table
+	// by its source name: the source history table stores them all as
+	// plain columns (computed ones included), and the copier's catalog
+	// default would leave rowversion / spatial columns out while the PG
+	// history table declares them.
+	for i := range t.res.Plan.Tables {
+		cur := &t.res.Plan.Tables[i]
+		tv := cur.TSQLTemporal
+		if tv == nil || !tv.CopyHistory {
+			continue
+		}
+		hi, ok := t.tsql.tables[t.tableKey(tv.HistorySchema, tv.HistoryTable)]
+		if !ok {
+			continue
+		}
+		src := t.tsql.srcCols[i]
+		cols := make([]string, 0, len(cur.Columns))
+		for _, c := range cur.Columns {
+			name := c.Name
+			if s, ok := src[c.Name]; ok {
+				name = s
+			}
+			cols = append(cols, name)
+		}
+		t.res.Plan.Tables[hi].CopyColumns = cols
 	}
 }
 
@@ -8419,8 +8446,11 @@ func (t *translator) translateTSQLProcedure(s *ast.CreateProcedure) {
 		SourceSchema: srcSchema, SourceName: s.Name, Schema: schema, Name: name, Body: s.Body,
 	}
 	rctx.Params = t.tsqlRoutineParams(s.Params, true, rctx.Expr())
-	if t.tsqlBodyReturnsResultSet(s.Body) {
-		if n, ok := t.tsqlResultSetCount(s.Body); ok && n > 0 {
+	// One parse of the body: tsqlResultSetCount counts the result-set
+	// SELECTs over the same containers tsqlBodyReturnsResultSet walks,
+	// so n > 0 is exactly "the body returns a result set".
+	if n, ok := t.tsqlResultSetCount(s.Body); n > 0 {
+		if ok {
 			rctx.ResultCursors = tsqlResultCursorNames(n, rctx.Params)
 			msg := "procedure " + schema + "." + name + " returns its result set(s) through INOUT refcursor parameter(s) " + strings.Join(rctx.ResultCursors, ", ") + " (DEFAULT NULL), one per result-set SELECT in source order: the body opens the cursor FOR the SELECT. A PostgreSQL procedure cannot stream rows to its caller as EXEC does: callers CALL it and FETCH ALL FROM the returned cursor name, in the same transaction (the cursor closes at commit)"
 			t.res.Explanations = append(t.res.Explanations, Explanation{
@@ -9301,16 +9331,19 @@ func (t *translator) tsqlConstraintTarget(idx int, name string) (string, string)
 // bytes — each reported as a blocking collision: PG cannot hold both
 // under one name, and keeping the second would make CREATE TABLE fail.
 // The passes over s.Columns index tbl.Columns in step, so the duplicates
-// are dropped before them.
-func (t *translator) tsqlDropFoldedColumnDups(s *ast.CreateTable, schema, name, srcSchema string) *ast.CreateTable {
+// are dropped before them. The table at Plan.Tables index idx then needs
+// an explicit copy list (computeTSQLCopyColumns): the copier's catalog
+// default would still select both source columns, which fold to the
+// same PG column.
+func (t *translator) tsqlDropFoldedColumnDups(idx int, s *ast.CreateTable, schema, name, srcSchema string) *ast.CreateTable {
 	seen := map[string]string{}
 	var keep []*ast.ColumnDef
 	for _, c := range s.Columns {
 		f := normalizeTSQLIdent(c.Name)
 		if prev, dup := seen[f]; dup {
-			t.warnSev("table."+schema+"."+name+"."+f, tsqlWarnFoldCollision,
+			t.tsqlFoldCollision("table."+schema+"."+name+"."+f,
 				"columns "+prev+" and "+c.Name+" of "+srcSchema+"."+s.Name+" both become the PostgreSQL column "+f+
-					" (identifiers are folded to lower case and cut to 63 bytes): only the first is created and copied. Rename one of them on the source before the migration", SeverityBlocking)
+					" (identifiers are folded to lower case and cut to 63 bytes): only the first is created and copied. Rename one of them on the source before the migration")
 			continue
 		}
 		seen[f] = c.Name
@@ -9319,7 +9352,37 @@ func (t *translator) tsqlDropFoldedColumnDups(s *ast.CreateTable, schema, name, 
 	if len(keep) == len(s.Columns) {
 		return s
 	}
+	t.tsql.explicitCopy[idx] = true
 	cp := *s
 	cp.Columns = keep
 	return &cp
+}
+
+// tsqlFoldCollisionTitle is the title of the blocking prerequisite
+// gathering the name.fold_collision warnings.
+const tsqlFoldCollisionTitle = "Rename SQL Server objects whose names fold to one PostgreSQL name"
+
+// tsqlFoldCollision reports two source objects (tables, columns of one
+// table) folding to one PG name: a blocking name.fold_collision warning
+// and its blocking prerequisite (one for every collision, the objects
+// accumulating on it), so the run is gated until it is acknowledged —
+// only the first object is migrated.
+func (t *translator) tsqlFoldCollision(object, msg string) {
+	t.warnSev(object, tsqlWarnFoldCollision, msg, SeverityBlocking)
+	for i := range t.res.Prerequisites {
+		if p := &t.res.Prerequisites[i]; p.Title == tsqlFoldCollisionTitle {
+			p.Object += ", " + object
+			p.Description += "\n  • " + msg
+			return
+		}
+	}
+	t.res.Prerequisites = append(t.res.Prerequisites, Prerequisite{
+		Severity: SeverityBlocking,
+		Category: CatManualReview,
+		Object:   object,
+		Title:    tsqlFoldCollisionTitle,
+		Description: "PostgreSQL folds the SQL Server identifiers to lower case and keeps 63 bytes of them; in a case-sensitive (_CS_ / _BIN2) database, or past 63 bytes, two source names become one:\n\n  • " + msg +
+			"\n\nOnly the first object of each pair is created and copied; the other one is not migrated.",
+		Remediation: "Rename one object of each pair on the source (sp_rename) and re-plan, or migrate the other one separately. Acknowledge this prerequisite to migrate without it.",
+	})
 }

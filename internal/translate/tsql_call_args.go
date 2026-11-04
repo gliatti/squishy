@@ -69,15 +69,16 @@ func (t *translator) tsqlProcParams(srcSchema, name, callerSchema string) []tsql
 			inout: p.Output || strings.EqualFold(p.Direction, "INOUT") || strings.EqualFold(p.Direction, "OUT"),
 		})
 	}
-	if t.tsqlBodyReturnsResultSet(def.Body) {
-		if n, ok := t.tsqlResultSetCount(def.Body); ok && n > 0 {
-			params := make([]RoutineParam, len(out))
-			for i, p := range out {
-				params[i] = RoutineParam{Name: p.name}
-			}
-			for _, c := range tsqlResultCursorNames(n, params) {
-				out = append(out, tsqlCalleeParam{name: c, inout: true, pgType: "refcursor"})
-			}
+	// One parse of the callee body: a result-set count above zero is
+	// exactly "the procedure returns a result set" (see
+	// translateTSQLProcedure), so tsqlBodyReturnsResultSet is not called.
+	if n, ok := t.tsqlResultSetCount(def.Body); ok && n > 0 {
+		params := make([]RoutineParam, len(out))
+		for i, p := range out {
+			params[i] = RoutineParam{Name: p.name}
+		}
+		for _, c := range tsqlResultCursorNames(n, params) {
+			out = append(out, tsqlCalleeParam{name: c, inout: true, pgType: "refcursor"})
 		}
 	}
 	return out
