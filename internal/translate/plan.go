@@ -43,6 +43,11 @@ type PGTable struct {
 	// HistoryTable, and the translator's post-copy actions install the
 	// versioning triggers. See mariadb_temporal.go.
 	SystemVersioning *PGSystemVersioning `json:"system_versioning,omitempty"`
+	// TSQLTemporal is set on a SQL Server system-versioned table whose
+	// versioning is emulated: the planner copies the source history
+	// table into HistoryTable, and the post-copy actions install the
+	// versioning triggers. See tsql_temporal.go.
+	TSQLTemporal *PGTSQLTemporal `json:"tsql_temporal,omitempty"`
 	// CopiedGenerated lists the source generated columns whose generation
 	// squishy refuses to translate (MySQL/MariaDB text conversion, source
 	// DDL with parse errors — see mysql_generated.go). They are created
@@ -70,6 +75,25 @@ type PGTable struct {
 	// PKName is the primary key constraint name to emit (`CONSTRAINT
 	// name PRIMARY KEY`); empty lets PG name it <table>_pkey.
 	PKName string `json:"pk_name,omitempty"`
+}
+
+// PGTSQLTemporal describes the emulation of one SQL Server
+// system-versioned table (tsql_temporal.go).
+type PGTSQLTemporal struct {
+	RowStart string `json:"row_start"` // PG ROW START column
+	RowEnd   string `json:"row_end"`   // PG ROW END column
+	// RowEndMax is the ROW END of current rows as PG holds it
+	// (datetime2's maximum truncated to the column's digits).
+	RowEndMax string `json:"row_end_max"`
+	// HistorySchema / HistoryTable name the PG history table;
+	// HistorySourceSchema / HistorySourceTable the source one the
+	// planner copies from (CopyHistory; false when the script creates
+	// the history table as a table of its own).
+	HistorySchema       string `json:"history_schema"`
+	HistoryTable        string `json:"history_table"`
+	HistorySourceSchema string `json:"history_source_schema"`
+	HistorySourceTable  string `json:"history_source_table"`
+	CopyHistory         bool   `json:"copy_history"`
 }
 
 // PGSystemVersioning describes the emulation of one MariaDB

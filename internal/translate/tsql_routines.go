@@ -119,6 +119,9 @@ type tsqlBody struct {
 
 	rowcount    *tsqlVar // _rowcount, when @@ROWCOUNT is read after DML
 	fetchStatus *tsqlVar // _fetch_status, when @@FETCH_STATUS is read
+	// updated maps a column tested by UPDATE(col) in a statement-level
+	// UPDATE trigger to its _updated_<col> local (see updatedMark).
+	updated map[string]*tsqlVar
 
 	// permanentInto is set when a SELECT … INTO targets a permanent
 	// table (the visitors' label then stands).
@@ -147,6 +150,9 @@ func translateTSQLRoutineBody(ctx *RoutineCtx) (string, []string, []string) {
 		}
 		return pgast.WritePLpgSQL(blk), b.warnings, b.notes
 	}
+	// Constant dynamic SQL is source text like the body: inlined before
+	// the rewrites (tsql_dynamic.go).
+	stmts = b.inlineConstantDynamicSQL(stmts)
 	stmts, labels := b.dialectPass(stmts)
 	b.collect(stmts)
 	text := b.render(stmts)
@@ -704,7 +710,10 @@ func (b *tsqlBody) builtin(x *ast.FuncCall) ast.Node {
 	return x
 }
 
-// columnUpdated approximates UPDATE(col) in a trigger handling UPDATE.
+// columnUpdated translates UPDATE(col) in a trigger handling UPDATE. In
+// a statement-level trigger it is exact (updatedMark). Otherwise — a
+// row-level (INSTEAD OF) trigger, which PG refuses a column list for,
+// or UPDATE(<expression>) — it is approximated:
 // T-SQL answers whether the UPDATE's SET list names the column; a PG
 // trigger cannot know it, so the test becomes "the column's values
 // changed": the new values of the transition table are not the old ones
@@ -713,6 +722,9 @@ func (b *tsqlBody) builtin(x *ast.FuncCall) ast.Node {
 // would make `IF NOT UPDATE(col)` dead code. A SET col = <same value>
 // still differs, hence the warning.
 func (b *tsqlBody) columnUpdated(col ast.Expr, p ast.Position) ast.Expr {
+	if id, ok := col.(*ast.Ident); ok && len(id.Parts) == 1 && b.ctx.Trigger.ForEach == "STATEMENT" && tsqlUpdateMarkOrdered(b.ctx.Name) {
+		return b.updatedMark(id.Parts[0], p)
+	}
 	b.warn("UPDATE(column) is not available in PostgreSQL triggers (they do not know which columns the UPDATE statement set): it is approximated by \"the column's values changed\", which differs when the UPDATE sets a column to its current value; split the trigger with UPDATE OF col where that matters")
 	id, ok := col.(*ast.Ident)
 	if !ok || len(id.Parts) != 1 {
@@ -748,6 +760,49 @@ func (b *tsqlBody) columnUpdated(col ast.Expr, p ast.Position) ast.Expr {
 	q := side("inserted")
 	q.SetOps = []ast.SetOp{{Op: "EXCEPT ALL", Stmt: side("deleted")}}
 	return &ast.ExistsExpr{Subquery: q, P: p}
+}
+
+// updatedMark translates UPDATE(col) in a statement-level UPDATE
+// trigger exactly: the column is recorded on the trigger
+// (TriggerInfo.UpdatedColumns), for which the translator adds a helper
+// `AFTER UPDATE OF col` trigger marking the statement
+// (tsql.mark_column_updated, see tsql_shim/60_column_updated.sql), and
+// UPDATE(col) reads a boolean local initialised from that mark when the
+// body starts — before any early RETURN, so the mark never outlives the
+// statement. PG fires an UPDATE OF col trigger exactly when the SET list
+// names col, T-SQL's rule for UPDATE(col).
+func (b *tsqlBody) updatedMark(col string, p ast.Position) ast.Expr {
+	if v := b.updated[col]; v != nil {
+		return v.ref(p)
+	}
+	if b.updated == nil {
+		b.updated = map[string]*tsqlVar{}
+	}
+	init := pgast.WriteExpr(&ast.FuncCall{Name: "tsql.take_column_updated", Args: []ast.Expr{
+		&ast.Ident{Parts: []string{"TG_RELID"}},
+		&ast.Literal{Kind: "string", Text: col},
+	}})
+	v := b.addLocal("_updated_"+col, "boolean", init)
+	b.updated[col] = v
+	b.ctx.Trigger.UpdatedColumns = append(b.ctx.Trigger.UpdatedColumns, col)
+	if b.ctx.Run != nil {
+		b.ctx.Run.Use("tsql.take_column_updated")
+	}
+	return v.ref(p)
+}
+
+// tsqlUpdateMarkOrdered reports whether the helper triggers of
+// updatedMark, named "0_<trigger>…" (tsqlUpdateMarkTrigger), sort before
+// the translated trigger itself: PG fires them in name order, and the
+// mark must be set before the body reads it.
+func tsqlUpdateMarkOrdered(trigger string) bool {
+	return trigger != "" && trigger[0] > '0'
+}
+
+// tsqlUpdateMarkTrigger names the helper trigger marking the i-th
+// (0-based) column a trigger tests with UPDATE(col).
+func tsqlUpdateMarkTrigger(trigger string, i int) string {
+	return pgIdentWithSuffix("0_"+trigger, "_upd_"+strconv.Itoa(i+1))
 }
 
 // errorFunc translates ERROR_MESSAGE() & co. Inside a CATCH block they

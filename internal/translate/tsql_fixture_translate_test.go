@@ -19,22 +19,20 @@ import (
 // that no longer fires fails the test too, so the list never goes
 // stale.
 var tsqlFixtureWarningAllowlist = map[string]string{
-	// usp_merge_product: MERGE … OUTPUT has no PG counterpart (PG 17
-	// MERGE … RETURNING lacks $action / inserted. / deleted.);
-	// usp_count_customers: sp_executesql / EXEC(@sql) run T-SQL strings
-	// that are never rewritten, and the OUTPUT parameter of
-	// sp_executesql needs EXECUTE … INTO; trg_orders_audit: UPDATE(col)
-	// is approximated by "the values changed".
-	"routine.untranslated_construct": "MERGE OUTPUT, dynamic SQL, UPDATE(col)",
-	// t_computed.c_label / c_is_bulk and [Order Details].line_total are
-	// not PERSISTED: PG only has stored generated columns, so they are
-	// plain copied columns until an override provides the expression.
-	"table.computed_not_generated": "non-PERSISTED computed columns",
-	// dbo.Employees is system-versioned: the history table and the
-	// period maintenance are not emulated.
-	"table.temporal_not_emulated": "system-versioned temporal table",
+	// usp_count_customers: EXEC (@msg) runs a string built at run time
+	// (concatenated with @country / @count), T-SQL that cannot be
+	// translated ahead of time. (Its constant sp_executesql statement is
+	// inlined as static SQL, the MERGE … OUTPUT result set is dropped
+	// like a result-set SELECT, and UPDATE(col) is exact through an
+	// UPDATE OF helper trigger.)
+	"routine.untranslated_construct": "dynamic SQL built at run time",
+	// [Order Details].line_total converts float arithmetic (real
+	// discount) to money: not proven identical on PG, so it is a plain
+	// copied column until an override provides the expression.
+	// (t_computed.c_label / c_is_bulk are proven and generated.)
+	"table.computed_not_generated": "computed column over float arithmetic",
 	// t_special.c_geography / c_geometry: the test target has no
-	// PostGIS, so the spatial columns are WKT text placeholders.
+	// PostGIS, so the spatial columns are EWKT text placeholders.
 	"type.spatial_no_postgis": "spatial columns without PostGIS",
 }
 
@@ -81,7 +79,20 @@ func TestTSQLFixture_TranslateEndToEnd(t *testing.T) {
 		}
 	}
 	got := map[string][]string{}
+	// The history table of the emulated system-versioned dbo.Employees
+	// is not created by the script (SQL Server creates it): it is in the
+	// plan on top of the script's tables.
+	histories := map[string]bool{}
 	for _, tb := range res.Plan.Tables {
+		if tv := tb.TSQLTemporal; tv != nil {
+			histories[tv.HistorySchema+"."+tv.HistoryTable] = true
+		}
+	}
+	require.Equal(t, map[string]bool{"dbo.employeeshistory": true}, histories)
+	for _, tb := range res.Plan.Tables {
+		if histories[tb.Schema+"."+tb.Name] {
+			continue
+		}
 		got["table"] = append(got["table"], tb.Schema+"."+tb.Name)
 	}
 	for _, v := range res.Plan.Views {
@@ -114,6 +125,15 @@ func TestTSQLFixture_TranslateEndToEnd(t *testing.T) {
 		seen[w.Kind] = true
 	}
 	require.Empty(t, unexpected, "non-info warnings outside the allowlist")
+	for _, w := range res.Warnings {
+		switch w.Kind {
+		case "routine.untranslated_construct":
+			require.Equal(t, "procedure.dbo.usp_count_customers", w.Object, w.Message)
+			require.Contains(t, w.Message, "dynamic SQL")
+		case "table.computed_not_generated":
+			require.Equal(t, "sales.order details.line_total", w.Object)
+		}
+	}
 	for kind := range tsqlFixtureWarningAllowlist {
 		require.True(t, seen[kind], "allowlisted warning kind %q no longer fires: remove it from tsqlFixtureWarningAllowlist", kind)
 	}

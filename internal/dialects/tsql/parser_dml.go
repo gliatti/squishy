@@ -870,21 +870,26 @@ func (p *Parser) parseValuesRows() [][]ast.Expr {
 // ---------------------------------------------------------------------------
 
 // parseOutputClause parses `OUTPUT items [INTO target [(cols)]]` (possibly
-// twice: OUTPUT … INTO … OUTPUT …) and returns its raw text.
-func (p *Parser) parseOutputClause() string {
+// twice: OUTPUT … INTO … OUTPUT …) and returns its raw text and its
+// typed clauses.
+func (p *Parser) parseOutputClause() (string, []ast.OutputClause) {
 	start := p.cur
+	var out []ast.OutputClause
 	for p.isKw("OUTPUT") {
 		p.advance()
-		p.parseSelectElements()
+		var oc ast.OutputClause
+		oc.Items, _ = p.parseSelectElements()
 		if p.isKw("INTO") {
 			p.advance()
-			p.parseTableRef()
+			ref := p.parseTableRef()
+			oc.Into = &ref
 			if p.isPunct("(") {
-				p.parseIdentList()
+				oc.IntoCols = p.parseIdentList()
 			}
 		}
+		out = append(out, oc)
 	}
-	return p.textFrom(start)
+	return p.textFrom(start), out
 }
 
 // parseDMLTop parses `TOP (n) [PERCENT]` after INSERT / UPDATE / DELETE /
@@ -928,7 +933,7 @@ func (p *Parser) parseInsertStatement(with *ast.WithClause) *ast.InsertStmt {
 		stmt.Cols = p.parseIdentList()
 	}
 	if p.isKw("OUTPUT") {
-		stmt.Output = p.parseOutputClause()
+		stmt.Output, stmt.Outputs = p.parseOutputClause()
 	}
 	switch {
 	case p.isKw("VALUES"):
@@ -1052,7 +1057,7 @@ func (p *Parser) parseUpdateStatement(with *ast.WithClause) *ast.UpdateStmt {
 	p.expectKw("SET")
 	stmt.Sets = p.parseSetItems()
 	if p.isKw("OUTPUT") {
-		stmt.Output = p.parseOutputClause()
+		stmt.Output, stmt.Outputs = p.parseOutputClause()
 	}
 	if p.isKw("FROM") {
 		p.advance()
@@ -1081,7 +1086,7 @@ func (p *Parser) parseDeleteStatement(with *ast.WithClause) *ast.DeleteStmt {
 	}
 	stmt.Table = p.parseDMLTarget()
 	if p.isKw("OUTPUT") {
-		stmt.Output = p.parseOutputClause()
+		stmt.Output, stmt.Outputs = p.parseOutputClause()
 	}
 	if p.isKw("FROM") {
 		p.advance()
@@ -1182,7 +1187,7 @@ func (p *Parser) parseMergeStatement(with *ast.WithClause) *ast.MergeStmt {
 		}
 	}
 	if p.isKw("OUTPUT") {
-		stmt.Output = p.parseOutputClause()
+		stmt.Output, stmt.Outputs = p.parseOutputClause()
 	}
 	if p.isKw("OPTION") && p.peekIsPunct(1, "(") {
 		p.parseOptionClause()

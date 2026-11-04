@@ -337,3 +337,19 @@ end`)
 		t.Errorf("IF … ELSE IF: %+v", ifs)
 	}
 }
+
+func TestParseParamDecls(t *testing.T) {
+	ps, errs := ParseParamDecls("@cc char(3), @c int OUTPUT, @d nvarchar(10) = N'x'")
+	if len(errs) > 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	if len(ps) != 3 || ps[0].Name != "@cc" || ps[0].Output || !ps[1].Output || ps[1].Name != "@c" || ps[2].Default == nil {
+		t.Errorf("params: %+v", ps)
+	}
+	if ps, errs := ParseParamDecls(""); len(ps) != 0 || len(errs) != 0 {
+		t.Errorf("empty list: %+v %v", ps, errs)
+	}
+	if _, errs := ParseParamDecls("@a int @b int"); len(errs) == 0 {
+		t.Error("a missing comma is an error")
+	}
+}

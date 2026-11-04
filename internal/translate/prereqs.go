@@ -581,7 +581,7 @@ func tsqlPrerequisite(w Warning) (Prerequisite, bool) {
 			Category:    CatInstallExtension,
 			Object:      w.Object,
 			Title:       "Install PostGIS for SQL Server geography / geometry columns",
-			Description: "The source has geography / geometry columns. Without PostGIS on the target, squishy created them as text and copies the WKT form, which loses every spatial operation, index and the SRID.",
+			Description: "The source has geography / geometry columns. Without PostGIS on the target, squishy created them as text and copies their EWKT form (SRID=n;WKT), which loses every spatial operation and index.",
 			Remediation: "CREATE EXTENSION IF NOT EXISTS postgis;  -- on the target database\n\nThen re-plan the migration: the columns map to PostGIS geography / geometry.",
 		}, true
 	case tsqlWarnHierarchy:

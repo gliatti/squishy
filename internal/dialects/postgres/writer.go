@@ -396,7 +396,15 @@ func writeCreateTrigger(b *strings.Builder, t *CreateTrigger) {
 	if t.WhenCond != "" {
 		fmt.Fprintf(b, " WHEN (%s)", t.WhenCond)
 	}
-	fmt.Fprintf(b, " EXECUTE FUNCTION %s.%s();\n", qIdent(t.Schema), qIdent(t.FnName))
+	fnSchema := t.Schema
+	if t.FnSchema != "" {
+		fnSchema = t.FnSchema
+	}
+	args := make([]string, len(t.FnArgs))
+	for i, a := range t.FnArgs {
+		args[i] = sqlLit(a)
+	}
+	fmt.Fprintf(b, " EXECUTE FUNCTION %s.%s(%s);\n", qIdent(fnSchema), qIdent(t.FnName), strings.Join(args, ", "))
 }
 
 // ---------------------------------------------------------------------------

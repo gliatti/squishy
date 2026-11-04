@@ -332,6 +332,11 @@ type TriggerInfo struct {
 	// ReturnRow is what the trigger function returns: "NULL"
 	// (statement-level), "NEW" or "OLD" (INSTEAD OF row triggers).
 	ReturnRow string
+	// UpdatedColumns is filled by the body translator: the PG columns a
+	// statement-level UPDATE trigger tests with UPDATE(col), each of
+	// which needs a helper `AFTER UPDATE OF col` trigger marking the
+	// statement (see tsqlBody.updatedMark).
+	UpdatedColumns []string
 }
 
 // RoutineCtx is the header context of one routine handed to

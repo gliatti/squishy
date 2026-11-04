@@ -152,27 +152,8 @@ func (d *Deps) planMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Probe extensions on the instance's admin PG (the per-migration target
-	// DB may not exist yet for the dedicated_db strategy).
 	probeStart := time.Now()
-	var targetExts []string
-	if pool, err := connection.OpenPostgres(ctx, connection.Params{
-		Kind: "postgres", Host: inst.TargetHost, Port: inst.TargetPort,
-		Database: inst.TargetDatabase, Username: inst.TargetUsername,
-		Password: inst.TargetPassword, SSLMode: inst.TargetSSLMode,
-	}); err == nil {
-		rows, err := pool.Query(ctx, `SELECT extname FROM pg_extension`)
-		if err == nil {
-			for rows.Next() {
-				var n string
-				if err := rows.Scan(&n); err == nil {
-					targetExts = append(targetExts, n)
-				}
-			}
-			rows.Close()
-		}
-		pool.Close()
-	}
+	targetExts := probeTargetExtensions(ctx, inst, mig)
 	timings.ProbeExts = time.Since(probeStart)
 
 	dia, err := dialects.Get(inst.Kind)
@@ -341,4 +322,44 @@ func writeMigErr(w http.ResponseWriter, err error) {
 	default:
 		errJSON(w, http.StatusInternalServerError, err.Error())
 	}
+}
+
+// probeTargetExtensions lists the extensions installed where the
+// migration's DDL will run: the instance's admin PG and, for the
+// dedicated_db strategy, the migration's own target database when it
+// already exists. An extension installed in the target database ahead
+// of the run (the remediation of an install_extension prerequisite:
+// "CREATE EXTENSION postgis on the target database, then re-plan") is
+// otherwise invisible, since a new database does not inherit the
+// extensions of the admin one. Unreachable databases add nothing.
+func probeTargetExtensions(ctx context.Context, inst *project.Instance, mig *project.Migration) []string {
+	dbs := []string{inst.TargetDatabase}
+	if inst.TargetStrategy == "dedicated_db" && mig.TargetDBName != "" && mig.TargetDBName != inst.TargetDatabase {
+		dbs = append(dbs, mig.TargetDBName)
+	}
+	seen := map[string]bool{}
+	var exts []string
+	for _, db := range dbs {
+		pool, err := connection.OpenPostgres(ctx, connection.Params{
+			Kind: "postgres", Host: inst.TargetHost, Port: inst.TargetPort,
+			Database: db, Username: inst.TargetUsername,
+			Password: inst.TargetPassword, SSLMode: inst.TargetSSLMode,
+		})
+		if err != nil {
+			continue
+		}
+		rows, err := pool.Query(ctx, `SELECT extname FROM pg_extension`)
+		if err == nil {
+			for rows.Next() {
+				var n string
+				if err := rows.Scan(&n); err == nil && !seen[n] {
+					seen[n] = true
+					exts = append(exts, n)
+				}
+			}
+			rows.Close()
+		}
+		pool.Close()
+	}
+	return exts
 }

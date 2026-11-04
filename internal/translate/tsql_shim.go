@@ -39,6 +39,8 @@ var tsqlShimFuncs = map[string][]string{
 	"tsql.isnumeric":     {"40_isnumeric.sql"},
 	"tsql.isdate":        {"41_isdate.sql"},
 	"tsql.convert_style": {"50_convert_style.sql"},
+	// UPDATE(col) in an AFTER UPDATE trigger (tsql_routines.go).
+	"tsql.take_column_updated": {"60_column_updated.sql"},
 }
 
 // tsqlShimFileNames returns the shim pieces in file-name order (the

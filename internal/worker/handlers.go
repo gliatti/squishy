@@ -606,14 +606,27 @@ type validatePayload struct {
 	} `json:"history_tables"`
 	SourceSchema string `json:"source_schema"`
 	TargetSchema string `json:"target_schema"`
+	// TableChecks (SQL Server, planner.ValidateTableCheck) carry their
+	// own source and target schema per table: a SQL Server database
+	// spans several T-SQL schemas, each mapped to its PG schema, which
+	// the single SourceSchema / TargetSchema pair cannot express.
+	TableChecks []struct {
+		SourceSchema string `json:"source_schema"`
+		SourceTable  string `json:"source_table"`
+		TargetSchema string `json:"target_schema"`
+		TargetTable  string `json:"target_table"`
+	} `json:"table_checks"`
 }
 
 // countCheck is one row-count comparison of the validate step: the rows
-// src reads from SourceTable against the rows of TargetTable.
+// src reads from SourceTable against the rows of TargetTable. The
+// schemas, when set, replace the payload's SourceSchema / TargetSchema.
 type countCheck struct {
-	src         dataxfer.SourceDialect
-	SourceTable string
-	TargetTable string
+	src          dataxfer.SourceDialect
+	SourceSchema string
+	SourceTable  string
+	TargetSchema string
+	TargetTable  string
 }
 
 // validateChecks lists the row-count comparisons of a validate payload:
@@ -640,6 +653,16 @@ func (d *Deps) validateChecks(p validatePayload) ([]countCheck, error) {
 		}
 		out = append(out, countCheck{src: hist, SourceTable: h.SourceTable, TargetTable: h.TargetTable})
 	}
+	for _, tc := range p.TableChecks {
+		if tc.SourceTable == "" || tc.TargetTable == "" || tc.SourceSchema == "" || tc.TargetSchema == "" {
+			return nil, fmt.Errorf("validate: table check needs source and target schema and table, got %+v", tc)
+		}
+		out = append(out, countCheck{
+			src:          dial,
+			SourceSchema: tc.SourceSchema, SourceTable: tc.SourceTable,
+			TargetSchema: tc.TargetSchema, TargetTable: tc.TargetTable,
+		})
+	}
 	return out, nil
 }
 
@@ -656,12 +679,19 @@ func (d *Deps) hValidate(ctx context.Context, j *queue.Job) error {
 		return err
 	}
 	for _, c := range checks {
+		srcSchema, dstSchema := p.SourceSchema, p.TargetSchema
+		if c.SourceSchema != "" {
+			srcSchema = c.SourceSchema
+		}
+		if c.TargetSchema != "" {
+			dstSchema = c.TargetSchema
+		}
 		var srcN int64
-		if err := d.SourceDB.QueryRowContext(ctx, c.src.CountQuery(p.SourceSchema, c.SourceTable)).Scan(&srcN); err != nil {
+		if err := d.SourceDB.QueryRowContext(ctx, c.src.CountQuery(srcSchema, c.SourceTable)).Scan(&srcN); err != nil {
 			return fmt.Errorf("count source %s (for %s): %w", c.SourceTable, c.TargetTable, err)
 		}
 		var dstN int64
-		if err := d.TargetPool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{p.TargetSchema, c.TargetTable}.Sanitize()).Scan(&dstN); err != nil {
+		if err := d.TargetPool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{dstSchema, c.TargetTable}.Sanitize()).Scan(&dstN); err != nil {
 			return fmt.Errorf("count pg %s: %w", c.TargetTable, err)
 		}
 		if srcN != dstN {

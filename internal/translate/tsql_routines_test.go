@@ -358,16 +358,21 @@ func TestTSQLRoutines_Triggers(t *testing.T) {
 		"CREATE TRIGGER \"iuperson_update\" AFTER UPDATE ON \"person\".\"person\"\n  REFERENCING NEW TABLE AS \"inserted\" OLD TABLE AS \"deleted\"\n  FOR EACH STATEMENT",
 		`"_tsql"."count" := (SELECT count(*) FROM "inserted");`,
 		"IF TRUE OR TRUE THEN",
-		// On UPDATE, UPDATE(col) becomes "the column's values changed".
-		`IF EXISTS (SELECT CAST("businessentityid" AS text) FROM "inserted" EXCEPT ALL SELECT CAST("businessentityid" AS text) FROM "deleted") OR EXISTS (SELECT CAST("demographics" AS text) FROM "inserted" EXCEPT ALL SELECT CAST("demographics" AS text) FROM "deleted") THEN`,
+		// On UPDATE, UPDATE(col) reads the mark of a helper UPDATE OF
+		// col trigger, taken when the body starts; the helpers sort
+		// before the translated trigger, so PG fires them first.
+		"CREATE TRIGGER \"0_iuperson_update_upd_1\" AFTER UPDATE OF \"businessentityid\" ON \"person\".\"person\"\n  FOR EACH STATEMENT EXECUTE FUNCTION \"tsql\".\"mark_column_updated\"('businessentityid');",
+		"CREATE TRIGGER \"0_iuperson_update_upd_2\" AFTER UPDATE OF \"demographics\" ON \"person\".\"person\"\n  FOR EACH STATEMENT EXECUTE FUNCTION \"tsql\".\"mark_column_updated\"('demographics');",
+		`"_updated_businessentityid" boolean := tsql.take_column_updated(TG_RELID, 'businessentityid');`,
+		`IF "_tsql"."_updated_businessentityid" OR "_tsql"."_updated_demographics" THEN`,
 		`UPDATE "person"."person" SET "demographics" = '<IndividualSurvey/>' FROM "inserted" WHERE "person"."person"."businessentityid" = "inserted"."businessentityid" AND "inserted"."demographics" IS NULL;`,
 	} {
 		require.Contains(t, iu, frag)
 	}
 	require.Equal(t, 2, strings.Count(iu, "RETURN NULL;\nEND;"))
-	ws := tsqlObjectWarnings(res, "trigger.person.iuperson", "routine.untranslated_construct")
-	require.Len(t, ws, 1, "UPDATE(col) is exact on INSERT, approximated on UPDATE: %v", ws)
-	require.Contains(t, ws[0], "UPDATE(column)")
+	require.Less(t, "0_iuperson_update_upd_1", "iuperson_update")
+	require.Empty(t, tsqlObjectWarnings(res, "trigger.person.iuperson", "routine.untranslated_construct"), "UPDATE(col) is exact on INSERT and UPDATE")
+	require.Contains(t, strings.Join(res.Plan.PreActions, "\n"), "CREATE OR REPLACE FUNCTION tsql.take_column_updated(rel oid, col name)", "the shim piece is emitted")
 
 	// The DELETE trigger of a split trigger has no inserted rows: an
 	// empty relation of the table's shape, and UPDATE(col) is FALSE.
@@ -381,7 +386,10 @@ func TestTSQLRoutines_Triggers(t *testing.T) {
 	} {
 		require.Contains(t, idu, frag)
 	}
-	require.Equal(t, 3, strings.Count(idu, "CREATE TRIGGER"))
+	// One trigger per event, plus the UPDATE trigger's helpers marking
+	// the three columns its UPDATE(col) tests read.
+	require.Equal(t, 6, strings.Count(idu, "CREATE TRIGGER"))
+	require.Equal(t, 3, strings.Count(idu, "mark_column_updated"))
 }
 
 const tsqlOrdersSchema = `
@@ -484,7 +492,9 @@ GO
 		"  BEGIN\n    DELETE FROM \"dbo\".\"orders\" WHERE \"orderid\" = \"tx\".\"id\";\n  EXCEPTION\n    WHEN OTHERS THEN\n      IF 1 > 0 THEN\n        NULL;\n      END IF;\n      RAISE;\n  END;",
 		"CALL \"dbo\".\"walk\"(\"cust\" => \"tx\".\"id\", \"n\" => \"_tsql\".\"out\");\n  \"_tsql\".\"rc\" := 0;",
 		`CALL "dbo"."walk"("tx"."id", "_tsql"."out");`,
-		`EXECUTE "_tsql"."sql" USING "tx"."id";`,
+		// The constant sp_executesql statement is inlined, @p bound to
+		// @id; EXEC (@sql) leaves @p unbound and stays dynamic.
+		"CALL \"dbo\".\"walk\"(\"tx\".\"id\", \"_tsql\".\"out\");\n  DELETE FROM \"dbo\".\"orders\" WHERE \"orderid\" = \"tx\".\"id\";\n  EXECUTE \"_tsql\".\"sql\";",
 		`EXECUTE "_tsql"."sql";`,
 		"DROP TABLE IF EXISTS \"pg_temp\".\"work\";\n  CREATE TEMP TABLE \"work\" AS SELECT * FROM \"dbo\".\"orders\" WHERE \"orderid\" = \"tx\".\"id\";",
 		"DROP TABLE IF EXISTS \"pg_temp\".\"t2\";\n  CREATE TEMP TABLE \"t2\" (\"k\" integer NOT NULL);",
@@ -497,7 +507,7 @@ GO
 	require.NotContains(t, ddl, "BEGIN TRAN")
 	ws := strings.Join(tsqlObjectWarnings(res, "procedure.dbo.tx", "routine.untranslated_construct"), "\n")
 	require.Contains(t, ws, "no return status")
-	require.Contains(t, ws, "$1, $2")
+	require.NotContains(t, ws, "$1, $2", "the sp_executesql call is inlined")
 	require.Contains(t, ws, "dynamic SQL")
 	require.Contains(t, ws, "sp_rename")
 	require.NotContains(t, ws, "SELECT … INTO", "SELECT … INTO #temp is translated")
@@ -693,4 +703,60 @@ func TestTSQLRoutines_WithoutRun(t *testing.T) {
 	})
 	require.Contains(t, body, "RAISE EXCEPTION 'routine dbo.t was not translated from T-SQL';\n  RETURN NULL;")
 	require.Len(t, warnings, 1)
+}
+
+// sp_executesql / EXEC with a constant statement: the string is parsed
+// and translated as static SQL, its parameters bound to the arguments
+// (the OUTPUT one to the caller's variable). A statement built at run
+// time keeps EXECUTE and its warning; so does a constant one reading a
+// variable it does not declare, or one whose variable is reassigned.
+// Statements inside the body's BEGIN … END see the DECLAREs before them.
+func TestTSQLRoutines_ConstantDynamicSQL(t *testing.T) {
+	res := tsqlRoutinesTranslate(t, `
+CREATE TABLE dbo.Customers (customer_id int NOT NULL PRIMARY KEY, country_code char(3) NOT NULL, status varchar(10) NOT NULL);
+GO
+CREATE PROCEDURE dbo.usp_count
+    @country char(3),
+    @count   int OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @sql nvarchar(400) =
+        N'SELECT @c = COUNT(*) FROM dbo.Customers WHERE country_code = @cc';
+    EXEC sp_executesql @sql, N'@cc char(3), @c int OUTPUT', @cc = @country, @c = @count OUTPUT;
+    EXEC sp_executesql N'UPDATE dbo.Customers SET status = @s WHERE country_code = @k', N'@k char(3), @s varchar(10)', @country, 'vip';
+    EXEC (N'DELETE FROM dbo.Customers WHERE status = ''banned''');
+
+    DECLARE @msg nvarchar(200);
+    SET @msg = N'PRINT ''' + @country + N'''';
+    EXEC (@msg);
+    DECLARE @other nvarchar(100) = N'SELECT @x = 1';
+    EXEC sp_executesql @other, N'@x int OUTPUT', @x = @count OUTPUT;
+    EXEC (N'SELECT @count');
+    DECLARE @moved nvarchar(100) = N'DELETE FROM dbo.Customers';
+    SET @moved = N'TRUNCATE TABLE dbo.Customers';
+    EXEC (@moved);
+END;
+GO
+`)
+	ddl := tsqlRoutineDDL(t, res, "procedure", "dbo", "usp_count")
+	for _, frag := range []string{
+		`SELECT count(*) INTO "usp_count"."count" FROM "dbo"."customers" WHERE "country_code" = "usp_count"."country";`,
+		`UPDATE "dbo"."customers" SET "status" = 'vip' WHERE "country_code" = "usp_count"."country";`,
+		`DELETE FROM "dbo"."customers" WHERE "status" = 'banned';`,
+		`"usp_count"."count" := 1;`,
+		// Built at run time, reading a caller variable, reassigned:
+		// still dynamic.
+		`EXECUTE "_tsql"."msg";`,
+		`EXECUTE 'SELECT @count';`,
+		`EXECUTE "_tsql"."moved";`,
+	} {
+		require.Contains(t, ddl, frag)
+	}
+	require.NotContains(t, ddl, `EXECUTE "_tsql"."sql"`)
+	ws := tsqlObjectWarnings(res, "procedure.dbo.usp_count", "routine.untranslated_construct")
+	require.NotEmpty(t, ws)
+	for _, w := range ws {
+		require.NotContains(t, w, "parameter c not translated")
+	}
 }

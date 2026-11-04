@@ -231,6 +231,7 @@ type InsertStmt struct {
 	DefaultValues bool
 	Exec          PLStmt
 	Output        string
+	Outputs       []OutputClause
 	With          *WithClause
 	Top           Expr
 	P             Position
@@ -266,6 +267,7 @@ type UpdateStmt struct {
 	With         *WithClause
 	Top          Expr
 	Output       string
+	Outputs      []OutputClause
 	OptionClause string
 	P            Position
 }
@@ -301,6 +303,7 @@ type DeleteStmt struct {
 	With         *WithClause
 	Top          Expr
 	Output       string
+	Outputs      []OutputClause
 	OptionClause string
 	P            Position
 }
@@ -330,6 +333,7 @@ type MergeStmt struct {
 	// a T-SQL CTE prelude (nil when absent) and Top `MERGE TOP (n)`.
 	WhenNotMatchedBySource []MergeAction
 	Output                 string
+	Outputs                []OutputClause
 	With                   *WithClause
 	Top                    Expr
 
@@ -360,4 +364,18 @@ type MergeAction struct {
 	// shape — it would need a second `WHEN MATCHED AND <cond> THEN DELETE`
 	// branch); the translator surfaces a manual-remediation warning.
 	HasInlineDelete bool
+}
+
+// OutputClause is one T-SQL `OUTPUT items [INTO target [(cols)]]` clause
+// of an INSERT / UPDATE / DELETE / MERGE (the statement's Outputs; its
+// Output field keeps the raw text). Items reference the inserted. /
+// deleted. pseudo-rows and $action. Into is nil for an OUTPUT that
+// returns its rows to the caller as a result set; otherwise it is the
+// table or @table variable receiving them, IntoCols its column list.
+// The items are kept for the translator to inspect; ast.Rewrite does not
+// descend into them.
+type OutputClause struct {
+	Items    []SelectItem
+	Into     *TableRef
+	IntoCols []string
 }

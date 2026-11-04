@@ -171,6 +171,26 @@ func Build(source *inspect.SourceSchema, pg *translate.Result, opts BuildOptions
 			}, ddlID)
 			copyIDs[sv.HistoryTable] = id
 		}
+		// SQL Server system-versioned tables emulated by the translator:
+		// the source keeps the closed versions in a real history table
+		// (left out of the inspected tables), copied as is into the PG
+		// history table. Same DAG position as a table copy, so create_fk
+		// — which installs the versioning triggers — waits for it.
+		for _, tbl := range pg.Plan.Tables {
+			tv := tbl.TSQLTemporal
+			if tv == nil || !tv.CopyHistory {
+				continue
+			}
+			target := tv.HistorySourceSchema + "." + tv.HistorySourceTable
+			id := addStep("copy_table", target, 100, map[string]any{
+				"schema":        tv.HistorySourceSchema,
+				"table":         tv.HistorySourceTable,
+				"target_schema": tv.HistorySchema,
+				"target_table":  tv.HistoryTable,
+			}, ddlID)
+			copyIDs[target] = id
+			copySchemas[target] = tv.HistorySchema
+		}
 	}
 
 	// One create_index step per table — depends on copy_table of the same
@@ -440,6 +460,16 @@ func tableChecks(source *inspect.SourceSchema, pg *translate.Result) []ValidateT
 			SourceSchema: snap.Schema, SourceTable: snap.Name,
 			TargetSchema: pgTbl.Schema, TargetTable: pgTbl.Name,
 		})
+	}
+	// The history tables of emulated SQL Server system-versioned tables
+	// are copied too (see Build): their counts are checked the same way.
+	for _, tbl := range pg.Plan.Tables {
+		if tv := tbl.TSQLTemporal; tv != nil && tv.CopyHistory {
+			out = append(out, ValidateTableCheck{
+				SourceSchema: tv.HistorySourceSchema, SourceTable: tv.HistorySourceTable,
+				TargetSchema: tv.HistorySchema, TargetTable: tv.HistoryTable,
+			})
+		}
 	}
 	return out
 }

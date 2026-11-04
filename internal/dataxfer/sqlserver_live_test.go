@@ -86,7 +86,7 @@ func TestSQLServerLive(t *testing.T) {
 		require.NoError(t, err)
 		o := CopyOpts{SourceDB: db, SourceDialect: d, SrcSchema: tb.s, SrcTable: tb.n,
 			Columns: cols, RangeKind: plan.RangeKind, Low: plan.Ranges[0].Low, High: plan.Ranges[0].High}
-		sd, err := d.(selectExprDialect).ForColumns(ctx, db, tb.s, tb.n, cols)
+		sd, err := d.(selectExprDialect).ForColumns(ctx, db, tb.s, tb.n, cols, nil)
 		require.NoError(t, err)
 		o.SourceDialect = sd
 		r, err := o.selectSource(ctx)

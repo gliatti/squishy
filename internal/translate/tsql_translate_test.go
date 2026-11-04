@@ -613,11 +613,36 @@ CREATE TABLE dbo.Emp (
 GO
 `
 	res := tsqlTranslate(t, src, preserved())
-	ws := tsqlWarnings(res, "table.temporal_not_emulated")
-	require.Len(t, ws, 1)
-	require.Contains(t, ws[0].Message, "dbo.EmpHistory")
-	require.NotNil(t, tsqlPrereq(res, "temporal tables"))
+	// The system versioning is emulated: no warning, a history table
+	// copied from the source one, versioning triggers after the copy.
+	require.Empty(t, tsqlWarnings(res, "table.temporal_not_emulated"))
+	require.Nil(t, tsqlPrereq(res, "temporal tables"))
 	require.Contains(t, res.DDLScript, `"validfrom" timestamp(6) NOT NULL,`)
+	cur := tsqlTableOf(res, "dbo", "emp")
+	require.Equal(t, &PGTSQLTemporal{
+		RowStart: "validfrom", RowEnd: "validto", RowEndMax: "9999-12-31 23:59:59.999999",
+		HistorySchema: "dbo", HistoryTable: "emphistory",
+		HistorySourceSchema: "dbo", HistorySourceTable: "EmpHistory", CopyHistory: true,
+	}, cur.TSQLTemporal)
+	hist := tsqlTableOf(res, "dbo", "emphistory")
+	require.Equal(t, "EmpHistory", hist.SourceName)
+	require.Empty(t, hist.PK)
+	require.Len(t, hist.Columns, 5)
+	require.Contains(t, res.DDLScript, `CREATE TABLE "dbo"."emphistory" (`)
+	post := res.DDLPostCopy
+	require.Contains(t, post, "CREATE TRIGGER \"emp_period_stamp\" BEFORE INSERT OR UPDATE ON \"dbo\".\"emp\"\n  FOR EACH ROW")
+	require.Contains(t, post, "CREATE TRIGGER \"emp_period_history\" AFTER UPDATE OR DELETE ON \"dbo\".\"emp\"\n  FOR EACH ROW")
+	require.Contains(t, post, `NEW."validfrom" := timezone('UTC', transaction_timestamp());`)
+	require.Contains(t, post, `NEW."validto" := CAST('9999-12-31 23:59:59.999999' AS timestamp);`)
+	require.Contains(t, post, `INSERT INTO "dbo"."emphistory" ("id", "rv", "loc", "validfrom", "validto") VALUES (OLD."id", OLD."rv", OLD."loc", OLD."validfrom", NEW."validfrom")`)
+	require.Contains(t, post, "SQL Server error 13535")
+	var hidden bool
+	for _, e := range res.Explanations {
+		if e.Object == "table.dbo.emp" && strings.Contains(e.Reason, "HIDDEN") {
+			hidden = true
+		}
+	}
+	require.True(t, hidden, "HIDDEN period columns explained")
 	// rowversion and spatial columns are outside the copier's default
 	// list: the table gets an explicit one.
 	tbl := tsqlTableOf(res, "dbo", "emp")
@@ -712,6 +737,11 @@ func TestTSQL_Corpus(t *testing.T) {
 					if !x.Temporary {
 						tables++
 					}
+					// SQL Server creates the history table of a
+					// system-versioned table, which the plan holds.
+					if x.SystemVersioned && x.HistoryTable != nil {
+						tables++
+					}
 				case *ast.CreateView, *ast.CreateProcedure, *ast.CreateFunction:
 					modules++
 				}
@@ -735,4 +765,63 @@ func TestTSQL_Corpus(t *testing.T) {
 	if ran == 0 {
 		t.Skip("no T-SQL corpus on disk")
 	}
+}
+
+// A non-PERSISTED computed column whose expression is proven immutable
+// and identical becomes a stored generated column too (SQL Server
+// computes it on read, PG on write: the same value). CONCAT is rewritten
+// to an immutable coalesce(…::text, '') || … chain (PG's concat() is
+// only STABLE); a CONCAT over money or char(n) stays refused.
+func TestTSQL_ComputedNonPersistedWithHooks(t *testing.T) {
+	stmts, errs := tsqldialect.Parse(`
+CREATE TABLE dbo.c (
+    id int NOT NULL,
+    code varchar(20) NOT NULL,
+    note varchar(20) NULL,
+    qty int NOT NULL,
+    price money NOT NULL,
+    pad char(4) NOT NULL,
+    c_label AS (CONCAT(N'Q', qty, N' x ', code, NULL, note)),
+    c_is_bulk AS (CASE WHEN qty >= 100 THEN 1 ELSE 0 END),
+    c_money AS (CONCAT(N'p', price)),
+    c_pad AS (CONCAT(pad, code))
+);
+GO
+`)
+	require.Empty(t, errs)
+	res := Translate(stmts, Options{TargetSchema: "public", SourceKind: dialects.KindSQLServer, PreserveSourceSchemas: true})
+	ddl := res.DDLScript
+	require.Contains(t, ddl, `"c_label" text GENERATED ALWAYS AS (('Q' || coalesce(CAST("qty" AS text), '') || ' x ' || coalesce(CAST("code" AS text), '') || coalesce(CAST("note" AS text), ''))) STORED`)
+	require.Contains(t, ddl, `"c_is_bulk" integer GENERATED ALWAYS AS (CASE WHEN "qty" >= 100 THEN 1 ELSE 0 END) STORED`)
+	tbl := tsqlTableOf(res, "dbo", "c")
+	require.Equal(t, []string{"c_money", "c_pad"}, tbl.CopiedGenerated)
+	ws := tsqlWarnings(res, "table.computed_not_generated")
+	require.Len(t, ws, 2)
+	require.Contains(t, ws[0].Message, "non-PERSISTED computed column dbo.c.c_money")
+	require.Contains(t, ws[0].Message, "CONCAT argument")
+	var why string
+	for _, e := range res.Explanations {
+		if e.Object == "table.dbo.c.c_is_bulk" {
+			why = e.Reason
+		}
+	}
+	require.Contains(t, why, "non-PERSISTED computed column")
+}
+
+// A system-versioned table whose history table is not named (SQL Server
+// then names it MSSQL_TemporalHistoryFor_<id>, which only the catalog
+// knows) keeps the not-emulated warning.
+func TestTSQL_TemporalWithoutHistoryName(t *testing.T) {
+	res := tsqlTranslate(t, `
+CREATE TABLE dbo.Emp (
+    id int NOT NULL PRIMARY KEY,
+    ValidFrom datetime2(2) GENERATED ALWAYS AS ROW START NOT NULL,
+    ValidTo datetime2(2) GENERATED ALWAYS AS ROW END NOT NULL,
+    PERIOD FOR SYSTEM_TIME (ValidFrom, ValidTo)
+) WITH (SYSTEM_VERSIONING = ON);
+GO
+`, preserved())
+	require.Len(t, tsqlWarnings(res, "table.temporal_not_emulated"), 1)
+	require.Nil(t, tsqlTableOf(res, "dbo", "emp").TSQLTemporal)
+	require.Equal(t, "9999-12-31 23:59:59.99", tsqlPeriodEndMax(2))
 }

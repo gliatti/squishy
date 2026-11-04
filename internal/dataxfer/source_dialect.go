@@ -406,15 +406,23 @@ func (d sqlserverDialect) Qualify(schema, name string) string {
 // driver value the copier cannot load as is: the CLR types come back as
 // their serialized bytes and sql_variant has no stable Go value, so the
 // server renders them as text — hierarchyid as its path ('/1/3/'),
-// sql_variant as nvarchar, geography / geometry as WKT (the SRID is not
-// part of WKT; STSrid would have to travel separately). Every other type
-// is selected as is. The conversion keeps the column name (AS [col]).
-func sqlserverSelectExpr(quoted, dataType string) string {
+// sql_variant as nvarchar. geography / geometry depend on the target
+// column (targetUDT, its PG udt_name): into PostGIS they are read as
+// their SRID (4 bytes, big-endian) followed by their WKB with Z and M
+// (AsBinaryZM, SQL Server 2022), which sqlserverValue turns into the EWKB
+// the binary COPY sends; into a text placeholder (no PostGIS) as EWKT
+// ('SRID=4326;POINT (2 1)': the SRID, which WKT lacks, then AsTextZM).
+// A NULL value stays NULL (the concatenation yields NULL). Every other
+// type is selected as is. The conversion keeps the column name (AS [col]).
+func sqlserverSelectExpr(quoted, dataType, targetUDT string) string {
 	switch strings.ToLower(dataType) {
 	case "hierarchyid", "sql_variant":
 		return "CAST(" + quoted + " AS nvarchar(4000)) AS " + quoted
 	case "geography", "geometry":
-		return quoted + ".STAsText() AS " + quoted
+		if targetUDT == "geography" || targetUDT == "geometry" {
+			return "CAST(" + quoted + ".STSrid AS binary(4)) + " + quoted + ".AsBinaryZM() AS " + quoted
+		}
+		return "N'SRID=' + CAST(" + quoted + ".STSrid AS nvarchar(11)) + N';' + " + quoted + ".AsTextZM() AS " + quoted
 	}
 	return ""
 }
@@ -423,7 +431,7 @@ func sqlserverSelectExpr(quoted, dataType string) string {
 // columns needing a server-side conversion (sqlserverSelectExpr) are
 // looked up once per batch in INFORMATION_SCHEMA.COLUMNS (DATA_TYPE is
 // the base type, so alias types convert like their base).
-func (d sqlserverDialect) ForColumns(ctx context.Context, db *sql.DB, schema, table string, cols []string) (SourceDialect, error) {
+func (d sqlserverDialect) ForColumns(ctx context.Context, db *sql.DB, schema, table string, cols, targetTypes []string) (SourceDialect, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
 		 WHERE TABLE_SCHEMA = @p1 AND TABLE_NAME = @p2`, schema, table)
@@ -442,14 +450,18 @@ func (d sqlserverDialect) ForColumns(ctx context.Context, db *sql.DB, schema, ta
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return d.withTypes(cols, types), nil
+	return d.withTypes(cols, types, targetTypes), nil
 }
 
 // withTypes is ForColumns without the catalog lookup.
-func (d sqlserverDialect) withTypes(cols []string, types map[string]string) sqlserverDialect {
+func (d sqlserverDialect) withTypes(cols []string, types map[string]string, targetTypes []string) sqlserverDialect {
 	out := sqlserverDialect{}
-	for _, c := range cols {
-		if e := sqlserverSelectExpr(d.Quote(c), types[c]); e != "" {
+	for i, c := range cols {
+		target := ""
+		if i < len(targetTypes) {
+			target = targetTypes[i]
+		}
+		if e := sqlserverSelectExpr(d.Quote(c), types[c], target); e != "" {
 			if out.exprs == nil {
 				out.exprs = map[string]string{}
 			}

@@ -162,16 +162,16 @@ func TestSQLServerSelectExprs(t *testing.T) {
 	d := sqlserverDialect{}.withTypes(
 		[]string{"DocumentNode", "Title", "v", "Shape", "Loc]x"},
 		map[string]string{"DocumentNode": "hierarchyid", "Title": "nvarchar", "v": "sql_variant",
-			"Shape": "geometry", "Loc]x": "geography"})
+			"Shape": "geometry", "Loc]x": "geography"}, nil)
 	require.Equal(t,
 		"SELECT CAST([DocumentNode] AS nvarchar(4000)) AS [DocumentNode],[Title],CAST([v] AS nvarchar(4000)) AS [v],"+
-			"[Shape].STAsText() AS [Shape],[Loc]]x].STAsText() AS [Loc]]x] FROM [Production].[Document]"+
+			"N'SRID=' + CAST([Shape].STSrid AS nvarchar(11)) + N';' + [Shape].AsTextZM() AS [Shape],N'SRID=' + CAST([Loc]]x].STSrid AS nvarchar(11)) + N';' + [Loc]]x].AsTextZM() AS [Loc]]x] FROM [Production].[Document]"+
 			" ORDER BY [Production].[Document].[DocumentNode] OFFSET @p1 ROWS FETCH NEXT @p2 ROWS ONLY",
 		d.SelectOffsetOrderedQuery("Production", "Document",
 			[]string{"DocumentNode", "Title", "v", "Shape", "Loc]x"}, []string{"DocumentNode"}))
 	require.Equal(t, "sqlserver", d.Kind())
 
-	plain := sqlserverDialect{}.withTypes([]string{"id", "name"}, map[string]string{"id": "int", "name": "nvarchar"})
+	plain := sqlserverDialect{}.withTypes([]string{"id", "name"}, map[string]string{"id": "int", "name": "nvarchar"}, nil)
 	require.Nil(t, plain.exprs)
 	require.Equal(t,
 		"SELECT [id],[name] FROM [dbo].[t] WHERE [id] BETWEEN @p1 AND @p2 ORDER BY [id]",
@@ -181,4 +181,29 @@ func TestSQLServerSelectExprs(t *testing.T) {
 	require.True(t, ok)
 	_, ok = MySQLSource().(selectExprDialect)
 	require.False(t, ok)
+}
+
+// Spatial columns bound for PostGIS are read as SRID + WKB (ZM) and sent
+// as EWKB; bound for a text placeholder they are read as EWKT.
+func TestSQLServerSpatialForPostGIS(t *testing.T) {
+	d := sqlserverDialect{}.withTypes([]string{"g", "t"},
+		map[string]string{"g": "geography", "t": "geometry"}, []string{"geography", "text"})
+	require.Equal(t, "CAST([g].STSrid AS binary(4)) + [g].AsBinaryZM() AS [g]", d.exprs["g"])
+	require.Equal(t, "N'SRID=' + CAST([t].STSrid AS nvarchar(11)) + N';' + [t].AsTextZM() AS [t]", d.exprs["t"])
+
+	// geography::Point(-79, -167, 4326) as SQL Server returns it: SRID
+	// 4326 big-endian, then little-endian WKB POINT(-167 -79).
+	in := []byte{0x00, 0x00, 0x10, 0xE6,
+		0x01, 0x01, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x64, 0xC0,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x53, 0xC0}
+	want := []byte{0x01, 0x01, 0x00, 0x00, 0x20, 0xE6, 0x10, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x64, 0xC0,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x53, 0xC0}
+	require.Equal(t, want, coerceFrom("sqlserver", in, "geography"))
+	// Big-endian ISO WKB POINT Z keeps its type code, flag added.
+	be := []byte{0, 0, 0, 0, 0x00, 0x00, 0x00, 0x03, 0xE9, 1, 2, 3}
+	require.Equal(t, []byte{0x00, 0x20, 0x00, 0x03, 0xE9, 0, 0, 0, 0, 1, 2, 3}, coerceFrom("sqlserver", be, "geometry"))
+	// Text placeholder: the EWKT string passes through.
+	require.Equal(t, "SRID=0;POINT (1 2)", coerceFrom("sqlserver", "SRID=0;POINT (1 2)", "text"))
 }

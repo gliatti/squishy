@@ -2339,34 +2339,58 @@ func (rw *tsqlRW) visitSelectShape(n ast.Node) ast.Node {
 		if x.Top != nil {
 			rw.label("INSERT TOP (n)")
 		}
-		if x.Output != "" {
-			rw.label("INSERT … OUTPUT clause")
-		}
 		if x.Exec != nil {
 			rw.label("INSERT … EXEC")
+		}
+		if x.Output != "" {
+			if !rw.resultSetOutput("INSERT", x.Outputs) {
+				rw.label("INSERT … OUTPUT clause")
+				return n
+			}
+			cp := *x
+			cp.Output, cp.Outputs = "", nil
+			return &cp
 		}
 	case *ast.UpdateStmt:
 		if x.Top != nil {
 			rw.label("UPDATE TOP (n) (PG UPDATE has no row limit)")
 		}
+		cp := *x
+		changed := false
 		if x.Output != "" {
-			rw.label("UPDATE … OUTPUT clause")
+			if rw.resultSetOutput("UPDATE", x.Outputs) {
+				cp.Output, cp.Outputs = "", nil
+				changed = true
+			} else {
+				rw.label("UPDATE … OUTPUT clause")
+			}
 		}
 		if x.OptionClause != "" {
-			cp := *x
 			cp.OptionClause = ""
+			changed = true
+		}
+		if changed {
 			return &cp
 		}
 	case *ast.DeleteStmt:
 		if x.Top != nil {
 			rw.label("DELETE TOP (n) (PG DELETE has no row limit)")
 		}
+		cp := *x
+		changed := false
 		if x.Output != "" {
-			rw.label("DELETE … OUTPUT clause")
+			if rw.resultSetOutput("DELETE", x.Outputs) {
+				cp.Output, cp.Outputs = "", nil
+				changed = true
+			} else {
+				rw.label("DELETE … OUTPUT clause")
+			}
 		}
 		if x.OptionClause != "" {
-			cp := *x
 			cp.OptionClause = ""
+			changed = true
+		}
+		if changed {
 			return &cp
 		}
 	case *ast.MergeStmt:
@@ -2374,10 +2398,37 @@ func (rw *tsqlRW) visitSelectShape(n ast.Node) ast.Node {
 			rw.label("MERGE TOP (n)")
 		}
 		if x.Output != "" {
-			rw.label("MERGE … OUTPUT clause")
+			if !rw.resultSetOutput("MERGE", x.Outputs) {
+				rw.label("MERGE … OUTPUT clause")
+				return n
+			}
+			cp := *x
+			cp.Output, cp.Outputs = "", nil
+			return &cp
 		}
 	}
 	return n
+}
+
+// resultSetOutput reports whether the OUTPUT clauses of a data
+// modification all return their rows to the caller (no INTO), and
+// notes that they are dropped. Such an OUTPUT is a result set, like a
+// SELECT at the top of a procedure, which the routine translator runs
+// with PERFORM and discards: a PostgreSQL procedure returns no result
+// set. The statement itself is kept unchanged. An OUTPUT … INTO feeds a
+// table or a @table variable the routine reads afterwards; it stays a
+// blocking label.
+func (rw *tsqlRW) resultSetOutput(stmt string, outs []ast.OutputClause) bool {
+	if len(outs) == 0 {
+		return false
+	}
+	for _, o := range outs {
+		if o.Into != nil {
+			return false
+		}
+	}
+	rw.note("the OUTPUT clause of a " + stmt + " returns its rows to the caller as a result set: it is dropped and the " + stmt + " is kept (a PostgreSQL procedure returns no result set)")
+	return true
 }
 
 // ---------------------------------------------------------------------------

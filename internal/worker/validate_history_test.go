@@ -85,3 +85,59 @@ func TestValidateChecksHistoryEdgeCases(t *testing.T) {
 	_, err = ora.validateChecks(decode(`{"tables":[],"history_tables":[{"source_table":"a","target_table":"a_history","row_end_col":"re"}]}`))
 	require.Error(t, err)
 }
+
+// SQL Server: the validate step counted nothing (tables is empty for a
+// multi-schema database and table_checks was not read). Each table is
+// now counted in its own source and target schema, the history table of
+// an emulated system-versioned table included.
+func TestValidateChecksSQLServerTableChecks(t *testing.T) {
+	src := &inspect.SourceSchema{Database: "db", Tables: []inspect.ObjectSnapshot{
+		{Name: "Employees", Schema: "dbo", Database: "db", Rows: 4},
+		{Name: "Order Details", Schema: "sales", Database: "db", Rows: 7},
+	}}
+	pg := &translate.Result{Plan: translate.SchemaPlan{Tables: []translate.PGTable{
+		{Schema: "dbo", Name: "employees", SourceSchema: "dbo", SourceName: "Employees", TSQLTemporal: &translate.PGTSQLTemporal{
+			RowStart: "valid_from", RowEnd: "valid_to",
+			HistorySchema: "dbo", HistoryTable: "employeeshistory",
+			HistorySourceSchema: "dbo", HistorySourceTable: "EmployeesHistory", CopyHistory: true,
+		}},
+		{Schema: "sales", Name: "order details", SourceSchema: "sales", SourceName: "Order Details"},
+		{Schema: "dbo", Name: "employeeshistory", SourceSchema: "dbo", SourceName: "EmployeesHistory"},
+	}}}
+	plan := planner.Build(src, pg, planner.BuildOptions{TargetSchema: "public", PreserveSourceSchemas: true})
+	var raw []byte
+	copies := map[string]map[string]any{}
+	for _, s := range plan.Steps {
+		switch s.Kind {
+		case "validate":
+			var err error
+			raw, err = json.Marshal(s.Payload)
+			require.NoError(t, err)
+		case "copy_table":
+			copies[s.Target] = s.Payload
+		}
+	}
+	require.NotNil(t, raw, "validate step expected")
+	// The history table is copied from the source history table.
+	require.Equal(t, "EmployeesHistory", copies["dbo.EmployeesHistory"]["table"])
+	require.Equal(t, "employeeshistory", copies["dbo.EmployeesHistory"]["target_table"])
+
+	var p validatePayload
+	require.NoError(t, json.Unmarshal(raw, &p))
+	d := &Deps{SourceDialect: dataxfer.SQLServerSource()}
+	checks, err := d.validateChecks(p)
+	require.NoError(t, err)
+	require.Len(t, checks, 3)
+	require.Equal(t, "SELECT COUNT_BIG(*) FROM [sales].[Order Details]", checks[1].src.CountQuery(checks[1].SourceSchema, checks[1].SourceTable))
+	require.Equal(t, "sales", checks[1].TargetSchema)
+	require.Equal(t, "order details", checks[1].TargetTable)
+	require.Equal(t, "EmployeesHistory", checks[2].SourceTable)
+	require.Equal(t, "employeeshistory", checks[2].TargetTable)
+
+	_, err = d.validateChecks(func() validatePayload {
+		var q validatePayload
+		require.NoError(t, json.Unmarshal([]byte(`{"tables":[],"table_checks":[{"source_table":"a","target_table":"a"}]}`), &q))
+		return q
+	}())
+	require.Error(t, err, "a table check without schemas")
+}

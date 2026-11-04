@@ -292,6 +292,11 @@ type CreateTrigger struct {
 	// (T-SQL's inserted / deleted pseudo-tables).
 	NewTable string
 	OldTable string
+	// FnSchema is the schema of the trigger function when it is not
+	// Schema (a shared helper, e.g. the tsql shim); FnArgs are its
+	// TG_ARGV arguments, rendered as string literals.
+	FnSchema string
+	FnArgs   []string
 }
 
 func (*CreateTrigger) pgNode()   {}

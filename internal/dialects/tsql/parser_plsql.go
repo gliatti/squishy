@@ -841,3 +841,29 @@ func (p *Parser) parseFetch() ast.PLStmt {
 	}
 	return fs
 }
+
+// ParseParamDecls parses a parameter-declaration list, the @params
+// argument of sp_executesql:
+//
+//	@a int, @b nvarchar(10) = N'x', @c int OUTPUT
+//
+// Each declaration has the shape of a procedure parameter (parseParam);
+// an empty list returns no parameter.
+func ParseParamDecls(src string) ([]ast.Param, ErrorList) {
+	p := newParser(src)
+	var out []ast.Param
+	if p.cur.Kind == TOK_EOF {
+		return nil, p.errs
+	}
+	for {
+		out = append(out, p.parseParam(true))
+		if !p.isPunct(",") {
+			break
+		}
+		p.advance()
+	}
+	if p.cur.Kind != TOK_EOF {
+		p.errorHere("unexpected token after the parameter declarations", "end of the declarations")
+	}
+	return out, p.errs
+}

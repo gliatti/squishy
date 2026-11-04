@@ -108,14 +108,6 @@ func CopyBatch(ctx context.Context, o CopyOpts) (int64, error) {
 		}
 		o.Columns = cols
 	}
-	if sd, ok := o.dialect().(selectExprDialect); ok {
-		d, err := sd.ForColumns(ctx, o.SourceDB, o.SrcSchema, o.SrcTable, o.Columns)
-		if err != nil {
-			return 0, err
-		}
-		o.SourceDialect = d
-	}
-
 	// Source-side columns (used in the Oracle/MySQL SELECT) keep their
 	// original case; PG-side columns need to match the names the translator
 	// emitted (all-caps Oracle idents get folded to lowercase).
@@ -124,10 +116,20 @@ func CopyBatch(ctx context.Context, o CopyOpts) (int64, error) {
 		pgCols[i] = normalizeDstIdent(o.dialect().Kind(), c)
 	}
 
-	// Introspect target types once for this batch — used to coerce values.
+	// Introspect target types once for this batch — used to coerce values
+	// (and to pick the server-side conversion of a column whose form
+	// depends on its PG type).
 	targetTypes, err := listTargetTypes(ctx, o.TargetPool, o.DstSchema, o.DstTable, pgCols)
 	if err != nil {
 		return 0, fmt.Errorf("target types: %w", err)
+	}
+
+	if sd, ok := o.dialect().(selectExprDialect); ok {
+		d, err := sd.ForColumns(ctx, o.SourceDB, o.SrcSchema, o.SrcTable, o.Columns, targetTypes)
+		if err != nil {
+			return 0, err
+		}
+		o.SourceDialect = d
 	}
 
 	if err := o.deleteTargetRange(ctx); err != nil {
@@ -199,9 +201,10 @@ func (o *CopyOpts) selectSource(ctx context.Context) (*sql.Rows, error) {
 // selectExprDialect is implemented by dialects that convert some column
 // types server-side in the batch SELECT (SQL Server CLR types). The
 // returned dialect renders those columns converted; quoting, kind and
-// catalog queries are unchanged.
+// catalog queries are unchanged. targetTypes runs parallel to cols: the
+// PG udt_name of each target column ("" when unknown).
 type selectExprDialect interface {
-	ForColumns(ctx context.Context, db *sql.DB, schema, table string, cols []string) (SourceDialect, error)
+	ForColumns(ctx context.Context, db *sql.DB, schema, table string, cols, targetTypes []string) (SourceDialect, error)
 }
 
 // keyedOffsetDialect is implemented by dialects whose OFFSET paging is
@@ -336,6 +339,11 @@ func coerce(v any, udt string) any {
 		return toPGInterval(v)
 	case "xml":
 		return toString(v)
+	case "geography", "geometry":
+		// PostGIS binary input: EWKB bytes (sridWKBToEWKB), sent as is.
+		if b, ok := v.([]byte); ok {
+			return b
+		}
 	}
 	// float4/float8/date/timestamp/timestamptz — passthrough
 	switch x := v.(type) {

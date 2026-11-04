@@ -199,12 +199,12 @@ func mapTSQLBuiltin(x *ast.TSQLType, caps Caps) typeResult {
 	case "GEOGRAPHY", "GEOMETRY":
 		pgName := strings.ToLower(x.Name)
 		if caps.HasPostGIS {
-			return typeResult{PG: pgName, Note: pgName + " → PostGIS " + pgName + " (copied as WKT; the SRID defaults to the PostGIS one)"}
+			return typeResult{PG: pgName, Note: pgName + " → PostGIS " + pgName + " (copied as EWKT: SRID and Z / M coordinates kept)"}
 		}
 		return typeResult{
 			PG:              "text",
 			Note:            pgName + " → text (PostGIS not installed on the target)",
-			Warning:         "spatial type " + pgName + " requires PostGIS: mapped to a text placeholder holding the WKT form",
+			Warning:         "spatial type " + pgName + " requires PostGIS: mapped to a text placeholder holding the EWKT form",
 			WarningSeverity: SeverityBlocking,
 			WarningKind:     tsqlWarnSpatial,
 		}

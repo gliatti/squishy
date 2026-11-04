@@ -6690,6 +6690,9 @@ func (t *translator) translateTSQLScript(stmts []ast.Stmt) {
 	for _, tr := range st.triggers {
 		t.translateTSQLTrigger(tr)
 	}
+	// After the triggers: the versioning trigger names are kept clear
+	// of theirs.
+	t.emitTSQLTemporal()
 	t.fillTSQLFKRefColumns()
 	t.applyTSQLComments()
 	t.reportUnusedGeneratedOverrides(st.overrideUsed)
@@ -6958,7 +6961,12 @@ func (t *translator) translateTSQLTable(s *ast.CreateTable) {
 	}
 
 	if s.SystemVersioned || len(s.Periods) > 0 {
-		t.tsqlTemporalTable(s, schema, name)
+		if tv := t.tsqlTemporalEmulation(s, srcSchema); tv != nil {
+			tbl.TSQLTemporal = tv
+			t.tsqlTemporalHidden(s, schema+"."+name)
+		} else {
+			t.tsqlTemporalTable(s, schema, name)
+		}
 	}
 
 	t.res.Plan.Tables = append(t.res.Plan.Tables, tbl)
@@ -7500,10 +7508,13 @@ func (t *translator) tsqlComputedColumn(tbl *PGTable, i int, s *ast.CreateTable,
 	if t.takeGeneratedOverride(tbl, i, ovTable, c.Name, obj, src, t.tsql.overrideUsed) {
 		return
 	}
+	// A non-PERSISTED column is computed on every read by SQL Server and
+	// a PG generated column on every write: for an expression proven
+	// immutable (same inputs, same value) both read the same value, so
+	// the proof below decides for both kinds alike.
+	kind := "PERSISTED computed column"
 	if c.Generated.Virtual {
-		t.copyRefusedGenerated(tbl, i, obj, src, "table.computed_not_generated",
-			"the T-SQL computed column "+obj+" is not PERSISTED: SQL Server computes it on every read. squishy only emits a PostgreSQL stored generated column for a PERSISTED column whose expression it proves immutable and identical")
-		return
+		kind = "non-PERSISTED computed column"
 	}
 	// The source half of the proof runs first: rewriters work in place
 	// (ast.Rewrite), the source tree is not intact afterwards.
@@ -7511,22 +7522,77 @@ func (t *translator) tsqlComputedColumn(tbl *PGTable, i int, s *ast.CreateTable,
 	expr := tsqlStripParens(c.Generated.Expr)
 	_, reason := p.source(expr)
 	rewritten := tsqlStripParens(t.tsqlDDLExpr(expr, ctx))
+	if reason == "" && p.concat {
+		rewritten = tsqlImmutableConcat(rewritten)
+	}
 	if reason == "" {
 		reason = p.target(rewritten)
 	}
 	if reason != "" {
 		t.copyRefusedGenerated(tbl, i, obj, src, "table.computed_not_generated",
-			"the expression of the PERSISTED computed column "+obj+" is not proven immutable and identical on PostgreSQL ("+reason+")")
+			"the expression of the T-SQL "+kind+" "+obj+" is not proven immutable and identical on PostgreSQL ("+reason+")")
 		return
 	}
 	col.Generated = &PGGenerated{Expr: pgast.WriteExpr(rewritten), Stored: true}
+	source, why := "AS ("+src+") PERSISTED", "PERSISTED computed column whose expression is proven immutable and identical on PostgreSQL: PG computes it on write, like SQL Server stores it."
+	if c.Generated.Virtual {
+		source = "AS (" + src + ")"
+		why = "non-PERSISTED computed column whose expression is proven immutable and identical on PostgreSQL: SQL Server computes it on read, PG on write (PostgreSQL 17 has only STORED generated columns); an immutable expression gives the same value either way."
+	}
 	t.res.Explanations = append(t.res.Explanations, Explanation{
 		Object: "table." + obj,
-		Source: "AS (" + src + ") PERSISTED",
+		Source: source,
 		Target: col.Type + " GENERATED ALWAYS AS (" + col.Generated.Expr + ") STORED",
-		Reason: "PERSISTED computed column whose expression is proven immutable and identical on PostgreSQL: PG computes it on write, like SQL Server stores it.",
+		Reason: why,
 		Level:  "info",
 	})
+}
+
+// tsqlImmutableConcat rewrites the concat() calls of a proven computed
+// column (tsqlComputedProof accepted their arguments) into the chain
+// coalesce(a::text, '') || …: PG's concat() is only STABLE (it calls
+// the output function of any argument type), so a generated column
+// cannot use it, while T-SQL CONCAT gives exactly that chain for text,
+// integer and decimal arguments (a NULL argument is the empty string).
+func tsqlImmutableConcat(e ast.Expr) ast.Expr {
+	out, ok := ast.Rewrite(e, func(n ast.Node) ast.Node {
+		fc, ok := n.(*ast.FuncCall)
+		if !ok || !strings.EqualFold(fc.Name, "concat") {
+			return n
+		}
+		var chain ast.Expr
+		for _, a := range fc.Args {
+			var op ast.Expr
+			switch x := unwrapParens(a).(type) {
+			case *ast.Literal:
+				switch x.Kind {
+				case "null":
+					continue
+				case "string":
+					op = x
+				}
+			}
+			if op == nil {
+				op = &ast.FuncCall{Name: "coalesce", Args: []ast.Expr{
+					mysqlGenCastText(a),
+					&ast.Literal{Kind: "string", Text: "", P: fc.P},
+				}, P: fc.P}
+			}
+			if chain == nil {
+				chain = op
+				continue
+			}
+			chain = &ast.BinaryExpr{Op: "||", Lhs: chain, Rhs: op, P: fc.P}
+		}
+		if chain == nil {
+			return &ast.Literal{Kind: "string", Text: "", P: fc.P}
+		}
+		return &ast.ParenExpr{Inner: chain, P: fc.P}
+	}).(ast.Expr)
+	if !ok {
+		return e
+	}
+	return out
 }
 
 // tsqlClass is the value class of a T-SQL expression, the granularity at
@@ -7616,6 +7682,9 @@ type tsqlComputedProof struct {
 	// textPlus is set when the source concatenates strings with `+`
 	// (the PG expression must then hold || instead).
 	textPlus bool
+	// concat is set when the source calls CONCAT (rewritten by
+	// tsqlImmutableConcat on the PG side).
+	concat bool
 }
 
 // source proves e on the T-SQL side and returns its class.
@@ -7762,6 +7831,23 @@ func (p *tsqlComputedProof) source(e ast.Expr) (tsqlClass, string) {
 		case "ABS":
 			if len(args) == 1 && tsqlNumericClass(args[0]) {
 				return args[0], ""
+			}
+		case "CONCAT":
+			// Each argument is converted to its string form (a NULL one
+			// to the empty string): the same text as ::text on PG for
+			// strings, integers and decimals. char(n) keeps its pad in
+			// T-SQL but loses it in a PG text cast; money, float, bit
+			// and temporal values print differently.
+			for i, c := range args {
+				switch c {
+				case tsqlClassText, tsqlClassInteger, tsqlClassNumeric, tsqlClassNull:
+				default:
+					return tsqlClassUnknown, "CONCAT argument " + pgast.WriteExpr(x.Args[i]) + " does not print the same text on PostgreSQL"
+				}
+			}
+			if len(args) > 0 {
+				p.concat = true
+				return tsqlClassText, ""
 			}
 		}
 		return tsqlClassUnknown, "function " + x.Name
@@ -8689,6 +8775,19 @@ func (t *translator) translateTSQLTrigger(s *ast.CreateTrigger) {
 		body, w, n := t.tsqlRoutineBody(rctx)
 		warnings = append(warnings, w...)
 		notes = append(notes, n...)
+		for ci, col := range tg.info.UpdatedColumns {
+			mark := tsqlUpdateMarkTrigger(tg.name, ci)
+			stmts = append(stmts, &pgast.CreateTrigger{
+				Name: mark, Timing: "AFTER", Events: []string{"UPDATE"}, UpdateOf: []string{col},
+				Schema: relSchema, Table: relName, ForEach: "STATEMENT",
+				FnSchema: "tsql", FnName: "mark_column_updated", FnArgs: []string{col},
+			})
+			t.res.Explanations = append(t.res.Explanations, Explanation{
+				Object: obj, Source: "UPDATE(" + col + ")", Target: "trigger " + mark + " AFTER UPDATE OF " + pgQuote(col) + " + tsql.take_column_updated()",
+				Reason: "PostgreSQL fires an UPDATE OF " + col + " trigger exactly when the UPDATE statement's SET list names " + col + ", T-SQL's rule for UPDATE(" + col + "). A trigger with transition tables cannot have a column list, so the helper statement-level trigger " + mark + " (named to fire before " + tg.name + ") marks the statement, and the translated body reads and clears the mark when it starts.",
+				Level:  "info",
+			})
+		}
 		stmts = append(stmts,
 			&pgast.CreateFunction{Schema: relSchema, Name: tg.fn, Returns: "trigger", Body: body},
 			&pgast.CreateTrigger{
@@ -8700,6 +8799,9 @@ func (t *translator) translateTSQLTrigger(s *ast.CreateTrigger) {
 	st.triggerRoutines[t.tableKey(relSchema, name)] = append(st.triggerRoutines[t.tableKey(relSchema, name)], len(t.res.Plan.Routines))
 	for _, tg := range trigs {
 		st.triggerNames[len(t.res.Plan.Routines)] = append(st.triggerNames[len(t.res.Plan.Routines)], tg.name)
+		for ci := range tg.info.UpdatedColumns {
+			st.triggerNames[len(t.res.Plan.Routines)] = append(st.triggerNames[len(t.res.Plan.Routines)], tsqlUpdateMarkTrigger(tg.name, ci))
+		}
 	}
 	t.res.Plan.Routines = append(t.res.Plan.Routines, PGRoutine{
 		Kind: "trigger", Schema: relSchema, Name: name, RawBody: s.Body,
