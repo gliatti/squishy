@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -99,7 +100,7 @@ func InspectSQLServer(ctx context.Context, db *sql.DB, database string, log zero
 	// --- views ---
 	if err := timings.Section("views", func(setCount func(int)) error {
 		out, err := ssListModules(ctx, db, database, log, "view", `
-			SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition
+			SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition, ISNULL(OBJECTPROPERTY(o.object_id, 'IsEncrypted'), 0)
 			  FROM sys.views o
 			  LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
 			 WHERE o.is_ms_shipped = 0
@@ -122,7 +123,7 @@ func InspectSQLServer(ctx context.Context, db *sql.DB, database string, log zero
 	// have no T-SQL definition and are skipped likewise.
 	if err := timings.Section("triggers", func(setCount func(int)) error {
 		out, err := ssListModules(ctx, db, database, log, "trigger", `
-			SELECT OBJECT_SCHEMA_NAME(tr.parent_id), tr.name, m.definition
+			SELECT OBJECT_SCHEMA_NAME(tr.parent_id), tr.name, m.definition, ISNULL(OBJECTPROPERTY(tr.object_id, 'IsEncrypted'), 0)
 			  FROM sys.triggers tr
 			  JOIN sys.sql_modules m ON m.object_id = tr.object_id
 			 WHERE tr.parent_class = 1 AND tr.is_ms_shipped = 0 AND tr.type = 'TR'
@@ -145,7 +146,7 @@ func InspectSQLServer(ctx context.Context, db *sql.DB, database string, log zero
 	// --- procedures (T-SQL only; CLR 'PC', extended 'X' are skipped) ---
 	if err := timings.Section("procedures", func(setCount func(int)) error {
 		out, err := ssListModules(ctx, db, database, log, "procedure", `
-			SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition
+			SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition, ISNULL(OBJECTPROPERTY(o.object_id, 'IsEncrypted'), 0)
 			  FROM sys.objects o
 			  LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
 			 WHERE o.type = 'P' AND o.is_ms_shipped = 0
@@ -169,7 +170,7 @@ func InspectSQLServer(ctx context.Context, db *sql.DB, database string, log zero
 	// table-valued (TF). CLR functions (FS, FT, AF) are skipped. ---
 	if err := timings.Section("functions", func(setCount func(int)) error {
 		out, err := ssListModules(ctx, db, database, log, "function", `
-			SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition
+			SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition, ISNULL(OBJECTPROPERTY(o.object_id, 'IsEncrypted'), 0)
 			  FROM sys.objects o
 			  LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
 			 WHERE o.type IN ('FN', 'IF', 'TF') AND o.is_ms_shipped = 0
@@ -279,18 +280,27 @@ func ssQueryRows(ctx context.Context, db *sql.DB, database, query string, scan f
 	})
 }
 
-// ssListModules reads (schema, name, definition) rows into snapshots. A
-// NULL definition is a WITH ENCRYPTION module: its text cannot be read,
-// so the snapshot only carries a comment and the log says so.
+// ssListModules reads (schema, name, definition, is_encrypted) rows into
+// snapshots. A NULL definition of a WITH ENCRYPTION module cannot be
+// read by anyone, so the snapshot only carries a comment and the log
+// says so; a NULL definition of any other module means the login lacks
+// VIEW DEFINITION on it, which fails the inspection (ssHidden) rather
+// than passing the module off as encrypted.
 func ssListModules(ctx context.Context, db *sql.DB, database string, log zerolog.Logger, kind, query string) ([]ObjectSnapshot, error) {
 	var out []ObjectSnapshot
+	hide := &ssHidden{}
 	err := ssQueryRows(ctx, db, database, query, func(rows *sql.Rows) error {
 		var schema, name string
 		var def sql.NullString
-		if err := rows.Scan(&schema, &name, &def); err != nil {
+		var encrypted int
+		if err := rows.Scan(&schema, &name, &def, &encrypted); err != nil {
 			return err
 		}
 		ddl := ssModuleDDL(def.String)
+		if !def.Valid && encrypted != 1 {
+			hide.add(0, kind+" "+schema+"."+name)
+			return nil
+		}
 		if !def.Valid {
 			log.Warn().Str("dialect", "sqlserver").Str("kind", kind).
 				Str("object", schema+"."+name).Msg("encrypted module: definition not readable, skipped")
@@ -299,6 +309,9 @@ func ssListModules(ctx context.Context, db *sql.DB, database string, log zerolog
 		out = append(out, ObjectSnapshot{Name: name, Schema: schema, Database: database, DDL: ddl})
 		return nil
 	})
+	if err == nil {
+		err = hide.err(database, nil)
+	}
 	return out, err
 }
 
@@ -559,6 +572,8 @@ func ssLoadCatalog(ctx context.Context, db *sql.DB, database string, log zerolog
 		fulltext  = map[int64]bool{}
 	)
 
+	hide := &ssHidden{}
+
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(inspectSQLServerConcurrency)
 
@@ -571,8 +586,8 @@ func ssLoadCatalog(ctx context.Context, db *sql.DB, database string, log zerolog
 			       ISNULL(CAST(ic.seed_value AS nvarchar(64)), ''),
 			       ISNULL(CAST(ic.increment_value AS nvarchar(64)), ''),
 			       c.is_rowguidcol, c.is_sparse,
-			       c.is_computed, ISNULL(cc.definition, ''), ISNULL(cc.is_persisted, 0),
-			       ISNULL(dc.name, ''), ISNULL(dc.definition, ''),
+			       c.is_computed, cc.definition, ISNULL(cc.is_persisted, 0),
+			       ISNULL(dc.name, ''), dc.definition,
 			       c.generated_always_type, c.is_hidden
 			  FROM sys.columns c
 			  JOIN sys.types ty ON ty.user_type_id = c.user_type_id
@@ -583,15 +598,23 @@ func ssLoadCatalog(ctx context.Context, db *sql.DB, database string, log zerolog
 			 ORDER BY c.object_id, c.column_id`, func(rows *sql.Rows) error {
 			var r colRow
 			c := &r.col
+			var computedDef, defaultDef sql.NullString
 			if err := rows.Scan(&r.obj, &c.ID, &c.Name,
 				&c.Type.Name, &c.Type.Schema, &c.Type.UserDefined,
 				&c.Type.MaxLength, &c.Type.Precision, &c.Type.Scale, &c.Nullable,
 				&c.Identity, &c.Seed, &c.Increment,
 				&c.RowGUID, &c.Sparse,
-				&c.Computed, &c.ComputedDef, &c.Persisted,
-				&c.DefaultName, &c.DefaultDef,
+				&c.Computed, &computedDef, &c.Persisted,
+				&c.DefaultName, &defaultDef,
 				&c.GeneratedAlways, &c.Hidden); err != nil {
 				return err
+			}
+			c.ComputedDef, c.DefaultDef = computedDef.String, defaultDef.String
+			if c.Computed && !computedDef.Valid {
+				hide.add(r.obj, "computed column "+c.Name)
+			}
+			if c.DefaultName != "" && !defaultDef.Valid {
+				hide.add(r.obj, "default "+c.DefaultName)
 			}
 			cols = append(cols, r)
 			return nil
@@ -663,8 +686,13 @@ func ssLoadCatalog(ctx context.Context, db *sql.DB, database string, log zerolog
 			 WHERE parent_object_id IN `+ssObjectFilter+`
 			 ORDER BY parent_object_id, name`, func(rows *sql.Rows) error {
 			var r checkRow
-			if err := rows.Scan(&r.obj, &r.check.Name, &r.check.Def); err != nil {
+			var def sql.NullString
+			if err := rows.Scan(&r.obj, &r.check.Name, &def); err != nil {
 				return err
+			}
+			r.check.Def = def.String
+			if !def.Valid {
+				hide.add(r.obj, "check constraint "+r.check.Name)
 			}
 			checks = append(checks, r)
 			return nil
@@ -680,7 +708,7 @@ func ssLoadCatalog(ctx context.Context, db *sql.DB, database string, log zerolog
 		// order (key_ordinal is 0 for them).
 		err := ssQueryRows(gctx, db, database, `
 			SELECT i.object_id, i.index_id, i.name, i.type, i.type_desc, i.is_unique,
-			       ISNULL(i.filter_definition, ''),
+			       i.has_filter, i.filter_definition,
 			       col.name, ic.is_descending_key, ic.is_included_column
 			  FROM sys.indexes i
 			  JOIN sys.tables t ON t.object_id = i.object_id AND t.is_ms_shipped = 0
@@ -690,9 +718,15 @@ func ssLoadCatalog(ctx context.Context, db *sql.DB, database string, log zerolog
 			   AND i.is_hypothetical = 0
 			 ORDER BY i.object_id, i.index_id, ic.is_included_column, ic.key_ordinal, ic.index_column_id`, func(rows *sql.Rows) error {
 			var r idxRow
+			var hasFilter bool
+			var filter sql.NullString
 			if err := rows.Scan(&r.obj, &r.idxID, &r.idx.Name, &r.idx.Type, &r.idx.TypeDesc, &r.idx.Unique,
-				&r.idx.Filter, &r.col, &r.desc, &r.incl); err != nil {
+				&hasFilter, &filter, &r.col, &r.desc, &r.incl); err != nil {
 				return err
+			}
+			r.idx.Filter = filter.String
+			if hasFilter && !filter.Valid {
+				hide.add(r.obj, "filter of index "+r.idx.Name)
 			}
 			idxs = append(idxs, r)
 			return nil
@@ -838,6 +872,9 @@ func ssLoadCatalog(ctx context.Context, db *sql.DB, database string, log zerolog
 	})
 
 	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := hide.err(database, byID); err != nil {
 		return nil, err
 	}
 
@@ -1368,4 +1405,57 @@ func ssSequenceNext(q ssSequence) (string, string) {
 		return maxV.String(), ""
 	}
 	return cur.String(), "exhausted on the source (current value " + cur.String() + " is its bound)"
+}
+
+// ---------------------------------------------------------------------------
+// Definitions the login cannot see
+// ---------------------------------------------------------------------------
+
+// ssHidden collects the catalog definitions that read as NULL although
+// the object has one: SQL Server returns NULL for sys.check_constraints /
+// default_constraints / computed_columns / indexes.filter_definition and
+// sys.sql_modules.definition when the login lacks VIEW DEFINITION on the
+// object (a db_datareader-only migration login). Read as empty strings
+// they would silently drop defaults and index filters, render computed
+// columns as `AS ()` and modules as encrypted: inspection fails instead,
+// naming them and the missing permission. Loaders run concurrently.
+type ssHidden struct {
+	mu    sync.Mutex
+	items []ssHiddenItem
+}
+
+type ssHiddenItem struct {
+	obj  int64  // owning table's object_id (0: a module, named in what)
+	what string // "default DF_x", "check constraint CK_y", "view dbo.v", …
+}
+
+func (h *ssHidden) add(obj int64, what string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.items = append(h.items, ssHiddenItem{obj: obj, what: what})
+}
+
+// err returns the inspection error listing the hidden definitions (at
+// most 10, then a count), nil when there is none.
+func (h *ssHidden) err(database string, byID map[int64]*ssTable) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.items) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(h.items))
+	for _, it := range h.items {
+		name := it.what
+		if t := byID[it.obj]; t != nil {
+			name += " of " + t.Schema + "." + t.Name
+		}
+		names = append(names, name)
+	}
+	more := ""
+	if len(names) > 10 {
+		more = fmt.Sprintf(" and %d more", len(names)-10)
+		names = names[:10]
+	}
+	return fmt.Errorf("sqlserver: the login cannot read the definition of %s%s in database %s (SQL Server returns NULL without VIEW DEFINITION): GRANT VIEW DEFINITION ON DATABASE::%s TO the migration login, then inspect again",
+		strings.Join(names, ", "), more, database, ssQuoteIdent(database))
 }

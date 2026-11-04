@@ -164,7 +164,7 @@ func TestSQLServerSelectExprs(t *testing.T) {
 		map[string]string{"DocumentNode": "hierarchyid", "Title": "nvarchar", "v": "sql_variant",
 			"Shape": "geometry", "Loc]x": "geography"}, nil)
 	require.Equal(t,
-		"SELECT CAST([DocumentNode] AS nvarchar(4000)) AS [DocumentNode],[Title],CAST([v] AS nvarchar(4000)) AS [v],"+
+		"SELECT CAST([DocumentNode] AS nvarchar(4000)) AS [DocumentNode],[Title],"+sqlserverVariantText("[v]")+" AS [v],"+
 			"N'SRID=' + CAST([Shape].STSrid AS nvarchar(11)) + N';' + [Shape].AsTextZM() AS [Shape],N'SRID=' + CAST([Loc]]x].STSrid AS nvarchar(11)) + N';' + [Loc]]x].AsTextZM() AS [Loc]]x] FROM [Production].[Document]"+
 			" ORDER BY [Production].[Document].[DocumentNode] OFFSET @p1 ROWS FETCH NEXT @p2 ROWS ONLY",
 		d.SelectOffsetOrderedQuery("Production", "Document",
@@ -206,4 +206,17 @@ func TestSQLServerSpatialForPostGIS(t *testing.T) {
 	require.Equal(t, []byte{0x00, 0x20, 0x00, 0x03, 0xE9, 0, 0, 0, 0, 1, 2, 3}, coerceFrom("sqlserver", be, "geometry"))
 	// Text placeholder: the EWKT string passes through.
 	require.Equal(t, "SRID=0;POINT (1 2)", coerceFrom("sqlserver", "SRID=0;POINT (1 2)", "text"))
+}
+
+// A SQL Server table without primary key is paged over a unique,
+// unfiltered index when it has one.
+func TestSQLServerUniqueKeyQuery(t *testing.T) {
+	ud, ok := SQLServerSource().(uniqueKeyDialect)
+	require.True(t, ok)
+	q := ud.UniqueKeyColumnsQuery()
+	for _, frag := range []string{"OBJECT_ID(QUOTENAME(@p1) + '.' + QUOTENAME(@p2))", "i.is_unique = 1", "i.has_filter = 0", "i.is_disabled = 0", "ORDER BY ic.key_ordinal"} {
+		require.Contains(t, q, frag)
+	}
+	_, ok = MySQLSource().(uniqueKeyDialect)
+	require.False(t, ok)
 }

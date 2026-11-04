@@ -5,12 +5,16 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // ast_only_guard_test.go — enforces the CLAUDE.md "No regex anywhere —
@@ -68,14 +72,17 @@ var astOnlyForbiddenIdents = map[string]bool{
 // relative to internal/translate.
 var astOnlyForbiddenFiles = []string{"body_rewrite.go", "routine_body.go"}
 
-// astOnlyGuardDirs maps each directory scanned by the repo-level guard
-// (relative to this package's directory) to the logical path used in
-// the violation report and by check (b).
-var astOnlyGuardDirs = []struct{ fsDir, logical string }{
-	{".", astOnlyTranslateDir},
-	{"../planner", "internal/planner"},
-	{"../worker", "internal/worker"},
-	{"../httpapi", "internal/httpapi"},
+// astOnlyGuardRoots are the trees scanned by the repo-level guard, walked
+// recursively (relative to this package's directory), with the logical
+// path of each root used in the violation report and by check (b). Check
+// (a) holds for every package of the repository: CLAUDE.md forbids regex
+// in discovery, inspection, copy and connection code as much as in the
+// translator, and a new package is covered without being listed.
+var astOnlyGuardRoots = []struct{ fsDir, logical string }{
+	{"..", "internal"},
+	{"../../cmd", "cmd"},
+	{"../../pkg", "pkg"},
+	{"../../mcp-server", "mcp-server"},
 }
 
 // checkASTOnly runs checks (a), (b) and (c) over fsys, a map of logical
@@ -178,26 +185,47 @@ func checkASTOnly(fsys map[string]string) []string {
 	return out
 }
 
-// loadASTOnlyGuardSources reads every non-test .go file of the guarded
-// directories into a checkASTOnly input map keyed by logical path.
+// loadASTOnlyGuardSources reads every non-test .go file under the guarded
+// roots (testdata and vendor trees aside) into a checkASTOnly input map
+// keyed by logical path. internal must be there; the other roots are
+// skipped when the checkout has none.
 func loadASTOnlyGuardSources(t *testing.T) map[string]string {
 	t.Helper()
 	fsys := map[string]string{}
-	for _, d := range astOnlyGuardDirs {
-		entries, err := os.ReadDir(d.fsDir)
-		if err != nil {
-			t.Fatalf("read dir %s: %v", d.fsDir, err)
-		}
-		for _, e := range entries {
-			n := e.Name()
-			if e.IsDir() || path.Ext(n) != ".go" || strings.HasSuffix(n, "_test.go") {
+	for _, d := range astOnlyGuardRoots {
+		if _, err := os.Stat(d.fsDir); err != nil {
+			if os.IsNotExist(err) && d.logical != "internal" {
 				continue
 			}
-			b, err := os.ReadFile(path.Join(d.fsDir, n))
+			t.Fatalf("stat %s: %v", d.fsDir, err)
+		}
+		err := filepath.WalkDir(d.fsDir, func(p string, e fs.DirEntry, err error) error {
 			if err != nil {
-				t.Fatalf("read %s: %v", path.Join(d.fsDir, n), err)
+				return err
 			}
-			fsys[path.Join(d.logical, n)] = string(b)
+			n := e.Name()
+			if e.IsDir() {
+				if n == "testdata" || n == "vendor" || n == "node_modules" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if path.Ext(n) != ".go" || strings.HasSuffix(n, "_test.go") {
+				return nil
+			}
+			rel, err := filepath.Rel(d.fsDir, p)
+			if err != nil {
+				return err
+			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			fsys[path.Join(d.logical, filepath.ToSlash(rel))] = string(b)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", d.fsDir, err)
 		}
 	}
 	return fsys
@@ -411,5 +439,23 @@ func TestASTOnlyGuard_RepoIsClean(t *testing.T) {
 	violations := checkASTOnlyRepo(t)
 	if len(violations) != 0 {
 		t.Fatalf("AST-only rule violated (%d):\n%s", len(violations), strings.Join(violations, "\n"))
+	}
+}
+
+// Check (a) covers every package, not only the translation pipeline:
+// the SQL Server discovery, inspection, copy and connection code are
+// loaded too (CLAUDE.md forbids regex there as well).
+func TestASTOnlyGuard_CoversEveryPackage(t *testing.T) {
+	fsys := loadASTOnlyGuardSources(t)
+	for _, f := range []string{
+		"internal/inspect/sqlserver.go",
+		"internal/discover/sqlserver.go",
+		"internal/dataxfer/source_dialect.go",
+		"internal/connection/types.go",
+		"internal/dialects/tsql/parser.go",
+		"internal/translate/tsql_visitors.go",
+		"cmd/squishy/main.go",
+	} {
+		require.Contains(t, fsys, f)
 	}
 }

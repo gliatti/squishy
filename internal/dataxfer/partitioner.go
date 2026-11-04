@@ -73,6 +73,27 @@ func BuildPartitionPlan(ctx context.Context, db *sql.DB, d SourceDialect, schema
 
 	// fallback: OFFSET/LIMIT
 	pp.RangeKind = "offset"
+	if _, keyed := d.(keyedOffsetDialect); keyed && len(pp.PK) == 0 {
+		// SQL Server pages OFFSET batches in key order. A heap with
+		// neither primary key nor unique index has no order two batch
+		// SELECTs agree on (a parallel plan or a shared scan may return
+		// the rows differently each time): rows would be copied twice
+		// or never, unseen by the COUNT(*) validation. One batch reads
+		// the whole table in a single SELECT instead.
+		key, err := sourceOrderKey(ctx, db, d, schema, table)
+		if err != nil {
+			return nil, fmt.Errorf("order key: %w", err)
+		}
+		if len(key) == 0 {
+			pp.Ranges = []Range{{
+				Seq:      0,
+				Low:      map[string]any{"offset": int64(0)},
+				High:     map[string]any{"limit": pp.TotalRows},
+				RowCount: pp.TotalRows,
+			}}
+			return pp, nil
+		}
+	}
 	n := int((pp.TotalRows + int64(batchSize) - 1) / int64(batchSize))
 	for i := 0; i < n; i++ {
 		off := int64(i) * int64(batchSize)

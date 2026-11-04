@@ -93,9 +93,25 @@ func normalizeDstIdent(kind, s string) string {
 // The translator's identifier fold for the sqlserver kind must stay in
 // lockstep with this (strings.ToLower, i.e. Unicode simple case
 // mapping). It applies to a single identifier, never to SQL text.
+//
+// The result is cut to PostgreSQL's 63 bytes on a rune boundary, as PG
+// truncates a longer identifier in DDL (SQL Server allows 128
+// characters): the copier's catalog lookups (listTargetTypes) and COPY
+// column list then name what PG stored.
 func FoldSQLServerIdent(s string) string {
-	return strings.ToLower(s)
+	out := strings.ToLower(s)
+	if len(out) <= pgMaxIdentBytes {
+		return out
+	}
+	n := pgMaxIdentBytes
+	for n > 0 && !utf8.RuneStart(out[n]) {
+		n--
+	}
+	return out[:n]
 }
+
+// pgMaxIdentBytes is PostgreSQL's identifier length limit (NAMEDATALEN-1).
+const pgMaxIdentBytes = 63
 
 // CopyBatch streams the rows matching the given range from MySQL into PG.
 // It introspects the PG target column types, DELETEs the target range first
@@ -224,11 +240,13 @@ func (o *CopyOpts) offsetQuery(ctx context.Context, d SourceDialect) (string, er
 	if !ok {
 		return d.SelectOffsetQuery(o.SrcSchema, o.SrcTable, o.Columns), nil
 	}
-	pk, err := sourcePKColumns(ctx, o.SourceDB, d, o.SrcSchema, o.SrcTable)
+	pk, err := sourceOrderKey(ctx, o.SourceDB, d, o.SrcSchema, o.SrcTable)
 	if err != nil {
-		return "", fmt.Errorf("pk cols: %w", err)
+		return "", fmt.Errorf("order key: %w", err)
 	}
 	if len(pk) == 0 {
+		// No key orders the rows: the partitioner made this the table's
+		// only batch (BuildPartitionPlan), which needs no order.
 		return d.SelectOffsetQuery(o.SrcSchema, o.SrcTable, o.Columns), nil
 	}
 	return kd.SelectOffsetOrderedQuery(o.SrcSchema, o.SrcTable, o.Columns, pk), nil

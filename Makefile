@@ -124,16 +124,15 @@ test: check-no-regex ## Run unit tests (dockerized)
 
 # Guard rail introduced after the SQL-translation pipeline was de-regex'ed
 # (PR2–PR6: byte-walks, AST extensions, structured DML parsers and a typed
-# Postgres writer). New regexp.MustCompile calls inside internal/translate
-# or internal/dialects regress the project back toward the brittle text
-# rewriting we worked to remove — fail the test target rather than letting
-# them slip in silently. Local helpers like httpapi/projects.go (slug
-# regex, hors chaîne SQL) and planner/planner.go (dependency analysis on
-# raw routine bodies, AST'ifié dans une PR ultérieure) sont volontairement
-# en dehors de la portée surveillée.
-check-no-regex: ## Fail when regexp.MustCompile reappears in the SQL translation pipeline
+# Postgres writer). CLAUDE.md forbids regex everywhere — discovery,
+# inspection, copy and connection code as much as the translator: a
+# regexp.MustCompile or a "regexp" import anywhere in the Go tree fails the
+# test target rather than slipping in silently.
+# internal/translate/ast_only_guard_test.go checks the same rule on the
+# parsed imports of every package (its own test cases are excluded here).
+check-no-regex: ## Fail when regexp reappears anywhere in the Go code
 	@hits=$$(grep -rn 'regexp\.MustCompile\|"regexp"' --include='*.go' \
-	  internal/translate internal/dialects 2>/dev/null || true); \
+	  --exclude='ast_only_guard_test.go' internal cmd mcp-server 2>/dev/null || true); \
 	if [ -n "$$hits" ]; then \
 	  echo "regex regression in SQL translation pipeline:"; \
 	  echo "$$hits"; \

@@ -16,6 +16,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,5 +100,72 @@ func TestSQLServerLive(t *testing.T) {
 		r.Close()
 		require.Positive(t, n, tb.s+"."+tb.n)
 		t.Logf("%s.%s: %s, first batch %d rows, %d cols", tb.s, tb.n, plan.RangeKind, n, len(cols))
+	}
+}
+
+// A table without primary key nor unique index (the fixture's
+// system-versioned history table) is copied in one batch: no key orders
+// its rows the same way in two OFFSET SELECTs.
+func TestSQLServerLiveHeap(t *testing.T) {
+	port, _ := strconv.Atoi(liveEnv("SQUISHY_SQLSERVER_PORT", "1433"))
+	p := connection.Params{
+		Kind: "sqlserver", Host: liveEnv("SQUISHY_SQLSERVER_HOST", "sqlserver-sample"), Port: port,
+		Database: "squishy_sample", Username: "sa",
+		Password: liveEnv("SQUISHY_SQLSERVER_PASSWORD", "Squishy_2026x"), SSLMode: "disable",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	db, err := connection.OpenSQLServer(ctx, p)
+	require.NoError(t, err)
+	defer db.Close()
+	d := SQLServerSource()
+	plan, err := BuildPartitionPlan(ctx, db, d, "dbo", "EmployeesHistory", 1)
+	require.NoError(t, err)
+	require.Equal(t, "offset", plan.RangeKind)
+	require.Len(t, plan.Ranges, 1)
+	require.Equal(t, plan.TotalRows, plan.Ranges[0].High["limit"])
+	key, err := sourceOrderKey(ctx, db, d, "dbo", "EmployeesHistory")
+	require.NoError(t, err)
+	require.Empty(t, key)
+	// A table with a primary key is unchanged.
+	key, err = sourceOrderKey(ctx, db, d, "dbo", "Employees")
+	require.NoError(t, err)
+	require.NotEmpty(t, key)
+}
+
+// sql_variant values are read as the lossless text of their base type.
+func TestSQLServerLiveVariant(t *testing.T) {
+	port, _ := strconv.Atoi(liveEnv("SQUISHY_SQLSERVER_PORT", "1433"))
+	p := connection.Params{
+		Kind: "sqlserver", Host: liveEnv("SQUISHY_SQLSERVER_HOST", "sqlserver-sample"), Port: port,
+		Database: "master", Username: "sa",
+		Password: liveEnv("SQUISHY_SQLSERVER_PASSWORD", "Squishy_2026x"), SSLMode: "disable",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	db, err := connection.OpenSQLServer(ctx, p)
+	require.NoError(t, err)
+	defer db.Close()
+	cases := []struct{ value, want string }{
+		{"CAST('2024-05-01 13:45:12.347' AS datetime)", "2024-05-01T13:45:12.347"},
+		{"CAST('2024-05-01 13:45:12.1234567' AS datetime2(7))", "2024-05-01T13:45:12.1234567"},
+		{"CAST('2024-05-01 13:45:12 +02:00' AS datetimeoffset(0))", "2024-05-01T13:45:12+02:00"},
+		{"CAST('2024-05-01' AS date)", "2024-05-01"},
+		{"CAST(3.14159265358979 AS float)", "3.1415926535897900e+000"},
+		{"CAST(12.3456 AS money)", "12.3456"},
+		{"CAST(0x4142 AS varbinary(10))", "0x4142"},
+		{"CAST(REPLICATE(CAST('x' AS varchar(max)), 6000) AS varchar(8000))", strings.Repeat("x", 6000)},
+		{"CAST(N'été' AS nvarchar(10))", "été"},
+		{"CAST('ab' AS char(4))", "ab  "},
+		{"CAST(12.50 AS decimal(5,2))", "12.50"},
+	}
+	for _, c := range cases {
+		var got string
+		// A table, not a constant: SQL Server folds constants through
+		// every CASE branch, which a column value never meets.
+		q := "SET NOCOUNT ON; DECLARE @t TABLE ([x] sql_variant); INSERT INTO @t VALUES (CAST(" + c.value + " AS sql_variant)); SELECT " + sqlserverVariantText("[x]") + " FROM @t"
+		require.NoError(t, db.QueryRowContext(ctx, q).Scan(&got), c.value)
+		require.Equal(t, len(c.want), len(got), c.value)
+		require.True(t, c.want == got, "%s: got %.80q", c.value, got)
 	}
 }

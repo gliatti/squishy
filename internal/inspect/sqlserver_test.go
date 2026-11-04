@@ -270,3 +270,23 @@ func TestSSModuleDDL(t *testing.T) {
 	require.Equal(t, "CREATE VIEW v AS SELECT 1\n", ssModuleDDL("CREATE VIEW v AS SELECT 1\n"))
 	require.Equal(t, "", ssModuleDDL(""))
 }
+
+// Definitions the login cannot read (NULL without VIEW DEFINITION) fail
+// the inspection with the objects and the grant to issue, instead of
+// dropping defaults or passing modules off as encrypted.
+func TestSSHiddenDefinitions(t *testing.T) {
+	h := &ssHidden{}
+	require.NoError(t, h.err("AdventureWorks", nil))
+	byID := map[int64]*ssTable{7: {Schema: "Sales", Name: "Orders"}}
+	h.add(7, "default DF_Orders_Status")
+	h.add(0, "view dbo.vOrders")
+	err := h.err("AdventureWorks", byID)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "default DF_Orders_Status of Sales.Orders")
+	require.Contains(t, err.Error(), "view dbo.vOrders")
+	require.Contains(t, err.Error(), "GRANT VIEW DEFINITION ON DATABASE::[AdventureWorks]")
+	for i := 0; i < 12; i++ {
+		h.add(0, "procedure dbo.p")
+	}
+	require.Contains(t, h.err("AdventureWorks", byID).Error(), "and 4 more")
+}

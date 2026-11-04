@@ -148,14 +148,21 @@ func OpenDB2(ctx context.Context, p Params) (*sql.DB, error) {
 //	sqlserver://user:pass@host:port?database=X&encrypt=disable
 //
 // url.UserPassword escapes the credentials (SA passwords routinely carry
-// `@`, `#`, `%`). SSLMode maps onto the driver's TLS knobs: "disable"
-// turns TLS off, "require" asks for an encrypted, verified channel, and
-// anything else (empty included) keeps the driver's default negotiation
-// but trusts the server certificate — the sample containers and most
-// on-premise instances present a self-signed one. Extra entries are
-// passed through as query parameters and win over the SSLMode mapping,
-// so a connection can still set e.g. `encrypt=strict` or a
-// `hostNameInCertificate` explicitly.
+// `@`, `#`, `%`). SSLMode maps onto the driver's TLS knobs:
+//
+//   - "disable": TLS off (the sample containers, a trusted network);
+//   - "require", "verify-ca", "verify-full": an encrypted channel whose
+//     server certificate is verified;
+//   - "prefer", "allow": the driver's negotiation, trusting whatever
+//     certificate the server presents (a self-signed one, as most
+//     on-premise instances have) — an explicit opt-in, since the login
+//     (password included) then goes to a server nobody authenticated;
+//   - anything else, empty included: the driver's default negotiation
+//     with the certificate verified. Never trust-anything by default.
+//
+// Extra entries are passed through as query parameters and win over the
+// SSLMode mapping, so a connection can still set e.g. `encrypt=strict`,
+// `TrustServerCertificate=true` or a `hostNameInCertificate` explicitly.
 func (p Params) SQLServerDSN() string {
 	q := url.Values{}
 	if p.Database != "" {
@@ -164,9 +171,9 @@ func (p Params) SQLServerDSN() string {
 	switch p.SSLMode {
 	case "disable":
 		q.Set("encrypt", "disable")
-	case "require":
+	case "require", "verify-ca", "verify-full":
 		q.Set("encrypt", "true")
-	default:
+	case "prefer", "allow":
 		q.Set("TrustServerCertificate", "true")
 	}
 	for k, v := range p.Extra {

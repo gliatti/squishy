@@ -416,8 +416,10 @@ func (d sqlserverDialect) Qualify(schema, name string) string {
 // type is selected as is. The conversion keeps the column name (AS [col]).
 func sqlserverSelectExpr(quoted, dataType, targetUDT string) string {
 	switch strings.ToLower(dataType) {
-	case "hierarchyid", "sql_variant":
+	case "hierarchyid":
 		return "CAST(" + quoted + " AS nvarchar(4000)) AS " + quoted
+	case "sql_variant":
+		return sqlserverVariantText(quoted) + " AS " + quoted
 	case "geography", "geometry":
 		if targetUDT == "geography" || targetUDT == "geometry" {
 			return "CAST(" + quoted + ".STSrid AS binary(4)) + " + quoted + ".AsBinaryZM() AS " + quoted
@@ -648,4 +650,95 @@ func sourcePKColumns(ctx context.Context, db *sql.DB, d SourceDialect, schema, t
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// uniqueKeyDialect is implemented by the keyed-OFFSET dialects that can
+// order a table without primary key by one of its unique indexes.
+type uniqueKeyDialect interface {
+	// UniqueKeyColumnsQuery lists, in key order, the columns of a unique,
+	// unfiltered, enabled index of schema.table (@p1, @p2); no row when
+	// the table has none.
+	UniqueKeyColumnsQuery() string
+}
+
+// UniqueKeyColumnsQuery picks the first unique index (a UNIQUE constraint
+// is one) that covers every row — not filtered, not disabled, rowstore —
+// of a table without primary key. Its key orders the rows totally under
+// the index collation (two rows the collation calls equal cannot both be
+// in a unique index), so OFFSET pages over it are disjoint and complete.
+func (sqlserverDialect) UniqueKeyColumnsQuery() string {
+	return `
+		SELECT c.name
+		  FROM sys.index_columns ic
+		  JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+		 WHERE ic.object_id = OBJECT_ID(QUOTENAME(@p1) + '.' + QUOTENAME(@p2))
+		   AND ic.key_ordinal > 0
+		   AND ic.index_id = (
+		         SELECT TOP 1 i.index_id FROM sys.indexes i
+		          WHERE i.object_id = ic.object_id AND i.is_unique = 1
+		            AND i.has_filter = 0 AND i.is_disabled = 0 AND i.type IN (1, 2)
+		          ORDER BY i.index_id)
+		 ORDER BY ic.key_ordinal`
+}
+
+// sourceOrderKey returns the columns that order every row of a source
+// table for keyed OFFSET paging: its primary key, else (uniqueKeyDialect)
+// the key of a unique index; nil when there is neither.
+func sourceOrderKey(ctx context.Context, db *sql.DB, d SourceDialect, schema, table string) ([]string, error) {
+	pk, err := sourcePKColumns(ctx, db, d, schema, table)
+	if err != nil || len(pk) > 0 {
+		return pk, err
+	}
+	ud, ok := d.(uniqueKeyDialect)
+	if !ok {
+		return nil, nil
+	}
+	rows, err := db.QueryContext(ctx, ud.UniqueKeyColumnsQuery(), schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// sqlserverVariantText renders a sql_variant column as the lossless text
+// of its value, chosen by its base type (SQL_VARIANT_PROPERTY): a plain
+// CAST to nvarchar uses style 0, which drops the seconds of a datetime
+// ('May  1 2024  1:45PM'), keeps 6 digits of a float and 2 decimals of a
+// money, and reads binary bytes as characters. Each branch first casts
+// the variant to its base type, then converts it with the style that
+// keeps every digit: ISO 8601 (126) for date/times, 17 significant
+// digits (3) for float / real, 4 decimals (2) for money, 0x… hex (1) for
+// binary; other types (strings, integers, decimals, uniqueidentifier)
+// convert exactly with a CAST to nvarchar(max), which also never cuts a
+// string past 4000 characters.
+func sqlserverVariantText(quoted string) string {
+	base := "CAST(SQL_VARIANT_PROPERTY(" + quoted + ", 'BaseType') AS sysname)"
+	conv := func(typ, style string) string {
+		return "CONVERT(nvarchar(max), CAST(" + quoted + " AS " + typ + "), " + style + ")"
+	}
+	return "CASE " + base +
+		" WHEN 'datetime' THEN " + conv("datetime", "126") +
+		" WHEN 'smalldatetime' THEN " + conv("smalldatetime", "126") +
+		" WHEN 'datetime2' THEN " + conv("datetime2(7)", "126") +
+		" WHEN 'datetimeoffset' THEN " + conv("datetimeoffset(7)", "126") +
+		" WHEN 'date' THEN " + conv("date", "23") +
+		" WHEN 'time' THEN CAST(CAST(" + quoted + " AS time(7)) AS nvarchar(max))" +
+		" WHEN 'float' THEN " + conv("float", "3") +
+		" WHEN 'real' THEN " + conv("real", "3") +
+		" WHEN 'money' THEN " + conv("money", "2") +
+		" WHEN 'smallmoney' THEN " + conv("smallmoney", "2") +
+		" WHEN 'binary' THEN " + conv("varbinary(8000)", "1") +
+		" WHEN 'varbinary' THEN " + conv("varbinary(8000)", "1") +
+		" WHEN 'varchar' THEN CAST(CAST(" + quoted + " AS varchar(8000)) AS nvarchar(max))" +
+		" WHEN 'char' THEN CAST(CAST(" + quoted + " AS varchar(8000)) AS nvarchar(max))" +
+		" ELSE CAST(" + quoted + " AS nvarchar(max)) END"
 }

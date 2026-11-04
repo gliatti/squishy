@@ -47,9 +47,20 @@ func TestSQLServerDSN(t *testing.T) {
 			query: map[string]string{"database": "Northwind", "encrypt": "true"},
 		},
 		{
-			name:  "default trusts the server certificate",
-			p:     Params{},
+			name:  "verify-full verifies",
+			p:     Params{SSLMode: "verify-full"},
+			query: map[string]string{"database": "Northwind", "encrypt": "true"},
+		},
+		{
+			// Trusting any certificate is an explicit opt-in.
+			name:  "prefer trusts the server certificate",
+			p:     Params{SSLMode: "prefer"},
 			query: map[string]string{"database": "Northwind", "TrustServerCertificate": "true"},
+		},
+		{
+			name:  "default verifies the server certificate",
+			p:     Params{},
+			query: map[string]string{"database": "Northwind"},
 		},
 		{
 			name:  "extra wins over the ssl mapping",
