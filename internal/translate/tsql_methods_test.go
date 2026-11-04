@@ -19,8 +19,8 @@ func TestTSQLMethods_XMLNodes(t *testing.T) {
 	got, res := tsqlSelectOut(t, src, tsqlTestCtx(nil))
 	require.Empty(t, res.Labels)
 	require.Equal(t, `SELECT "jc"."jobcandidateid", `+
-		`CAST((SELECT "v" FROM XMLTABLE(XMLNAMESPACES('urn:r' AS "dns"), '/' PASSING ("resume"."ref") COLUMNS "v" varchar(30) PATH '(/dns:Resume/dns:Name/dns:Name.First)[1]') AS "_x") AS varchar(30)) AS "name.first", `+
-		`CAST((SELECT "v" FROM XMLTABLE(XMLNAMESPACES('urn:r' AS "dns"), '/' PASSING ("resume"."ref") COLUMNS "v" varchar(30) PATH '(/*/dns:Address/dns:Addr.Type)[1]') AS "_x") AS varchar(30)) AS "addr.type" `+
+		`CAST((SELECT "v" FROM XMLTABLE(XMLNAMESPACES('urn:r' AS "dns"), '/' PASSING ("resume"."ref") COLUMNS "v" text PATH '(/dns:Resume/dns:Name/dns:Name.First)[1]') AS "_x") AS varchar(30)) AS "name.first", `+
+		`CAST((SELECT "v" FROM XMLTABLE(XMLNAMESPACES('urn:r' AS "dns"), '/' PASSING ("resume"."ref") COLUMNS "v" text PATH '(/*/dns:Address/dns:Addr.Type)[1]') AS "_x") AS varchar(30)) AS "addr.type" `+
 		`FROM "aw_humanresources"."jobcandidate" "jc" CROSS JOIN LATERAL `+
 		`XMLTABLE(XMLNAMESPACES('urn:r' AS "dns"), '/dns:Resume' PASSING ("jc"."resume") COLUMNS "ref" xml PATH '.') AS "resume"`, got)
 
@@ -34,7 +34,7 @@ func TestTSQLMethods_XMLNodes(t *testing.T) {
 	got, res = tsqlSelectOut(t, src, tsqlTestCtx(nil))
 	require.Empty(t, res.Labels)
 	require.Contains(t, got, `COLUMNS "v" integer PATH '/*/@LocationID[1]'`)
-	require.Contains(t, got, `COLUMNS "v" varchar(1024) PATH 'string(/*)'`)
+	require.Contains(t, got, `COLUMNS "v" text PATH 'string(/*)') AS "_x") AS varchar(1024))`, "read as text, cast (truncating) to the type")
 	require.Contains(t, got, `XMLTABLE(XMLNAMESPACES('urn:r' AS "dns"), '/*/dns:step' PASSING ("mfginstructions"."ref") COLUMNS "ref" xml PATH '.') AS "steps"`)
 
 	// An absolute path read from a row that is not its document's element
@@ -48,7 +48,7 @@ func TestTSQLMethods_XMLNodes(t *testing.T) {
 	got, res = tsqlSelectOut(t, src, tsqlTestCtx(nil))
 	require.Empty(t, res.Labels)
 	require.Contains(t, got, `LEFT JOIN LATERAL XMLTABLE(XMLNAMESPACES('urn:c' AS "ci"), '/ci:AdditionalContactInfo' PASSING ("additionalcontactinfo") COLUMNS "ref" xml PATH '.') AS "c" ON true`)
-	require.Contains(t, got, `XMLNAMESPACES('urn:a' AS "act"), '/' PASSING ("c"."ref") COLUMNS "v" varchar(50) PATH '(/*/act:number)[1]'`)
+	require.Contains(t, got, `XMLNAMESPACES('urn:a' AS "act"), '/' PASSING ("c"."ref") COLUMNS "v" text PATH '(/*/act:number)[1]'`)
 }
 
 // The default-namespace prefix never collides with a declared one.

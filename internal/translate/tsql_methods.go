@@ -283,9 +283,18 @@ func (rw *tsqlRW) xmlScalarMethod(x *ast.MethodCall, m string) ast.Node {
 // xmlValueSubquery is `(SELECT "v" FROM XMLTABLE(ns, '/' PASSING (x)
 // COLUMNS "v" typ PATH 'path') AS "_x")::typ`: path evaluated once over
 // the document of x (no row, hence NULL, when x is NULL).
+//
+// A character target type is read as text and then cast: SQL Server's
+// value() truncates a longer string to nvarchar(n) silently, as PG's
+// explicit CAST to varchar(n) does, while an XMLTABLE column of type
+// varchar(n) would raise "value too long".
 func xmlValueSubquery(ns []ast.XQNamespace, x *ast.MethodCall, typ, path string) ast.Expr {
+	colType := typ
+	if pgTypeVal(typ) == tsqlValText {
+		colType = "text"
+	}
 	xt := &ast.FromXMLTable{Namespaces: ns, RowPath: "/", Passing: x.Target,
-		Columns: []ast.XMLTableColumn{{Name: "v", Type: typ, Path: path}}, Alias: "_x", P: x.P}
+		Columns: []ast.XMLTableColumn{{Name: "v", Type: colType, Path: path}}, Alias: "_x", P: x.P}
 	sel := &ast.SelectStmt{Cols: []ast.SelectItem{{Expr: &ast.Ident{Parts: []string{"v"}}}}, From: []ast.FromItem{xt}}
 	// The cast types the subquery for the rewriters' value classes.
 	return &ast.CastExpr{Expr: &ast.SubqueryExpr{Stmt: sel, P: x.P}, Type: &ast.PGType{Name: typ}, P: x.P}

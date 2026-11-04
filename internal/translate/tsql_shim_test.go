@@ -291,6 +291,8 @@ func TestTSQLShim_PG(t *testing.T) {
 		{`CAST('<r xmlns="urn:x"><a>7</a></r>' AS xml).value('declare default element namespace "urn:x"; (/r/a)[1]', 'int') + 1`, "8"},
 		{`CAST('<r><a b="x"/></r>' AS xml).exist('/r/a[@b="x"]')`, "true"},
 		{`CAST('<r><a b="x"/></r>' AS xml).exist('/r/c')`, "false"},
+		// value() truncates to the declared length, as SQL Server does.
+		{`CAST('<a>abcdef</a>' AS xml).value('(/a)[1]', 'nvarchar(3)')`, "abc"},
 	}
 	for _, c := range exprs {
 		e, errs := tsqldialect.ParseExpr(c.tsql)
