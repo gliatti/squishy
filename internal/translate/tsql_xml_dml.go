@@ -63,6 +63,6 @@ func (b *tsqlBody) xmlModifyGuard(x *ast.UpdateStmt) []pgast.PLStmt {
 	msg := "T-SQL XML DML " + tname + "." + normalizeTSQLIdent(col) + ".modify() of " + b.ctx.Object + " is not supported on PostgreSQL"
 	return []pgast.PLStmt{&pgast.PLIf{Branches: []pgast.PLIfBranch{{
 		Cond: cond,
-		Body: []pgast.PLStmt{&pgast.PLRaise{Level: "EXCEPTION", Msg: msg, ErrCode: "feature_not_supported"}},
+		Body: []pgast.PLStmt{&pgast.PLRaise{Level: "EXCEPTION", Msg: tsqlRaiseText(msg), ErrCode: "feature_not_supported"}},
 	}}}}
 }

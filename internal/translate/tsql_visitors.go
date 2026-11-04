@@ -13,6 +13,7 @@ package translate
 import (
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"gitlab.com/dalibo/squishy/internal/dialects"
 	tsqldialect "gitlab.com/dalibo/squishy/internal/dialects/tsql"
@@ -170,9 +171,6 @@ type tsqlRW struct {
 	labels []string
 	notes  []string
 	seen   map[string]bool
-	// core skips, in the residual report, the clauses the translator
-	// reports itself on view / TVF queries (FOR XML, TOP … PERCENT).
-	core bool
 	// xmlRefs are the row columns of the xml nodes() sources in scope
 	// (`… CROSS APPLY x.nodes('/a') AS T(c)` → "t.c"), see
 	// tsql_methods.go.
@@ -247,7 +245,7 @@ func (rw *tsqlRW) note(s string) {
 // reported.
 func (rw *tsqlRW) finish(nodes ...ast.Node) tsqlRewriteResult {
 	for _, n := range nodes {
-		for _, l := range rw.residual(n, rw.core) {
+		for _, l := range rw.residual(n) {
 			rw.label(l)
 		}
 		if rw.run != nil {
@@ -1368,7 +1366,7 @@ func (rw *tsqlRW) funcCall(x *ast.FuncCall) ast.Node {
 	case "ISNULL":
 		out := renameMySQLFuncCall(x, "coalesce")
 		rw.boolifyArgs(out.Args)
-		return out
+		return rw.isnullType(out)
 	case "COALESCE", "NULLIF":
 		out := renameMySQLFuncCall(x, strings.ToLower(x.Name))
 		rw.boolifyArgs(out.Args)
@@ -1593,6 +1591,64 @@ func (rw *tsqlRW) funcCall(x *ast.FuncCall) ast.Node {
 	return renameMySQLFuncCall(x, strings.ToLower(x.Name))
 }
 
+// isnullType types ISNULL(a, b) (rewritten coalesce(a, b)) like its first
+// argument, as SQL Server does: the replacement is converted to a's type,
+// so ISNULL(code, 'UNKNOWN') with code varchar(3) gives 'UNK'. coalesce
+// takes the common type instead and would return the whole replacement
+// (and a varchar(3) generated column would reject it). When a is a
+// length-bounded string of known type and b is not proven to fit, the
+// call is cast to a's type: an explicit cast to varchar(n) / char(n)
+// truncates like SQL Server.
+func (rw *tsqlRW) isnullType(out *ast.FuncCall) ast.Expr {
+	if len(out.Args) != 2 {
+		return out
+	}
+	id, ok := tsqlUnparen(out.Args[0]).(*ast.Ident)
+	if !ok {
+		return out
+	}
+	typ := rw.columnType(id)
+	n, bounded := pgBoundedTextLen(typ)
+	if !bounded {
+		return out
+	}
+	switch b := tsqlUnparen(out.Args[1]).(type) {
+	case *ast.Literal:
+		if b.Kind == "null" || b.Kind == "string" && utf8.RuneCountInString(b.Text) <= n {
+			return out
+		}
+	case *ast.Ident:
+		if rw.columnType(b) == typ {
+			return out
+		}
+	}
+	return &ast.CastExpr{Expr: out, Type: &ast.PGType{Name: typ, P: out.P}, P: out.P}
+}
+
+// pgBoundedTextLen returns n for a PG varchar(n) / char(n) type text
+// (as MapType renders it).
+func pgBoundedTextLen(typ string) (int, bool) {
+	open := -1
+	for i := 0; i < len(typ); i++ {
+		if typ[i] == '(' {
+			open = i
+			break
+		}
+	}
+	if open < 0 || typ[len(typ)-1] != ')' || pgTypeVal(typ) != tsqlValText {
+		return 0, false
+	}
+	n := 0
+	for i := open + 1; i < len(typ)-1; i++ {
+		c := typ[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, n > 0
+}
+
 // isPGBuiltinSpelling reports whether a non-upper-case name is one this
 // chain produces itself (so a second pass over the node is a no-op).
 func isPGBuiltinSpelling(name string) bool {
@@ -1677,22 +1733,120 @@ func (rw *tsqlRW) str(x *ast.FuncCall) ast.Node {
 
 func (rw *tsqlRW) round(x *ast.FuncCall) ast.Node {
 	a := x.Args
-	if len(a) != 3 {
+	if len(a) != 2 && len(a) != 3 {
 		return renameMySQLFuncCall(x, "round")
+	}
+	if len(a) == 2 {
+		return rw.roundCall("round", x.P, a[0], a[1])
 	}
 	if lit, ok := ast.IsLiteralKind(tsqlUnparen(a[2]), "number"); ok {
 		if lit.Text == "0" {
-			return rw.fc("round", x.P, a[0], a[1])
+			return rw.roundCall("round", x.P, a[0], a[1])
 		}
 		rw.note("ROUND(x, n, function ≠ 0) → trunc(x, n)")
-		return rw.fc("trunc", x.P, a[0], a[1])
+		return rw.roundCall("trunc", x.P, a[0], a[1])
 	}
 	rw.note("ROUND(x, n, function) → CASE choosing round / trunc")
 	return &ast.CaseExpr{
-		Whens: []ast.CaseExprWhen{{Match: ast.BuildBinary("=", a[2], ast.BuildIntLit(0)), Then: rw.fc("round", x.P, a[0], a[1])}},
-		Else:  rw.fc("trunc", x.P, a[0], a[1]),
+		Whens: []ast.CaseExprWhen{{Match: ast.BuildBinary("=", a[2], ast.BuildIntLit(0)), Then: rw.roundCall("round", x.P, a[0], a[1])}},
+		Else:  rw.roundCall("trunc", x.P, a[0], a[1]),
 		P:     x.P,
 	}
+}
+
+// roundCall builds round|trunc(x, n). PG only has the two-argument forms
+// for numeric: round(double precision, integer) does not exist. A float
+// operand is rounded as numeric and cast back (SQL Server's ROUND keeps
+// the float type); an operand of unknown type is cast to numeric, which
+// is what PG does implicitly for an integer or numeric one anyway.
+func (rw *tsqlRW) roundCall(name string, p ast.Position, x, n ast.Expr) ast.Expr {
+	switch rw.numClass(x) {
+	case tsqlNumExact:
+		return rw.fc(name, p, x, n)
+	case tsqlNumFloat:
+		inner := rw.fc(name, p, &ast.CastExpr{Expr: x, Type: &ast.PGType{Name: "numeric"}, P: p}, n)
+		return &ast.CastExpr{Expr: inner, Type: &ast.PGType{Name: "double precision"}, P: p}
+	}
+	return rw.fc(name, p, &ast.CastExpr{Expr: x, Type: &ast.PGType{Name: "numeric"}, P: p}, n)
+}
+
+// tsqlNumClass tells exact numbers (integer, numeric: PG's two-argument
+// round / trunc accept them) from floating ones.
+type tsqlNumClass int
+
+const (
+	tsqlNumUnknown tsqlNumClass = iota
+	tsqlNumExact
+	tsqlNumFloat
+)
+
+// pgNumClass classifies a PG type text.
+func pgNumClass(typ string) tsqlNumClass {
+	base := typ
+	for i := 0; i < len(typ); i++ {
+		if typ[i] == '(' {
+			base = typ[:i]
+			break
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(base)) {
+	case "integer", "int", "int4", "bigint", "int8", "smallint", "int2", "numeric", "decimal":
+		return tsqlNumExact
+	case "real", "double precision", "float4", "float8":
+		return tsqlNumFloat
+	}
+	return tsqlNumUnknown
+}
+
+// numClass classifies a PG-shaped numeric expression (see tsqlNumClass).
+func (rw *tsqlRW) numClass(e ast.Expr) tsqlNumClass {
+	switch x := e.(type) {
+	case *ast.Literal:
+		if x.Kind == "number" {
+			// 1.5e3 is a float in T-SQL; PG reads it as numeric, which is
+			// what round accepts.
+			return tsqlNumExact
+		}
+	case *ast.Ident:
+		return pgNumClass(rw.columnType(x))
+	case *ast.ParenExpr:
+		return rw.numClass(x.Inner)
+	case *ast.CastExpr:
+		if t, ok := x.Type.(*ast.PGType); ok {
+			return pgNumClass(t.Name)
+		}
+	case *ast.UnaryExpr:
+		if x.Op == "-" || x.Op == "+" {
+			return rw.numClass(x.Rhs)
+		}
+	case *ast.FuncCall:
+		switch strings.ToLower(x.Name) {
+		case "count", "length", "char_length", "octet_length", "strpos", "tsql.datediff", "tsql.datepart":
+			return tsqlNumExact
+		case "avg", "sum", "min", "max", "abs", "round", "trunc", "ceil", "floor", "sign":
+			if len(x.Args) > 0 {
+				return rw.numClass(x.Args[0])
+			}
+		case "power", "sqrt", "exp", "ln", "log", "random", "pi", "atan2":
+			return tsqlNumFloat
+		}
+	case *ast.WindowedAgg:
+		if x.Func != nil {
+			return rw.numClass(x.Func)
+		}
+	case *ast.BinaryExpr:
+		switch x.Op {
+		case "+", "-", "*", "/", "%":
+			l, r := rw.numClass(x.Lhs), rw.numClass(x.Rhs)
+			switch {
+			case l == tsqlNumFloat || r == tsqlNumFloat:
+				return tsqlNumFloat
+			case l == tsqlNumExact && r == tsqlNumExact:
+				return tsqlNumExact
+			}
+		}
+	}
+	return tsqlNumUnknown
 }
 
 // tsqlNameLiteral parses the content of a string literal naming an
@@ -1859,6 +2013,8 @@ func (rw *tsqlRW) visitCasts(n ast.Node) ast.Node {
 	}
 	style, isLit := ast.IsLiteralKind(tsqlUnparen(c.ConvertStyle), "number")
 	switch {
+	case tv == tsqlValBinary:
+		return rw.convertToBinary(c, out, src, style, isLit)
 	case tv == tsqlValText:
 		switch {
 		case src == tsqlValText || src == tsqlValNull:
@@ -1895,6 +2051,45 @@ func (rw *tsqlRW) visitCasts(n ast.Node) ast.Node {
 			rw.label("CONVERT() style " + style.Text + " (input format not emulated)")
 		}
 	}
+	return out
+}
+
+// convertToBinary rewrites CONVERT(binary | varbinary, x, style). The
+// style only describes a character input (SQL Server ignores it for any
+// other source):
+//
+//	style 0     → CAST(x AS bytea)               (the bytes of the characters)
+//	style 1     → decode(substr(x, 3), 'hex')    ('0x4142': hex digits after 0x)
+//	style 2     → decode(x, 'hex')               ('4142': bare hex digits)
+//
+// A plain CAST of '0x4142' would store the six characters instead of the
+// two decoded bytes. Any other style, or a computed one, is labelled.
+func (rw *tsqlRW) convertToBinary(c *ast.CastExpr, out *ast.CastExpr, src tsqlVal, style *ast.Literal, isLit bool) ast.Expr {
+	switch src {
+	case tsqlValText:
+	case tsqlValUnknown:
+		if isLit && style.Text == "0" {
+			return out
+		}
+		rw.label("CONVERT() to binary with style " + tsqlStyleText(c.ConvertStyle) + " from a value whose type is unknown")
+		return out
+	default:
+		return out
+	}
+	if !isLit {
+		rw.label("CONVERT() with a computed style")
+		return out
+	}
+	switch style.Text {
+	case "0":
+		return out
+	case "1":
+		digits := rw.fc("substr", c.P, rw.textify(c.Expr), ast.BuildIntLit(3))
+		return rw.fc("decode", c.P, digits, ast.BuildStringLit("hex"))
+	case "2":
+		return rw.fc("decode", c.P, rw.textify(c.Expr), ast.BuildStringLit("hex"))
+	}
+	rw.label("CONVERT() to binary with style " + style.Text + " (input format not emulated)")
 	return out
 }
 
@@ -2161,6 +2356,16 @@ func (rw *tsqlRW) visitOperators(n ast.Node) ast.Node {
 		if hx, ok := tsqlHexInt(x.Rhs); ok {
 			return tsqlPrec(ast.BuildBinary("-", &ast.UnaryExpr{Op: "-", Rhs: hx}, ast.BuildIntLit(1)))
 		}
+		switch rw.exprVal(x.Rhs) {
+		case tsqlValBool:
+			// ~ on a bit flips it; bit maps to boolean, where -x - 1
+			// does not exist.
+			// Parenthesised: ~ binds tighter than any operator, NOT looser.
+			return &ast.ParenExpr{Inner: &ast.UnaryExpr{Op: "NOT", Rhs: parenIfCompound(x.Rhs), P: x.P}, P: x.P}
+		case tsqlValNumber:
+		default:
+			rw.label("bitwise NOT (~) on a value whose type is unknown (rewritten -x - 1, valid for integers only)")
+		}
 		return tsqlPrec(ast.BuildBinary("-", &ast.UnaryExpr{Op: "-", Rhs: parenIfCompound(x.Rhs), P: x.P}, ast.BuildIntLit(1)))
 	case *ast.InExpr:
 		if rw.exprVal(x.Expr) != tsqlValBool || len(x.List) == 0 {
@@ -2413,6 +2618,9 @@ func (rw *tsqlRW) visitSelectShape(n ast.Node) ast.Node {
 		if x.Top != nil {
 			rw.label("MERGE TOP (n)")
 		}
+		if len(x.WhenNotMatchedBySource) > 0 {
+			rw.note("MERGE … WHEN NOT MATCHED BY SOURCE is kept as is: it needs PostgreSQL 17 or later on the target")
+		}
 		if x.Output != "" {
 			if !rw.resultSetOutput("MERGE", x.Outputs) {
 				rw.label("MERGE … OUTPUT clause")
@@ -2462,18 +2670,18 @@ func (rw *tsqlRW) resultSetOutput(stmt string, outs []ast.OutputClause) bool {
 // translator handles @@ROWCOUNT, @@FETCH_STATUS and @@TRANCOUNT, which
 // are not reported here.
 func tsqlResidualIdioms(n ast.Node) []string {
-	return tsqlStatic.residual(n, false)
+	return tsqlStatic.residual(n)
 }
 
 // residual is tsqlResidualIdioms with rw's column types (a `+` proven by
-// the rewrite is not reported). coreReported skips the clauses the
-// translator reports itself on view / TVF queries (FOR XML, TOP
-// PERCENT).
-func (rw *tsqlRW) residual(n ast.Node, coreReported bool) []string {
+// the rewrite is not reported). It walks the whole tree: a FOR XML /
+// JSON or TOP … PERCENT nested in a subquery is dropped by the PG writer
+// just like a top-level one, so every depth is reported.
+func (rw *tsqlRW) residual(n ast.Node) []string {
 	if n == nil {
 		return nil
 	}
-	v := &tsqlResidualVisitor{rw: rw, seen: map[string]bool{}, core: coreReported}
+	v := &tsqlResidualVisitor{rw: rw, seen: map[string]bool{}}
 	ast.Walk(v, n)
 	return v.out
 }
@@ -2482,7 +2690,6 @@ type tsqlResidualVisitor struct {
 	rw   *tsqlRW
 	out  []string
 	seen map[string]bool
-	core bool
 }
 
 func (v *tsqlResidualVisitor) add(label string) {
@@ -2512,10 +2719,10 @@ func (v *tsqlResidualVisitor) Visit(n ast.Node) ast.Visitor {
 			v.add("PIVOT")
 		}
 	case *ast.SelectStmt:
-		if x.ForXML != "" && !v.core {
+		if x.ForXML != "" {
 			v.add("FOR " + x.ForXMLKind + " clause")
 		}
-		if x.Top != nil && x.TopPercent && !v.core {
+		if x.Top != nil && x.TopPercent {
 			v.add("TOP … PERCENT")
 		}
 		if x.TopWithTies && (x.Limit == nil || len(x.OrderBy) == 0) {

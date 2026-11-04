@@ -62,3 +62,24 @@ func TestTSQLAdventureWorks_Residuals(t *testing.T) {
 		require.NotContains(t, v.DDL, "PIVOT", v.Name)
 	}
 }
+
+// Sales.SalesOrderDetail.LineTotal multiplies money by (1.0 - money):
+// decimal(19,4) * decimal(20,4) is decimal(40,8) by T-SQL rules, past
+// precision 38, so SQL Server rounds the product to 6 decimals. The
+// generated column casts it the same way.
+func TestTSQLAdventureWorks_LineTotalRounding(t *testing.T) {
+	res := tsqlRoutinesTranslate(t, `
+CREATE TABLE Sales.SalesOrderDetail (SalesOrderID int NOT NULL, OrderQty smallint NOT NULL, UnitPrice money NOT NULL,
+    UnitPriceDiscount money NOT NULL, LineTotal AS (isnull(([UnitPrice]*((1.0)-[UnitPriceDiscount]))*[OrderQty],(0.0))));
+GO`)
+	tbl := tsqlTableOf(res, "sales", "salesorderdetail")
+	require.NotNil(t, tbl)
+	require.Empty(t, tbl.CopiedGenerated)
+	var gen string
+	for _, c := range tbl.Columns {
+		if c.Name == "linetotal" && c.Generated != nil {
+			gen = c.Generated.Expr
+		}
+	}
+	require.Contains(t, gen, `CAST(("unitprice" * (1.0 - "unitpricediscount")) AS numeric(38,6))`)
+}

@@ -201,7 +201,7 @@ func tsqlTemporalDDL(schema, table string, cols []string, tv *PGTSQLTemporal, na
 			Cond: tgOp("UPDATE") + " AND " + pgast.WriteExpr(&ast.BinaryExpr{Op: ">", Lhs: rec("OLD", tv.RowStart), Rhs: txTime()}),
 			Body: []pgast.PLStmt{&pgast.PLRaise{
 				Level: "EXCEPTION",
-				Msg:   "Data modification failed on system-versioned table " + schema + "." + table + " because transaction time was earlier than period start time for affected records (SQL Server error 13535)",
+				Msg:   tsqlRaiseText("Data modification failed on system-versioned table " + schema + "." + table + " because transaction time was earlier than period start time for affected records (SQL Server error 13535)"),
 			}},
 		}}},
 		&pgast.PLAssign{Target: "NEW." + pgQuote(tv.RowStart), Expr: pgast.WriteExpr(txTime())},

@@ -240,13 +240,13 @@ GO
 	require.Empty(t, tsqlObjectWarnings(res, "function.dbo.ufngetstock", "routine.untranslated_construct"))
 
 	contact := tsqlRoutineDDL(t, res, "function", "dbo", "ufngetcontactinformation")
-	tmp := `"pg_temp"."ufngetcontactinformation_retcontactinformation"`
+	tmp := `"pg_temp"."dbo_ufngetcontactinformation_retcontactinformation"`
 	for _, frag := range []string{
 		// @PersonID is renamed: PG declares the RETURNS TABLE column personid
 		// as an OUT parameter of the same name (tsqlRenameClashingParams).
 		`"ufngetcontactinformation"("p_personid" integer)`,
 		`RETURNS TABLE ("personid" integer, "firstname" varchar(50), "lastname" varchar(50), "jobtitle" varchar(50), "businessentitytype" varchar(50))`,
-		`CREATE TEMP TABLE IF NOT EXISTS "ufngetcontactinformation_retcontactinformation" ("personid" integer, "firstname" varchar(50), "lastname" varchar(50), "jobtitle" varchar(50), "businessentitytype" varchar(50)) ON COMMIT DROP;`,
+		`CREATE TEMP TABLE IF NOT EXISTS "dbo_ufngetcontactinformation_retcontactinformation" ("personid" integer, "firstname" varchar(50), "lastname" varchar(50), "jobtitle" varchar(50), "businessentitytype" varchar(50)) ON COMMIT DROP;`,
 		"TRUNCATE TABLE " + tmp + ";",
 		`IF EXISTS (SELECT * FROM "humanresources"."employee" "e" WHERE "e"."businessentityid" = "ufngetcontactinformation"."p_personid") THEN`,
 		"INSERT INTO " + tmp + ` SELECT "ufngetcontactinformation"."p_personid", "p"."firstname"`,
@@ -345,10 +345,13 @@ func TestTSQLRoutines_Triggers(t *testing.T) {
 	// @@ROWCOUNT at the top of a row-level trigger is 1.
 	del := tsqlRoutineDDL(t, res, "trigger", "humanresources", "demployee")
 	for _, frag := range []string{
-		"<<_tsql>>\nDECLARE\n  \"count\" integer;\nBEGIN\n  \"_tsql\".\"count\" := 1;\n",
-		"IF \"_tsql\".\"count\" = 0 THEN\n    RETURN NULL;\n  END IF;",
+		// The recursion guard: DML the body runs on its own table goes
+		// through, as SQL Server does not fire the INSTEAD OF trigger
+		// again for it; cleared before every RETURN.
+		"<<_tsql>>\nDECLARE\n  \"count\" integer;\nBEGIN\n  IF coalesce(current_setting('tsql.instead_' || TG_RELID::text || '_demployee', true), '') = 'on' THEN\n    IF TG_OP = 'DELETE' THEN\n      RETURN OLD;\n    END IF;\n    RETURN NEW;\n  END IF;\n  PERFORM set_config('tsql.instead_' || TG_RELID::text || '_demployee', 'on', true);\n  \"_tsql\".\"count\" := 1;\n",
+		"IF \"_tsql\".\"count\" = 0 THEN\n    PERFORM set_config('tsql.instead_' || TG_RELID::text || '_demployee', '', true);\n    RETURN NULL;\n  END IF;",
 		"RAISE NOTICE USING MESSAGE = 'Employees cannot be deleted. They can only be marked as not current.';",
-		"IF 1 > 0 THEN\n    RAISE EXCEPTION 'transaction rolled back by trigger %', TG_NAME;\n  END IF;\n  RETURN NULL;\nEND;",
+		"IF 1 > 0 THEN\n    RAISE EXCEPTION 'transaction rolled back by trigger %', TG_NAME;\n  END IF;\n  PERFORM set_config('tsql.instead_' || TG_RELID::text || '_demployee', '', true);\n  RETURN NULL;\nEND;",
 		"BEFORE DELETE ON \"humanresources\".\"employee\"\n  FOR EACH ROW",
 	} {
 		require.Contains(t, del, frag)
@@ -366,9 +369,9 @@ func TestTSQLRoutines_Triggers(t *testing.T) {
 		// On UPDATE, UPDATE(col) reads the mark of a helper UPDATE OF
 		// col trigger, taken when the body starts; the helpers sort
 		// before the translated trigger, so PG fires them first.
-		"CREATE TRIGGER \"0_iuperson_update_upd_1\" AFTER UPDATE OF \"businessentityid\" ON \"person\".\"person\"\n  FOR EACH STATEMENT EXECUTE FUNCTION \"tsql\".\"mark_column_updated\"('businessentityid');",
-		"CREATE TRIGGER \"0_iuperson_update_upd_2\" AFTER UPDATE OF \"demographics\" ON \"person\".\"person\"\n  FOR EACH STATEMENT EXECUTE FUNCTION \"tsql\".\"mark_column_updated\"('demographics');",
-		`"_updated_businessentityid" boolean := tsql.take_column_updated(TG_RELID, 'businessentityid');`,
+		"CREATE TRIGGER \"0_iuperson_update_upd_1\" AFTER UPDATE OF \"businessentityid\" ON \"person\".\"person\"\n  FOR EACH STATEMENT EXECUTE FUNCTION \"tsql\".\"mark_column_updated\"('iuperson_update', 'businessentityid');",
+		"CREATE TRIGGER \"0_iuperson_update_upd_2\" AFTER UPDATE OF \"demographics\" ON \"person\".\"person\"\n  FOR EACH STATEMENT EXECUTE FUNCTION \"tsql\".\"mark_column_updated\"('iuperson_update', 'demographics');",
+		`"_updated_businessentityid" boolean := tsql.take_column_updated(TG_RELID, TG_NAME, 'businessentityid');`,
 		`IF "_tsql"."_updated_businessentityid" OR "_tsql"."_updated_demographics" THEN`,
 		`UPDATE "person"."person" SET "demographics" = '<IndividualSurvey/>' FROM "inserted" WHERE "person"."person"."businessentityid" = "inserted"."businessentityid" AND "inserted"."demographics" IS NULL;`,
 	} {
@@ -377,7 +380,7 @@ func TestTSQLRoutines_Triggers(t *testing.T) {
 	require.Equal(t, 2, strings.Count(iu, "RETURN NULL;\nEND;"))
 	require.Less(t, "0_iuperson_update_upd_1", "iuperson_update")
 	require.Empty(t, tsqlObjectWarnings(res, "trigger.person.iuperson", "routine.untranslated_construct"), "UPDATE(col) is exact on INSERT and UPDATE")
-	require.Contains(t, strings.Join(res.Plan.PreActions, "\n"), "CREATE OR REPLACE FUNCTION tsql.take_column_updated(rel oid, col name)", "the shim piece is emitted")
+	require.Contains(t, strings.Join(res.Plan.PreActions, "\n"), "CREATE OR REPLACE FUNCTION tsql.take_column_updated(rel oid, trg name, col name)", "the shim piece is emitted")
 
 	// The DELETE trigger of a split trigger has no inserted rows: an
 	// empty relation of the table's shape, and UPDATE(col) is FALSE.
@@ -438,17 +441,17 @@ GO
 	ddl := tsqlRoutineDDL(t, res, "procedure", "dbo", "walk")
 	for _, frag := range []string{
 		"<<_tsql>>\nDECLARE\n  \"id\" integer;\n  \"total\" numeric(19,4);\n  \"msg\" varchar(200);\n  \"flag\" boolean;\n  \"_fetch_status\" integer := -1;\n  \"_rowcount\" bigint := 0;\n  \"c\" refcursor;\nBEGIN\n",
-		`CREATE TEMP TABLE IF NOT EXISTS "walk_t" ("id" integer NOT NULL, "amount" numeric(19,4) DEFAULT 0, PRIMARY KEY ("id")) ON COMMIT DROP;`,
+		`CREATE TEMP TABLE IF NOT EXISTS "dbo_walk_t" ("id" integer NOT NULL, "amount" numeric(19,4) DEFAULT 0, PRIMARY KEY ("id")) ON COMMIT DROP;`,
 		`"_tsql"."msg" := 'start';`,
 		`"_tsql"."flag" := true;`,
 		`OPEN "c" FOR SELECT "orderid", "total" FROM "dbo"."orders" WHERE "customerid" = "walk"."cust";`,
 		"FETCH NEXT FROM \"c\" INTO \"_tsql\".\"id\", \"_tsql\".\"total\";\n  \"_tsql\".\"_fetch_status\" := CASE WHEN \"found\" THEN 0 ELSE -1 END;\n  WHILE \"_tsql\".\"_fetch_status\" = 0 LOOP",
 		"CONTINUE;",
-		"INSERT INTO \"pg_temp\".\"walk_t\" (\"id\", \"amount\") VALUES (\"_tsql\".\"id\", \"_tsql\".\"total\");\n    GET DIAGNOSTICS \"_tsql\".\"_rowcount\" = ROW_COUNT;",
+		"INSERT INTO \"pg_temp\".\"dbo_walk_t\" (\"id\", \"amount\") VALUES (\"_tsql\".\"id\", \"_tsql\".\"total\");\n    GET DIAGNOSTICS \"_tsql\".\"_rowcount\" = ROW_COUNT;",
 		`"walk"."n" := "walk"."n" + 1;`,
 		"EXIT;",
 		"END LOOP;\n  CLOSE \"c\";\n  UPDATE",
-		"(SELECT \"id\" FROM \"pg_temp\".\"walk_t\");\n  GET DIAGNOSTICS \"_tsql\".\"_rowcount\" = ROW_COUNT;\n  IF \"_tsql\".\"_rowcount\" = 0 THEN",
+		"(SELECT \"id\" FROM \"pg_temp\".\"dbo_walk_t\");\n  GET DIAGNOSTICS \"_tsql\".\"_rowcount\" = ROW_COUNT;\n  IF \"_tsql\".\"_rowcount\" = 0 THEN",
 		`RAISE EXCEPTION USING MESSAGE = format('no order shipped for customer %s (%s)', "walk"."cust", "_tsql"."msg");`,
 		`RAISE NOTICE '%', "_tsql"."msg" || ' done';`,
 	} {
@@ -696,9 +699,9 @@ func TestTSQLRoutines_WithoutRun(t *testing.T) {
 	require.Empty(t, notes)
 	for _, frag := range []string{
 		"#variable_conflict use_column\n<<_tsql>>\nDECLARE\n  \"x\" integer;\nBEGIN\n",
-		`CREATE TEMP TABLE IF NOT EXISTS "p_t" ("k" integer DEFAULT 0) ON COMMIT DROP;`,
+		`CREATE TEMP TABLE IF NOT EXISTS "sales_p_t" ("k" integer DEFAULT 0) ON COMMIT DROP;`,
 		`"_tsql"."x" := 1;`,
-		`INSERT INTO "pg_temp"."p_t" ("k") VALUES ("_tsql"."x");`,
+		`INSERT INTO "pg_temp"."sales_p_t" ("k") VALUES ("_tsql"."x");`,
 		`CALL "sales"."q"("_tsql"."x");`,
 	} {
 		require.Contains(t, body, frag)

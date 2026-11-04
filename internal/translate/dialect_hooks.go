@@ -357,6 +357,11 @@ type TriggerInfo struct {
 	// which needs a helper `AFTER UPDATE OF col` trigger marking the
 	// statement (see tsqlBody.updatedMark).
 	UpdatedColumns []string
+	// InsteadGuard is set on the BEFORE … FOR EACH ROW trigger emulating
+	// a T-SQL INSTEAD OF trigger on a table: its body lets the DML it
+	// runs on its own table through, since SQL Server does not fire the
+	// INSTEAD OF trigger again for it (tsqlBody.insteadEnter).
+	InsteadGuard bool
 }
 
 // RoutineCtx is the header context of one routine handed to

@@ -69,3 +69,51 @@ func TestWriteSelect_WithTies(t *testing.T) {
 	s.OrderBy = nil
 	require.Equal(t, `SELECT "name" FROM "t" LIMIT 10`, writeSelect(s))
 }
+
+// MERGE … WHEN NOT MATCHED BY SOURCE (PG 17) and INSERT … DEFAULT VALUES
+// are T-SQL statement shapes PG spells the same way: the writer must
+// emit them, never drop them.
+func TestWriteMerge_NotMatchedBySource(t *testing.T) {
+	col := func(parts ...string) ast.Expr { return &ast.Ident{Parts: parts} }
+	m := &ast.MergeStmt{
+		Target:      ast.TableRef{Schema: "dbo", Name: "t"},
+		TargetAlias: "tgt",
+		Source:      &ast.FromTable{Schema: "dbo", Name: "s", Alias: "src"},
+		On:          &ast.BinaryExpr{Op: "=", Lhs: col("tgt", "id"), Rhs: col("src", "id")},
+		WhenMatched: []ast.MergeAction{{Kind: "UPDATE", Sets: []ast.Assign{{Col: "v", Expr: col("src", "v")}}}},
+		WhenNotMatched: []ast.MergeAction{{
+			Kind: "INSERT", InsertCols: []string{"id", "v"}, InsertValues: []ast.Expr{col("src", "id"), col("src", "v")},
+		}},
+		WhenNotMatchedBySource: []ast.MergeAction{
+			{Kind: "UPDATE", Cond: &ast.BinaryExpr{Op: ">", Lhs: col("tgt", "v"), Rhs: ast.BuildIntLit(0)}, Sets: []ast.Assign{{Col: "v", Expr: ast.BuildIntLit(0)}}},
+			{Kind: "DELETE"},
+		},
+	}
+	require.Equal(t, `MERGE INTO "dbo"."t" "tgt" USING "dbo"."s" "src" ON "tgt"."id" = "src"."id"`+
+		` WHEN MATCHED THEN UPDATE SET "v" = "src"."v"`+
+		` WHEN NOT MATCHED THEN INSERT ("id", "v") VALUES ("src"."id", "src"."v")`+
+		` WHEN NOT MATCHED BY SOURCE AND "tgt"."v" > 0 THEN UPDATE SET "v" = 0`+
+		` WHEN NOT MATCHED BY SOURCE THEN DELETE`, writeMerge(m))
+}
+
+func TestWriteInsert_DefaultValues(t *testing.T) {
+	s := &ast.InsertStmt{Table: ast.TableRef{Schema: "dbo", Name: "t"}, DefaultValues: true}
+	require.Equal(t, `INSERT INTO "dbo"."t" DEFAULT VALUES`, writeInsert(s))
+}
+
+// A T-SQL `WITH cte AS (…) UPDATE|DELETE|INSERT|MERGE` keeps its CTE
+// prelude on the statement: the writer must put it back in front.
+func TestWriteDML_WithPrelude(t *testing.T) {
+	w := &ast.WithClause{CTEs: []ast.CTE{{Name: "c", Body: &ast.SelectStmt{
+		Cols: []ast.SelectItem{{Expr: &ast.Ident{Parts: []string{"id"}}}},
+		From: []ast.FromItem{&ast.FromTable{Name: "s"}},
+	}}}}
+	where := &ast.InExpr{Expr: &ast.Ident{Parts: []string{"id"}}, Subquery: &ast.SelectStmt{
+		Cols: []ast.SelectItem{{Expr: &ast.Ident{Parts: []string{"id"}}}},
+		From: []ast.FromItem{&ast.FromTable{Name: "c"}},
+	}}
+	require.Equal(t, `WITH "c" AS (SELECT "id" FROM "s") DELETE FROM "t" WHERE "id" IN (SELECT "id" FROM "c")`,
+		writeDelete(&ast.DeleteStmt{With: w, Table: ast.TableRef{Name: "t"}, Where: where}))
+	require.Equal(t, `WITH "c" AS (SELECT "id" FROM "s") INSERT INTO "t" SELECT "id" FROM "c"`,
+		writeInsert(&ast.InsertStmt{With: w, Table: ast.TableRef{Name: "t"}, Select: where.Subquery}))
+}

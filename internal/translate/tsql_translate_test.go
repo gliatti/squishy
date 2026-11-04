@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
@@ -74,9 +75,13 @@ func tsqlTableOf(res *Result, schema, name string) *PGTable {
 // The identifier fold must be the one the copier and the worker use, or
 // the copy would target tables the DDL did not create.
 func TestNormalizeTSQLIdent_MatchesCopier(t *testing.T) {
-	for _, s := range []string{"SalesOrderHeader", "Order Details", "ÉTÉ", "already_lower", "MiXeD123"} {
+	long := strings.Repeat("Résumé_", 12) // 96 bytes: cut like PG cuts it
+	for _, s := range []string{"SalesOrderHeader", "Order Details", "ÉTÉ", "already_lower", "MiXeD123", long, strings.Repeat("A", 70)} {
 		require.Equal(t, dataxfer.FoldSQLServerIdent(s), normalizeTSQLIdent(s), s)
+		require.LessOrEqual(t, len(normalizeTSQLIdent(s)), 63, s)
+		require.True(t, utf8.ValidString(normalizeTSQLIdent(s)), s)
 	}
+	require.Equal(t, strings.Repeat("a", 63), normalizeTSQLIdent(strings.Repeat("A", 70)))
 	require.Equal(t, "customerid", tsqlParamName("@CustomerID"))
 }
 

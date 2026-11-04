@@ -24,13 +24,19 @@ package translate
 // of the caller — and only OUTPUT parameters, bound to an OUTPUT
 // variable argument, may be assigned. Each parameter reference then
 // becomes its argument: an input parameter is a value (never assigned,
-// so passing by value and substituting agree), an OUTPUT one is the
-// caller's variable, which sp_executesql copies back at the end.
+// so passing by value and substituting agree), converted to the
+// parameter's declared type like sp_executesql binds it (dynArg); an
+// OUTPUT one is the caller's variable, which sp_executesql copies back
+// at the end; a caller variable bound to an OUTPUT parameter and to
+// another one is not inlined (copy-in / copy-out would differ).
 //
 // Nothing here inspects SQL text: the strings go through the parser,
 // the rest is AST rewriting.
 
 import (
+	"strings"
+	"unicode/utf8"
+
 	tsqldialect "gitlab.com/dalibo/squishy/internal/dialects/tsql"
 	"gitlab.com/dalibo/squishy/internal/sqlparse/ast"
 )
@@ -39,6 +45,7 @@ import (
 // body, every EXEC of a constant statement that can be inlined by the
 // statements it runs (in a BEGIN … END block).
 func (b *tsqlBody) inlineConstantDynamicSQL(stmts []ast.PLStmt) []ast.PLStmt {
+	b.dynVarTypes = b.tsqlDeclaredVarTypes(stmts)
 	b.inlineDynamicSeq(stmts, tsqlWrittenVars(stmts), map[string]string{})
 	return stmts
 }
@@ -166,6 +173,9 @@ func tsqlConstString(e ast.Expr, consts map[string]string) (string, bool) {
 type tsqlDynBinding struct {
 	arg    ast.Expr // *ast.Literal or variable *ast.Ident (source form)
 	output bool
+	// typ is the declared type of the parameter: sp_executesql converts
+	// an input argument to it when binding (char(2) truncates 'ABC').
+	typ ast.DataType
 }
 
 // inlineDynamic returns the BEGIN … END block of the statements a
@@ -229,7 +239,7 @@ func (b *tsqlBody) inlineDynamic(x *ast.ExecuteImmediateStmt, consts map[string]
 			if !bound {
 				return n
 			}
-			return tsqlCopyLeaf(bd.arg, id.P)
+			return b.dynArg(bd, id.P)
 		})
 		if ps, ok := out.(ast.PLStmt); ok {
 			dyn[i] = ps
@@ -303,12 +313,12 @@ func tsqlBindDynamicArgs(params []ast.Param, args []ast.Expr) (map[string]tsqlDy
 			if p.Output || output {
 				return nil, false
 			}
-			bind[key] = tsqlDynBinding{arg: v}
+			bind[key] = tsqlDynBinding{arg: v, typ: p.Type}
 		case *ast.Ident:
 			if !v.Variable || len(v.Parts) != 1 || isTSQLSystemVar(v.Parts[0]) || p.Output != output {
 				return nil, false
 			}
-			bind[key] = tsqlDynBinding{arg: v, output: output}
+			bind[key] = tsqlDynBinding{arg: v, output: output, typ: p.Type}
 		default:
 			return nil, false
 		}
@@ -316,7 +326,76 @@ func tsqlBindDynamicArgs(params []ast.Param, args []ast.Expr) (map[string]tsqlDy
 	if len(bind) != len(params) {
 		return nil, false
 	}
+	// sp_executesql copies the arguments in and the OUTPUT parameters
+	// out: a caller variable bound to an OUTPUT parameter and to another
+	// parameter is read with its old value by the latter, which a
+	// by-reference substitution would not reproduce.
+	uses := map[string]int{}
+	outs := map[string]bool{}
+	for _, bd := range bind {
+		if id, ok := bd.arg.(*ast.Ident); ok {
+			name := tsqlVarName(id.Parts[0])
+			uses[name]++
+			outs[name] = outs[name] || bd.output
+		}
+	}
+	for name, n := range uses {
+		if n > 1 && outs[name] {
+			return nil, false
+		}
+	}
 	return bind, true
+}
+
+// dynArg is the expression replacing a reference to an input parameter
+// of an inlined dynamic statement: its argument, converted to the
+// parameter's declared type as sp_executesql does when it binds it
+// (`N'@c char(2)'` bound to 'ABC' reads 'AB'; `N'@p int'` bound to a
+// varchar variable compares as an integer). The conversion is left out
+// when it cannot change the value: a variable of the same type, a NULL,
+// an integer literal for an integer parameter, a string literal that
+// fits a varchar parameter.
+func (b *tsqlBody) dynArg(bd tsqlDynBinding, p ast.Position) ast.Expr {
+	arg := tsqlCopyLeaf(bd.arg, p)
+	if bd.output || bd.typ == nil {
+		return arg
+	}
+	switch x := bd.arg.(type) {
+	case *ast.Ident:
+		if t := b.dynVarTypes[tsqlVarName(x.Parts[0])]; t != "" && t == b.mapType(bd.typ) {
+			return arg
+		}
+	case *ast.Literal:
+		switch x.Kind {
+		case "null":
+			return arg
+		case "number":
+			if _, isInt := bd.typ.(*ast.IntType); isInt && tsqlIsIntegerToken(x.Text) {
+				return arg
+			}
+		case "string":
+			if ch, ok := bd.typ.(*ast.CharType); ok && !strings.EqualFold(ch.Name, "CHAR") && !strings.EqualFold(ch.Name, "NCHAR") &&
+				(ch.Max || ch.HasLength && utf8.RuneCountInString(x.Text) <= ch.Length) {
+				return arg
+			}
+		}
+	}
+	return &ast.CastExpr{Expr: arg, Type: bd.typ, P: p}
+}
+
+// tsqlDeclaredVarTypes returns the PG type of every variable the body
+// declares and of the routine's parameters (folded names), for dynArg.
+func (b *tsqlBody) tsqlDeclaredVarTypes(stmts []ast.PLStmt) map[string]string {
+	out := map[string]string{}
+	for _, p := range b.ctx.Params {
+		out[tsqlVarName(p.SourceName)] = p.Type
+	}
+	walkAll(stmts, func(n ast.Node) {
+		if dv, ok := n.(*ast.DeclareVar); ok && dv.Type != nil {
+			out[tsqlVarName(dv.Name)] = b.mapType(dv.Type)
+		}
+	})
+	return out
 }
 
 // tsqlInlinableDynamic reports whether every statement of a dynamic

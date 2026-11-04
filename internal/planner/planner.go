@@ -416,6 +416,17 @@ func translatedTable(pg *translate.Result, snap inspect.ObjectSnapshot) *transla
 	if pg == nil {
 		return nil
 	}
+	// An exact match first: in a case-sensitive SQL Server database
+	// [Orders] and [orders] are two tables, and only the one the
+	// translator created (the other is a reported fold collision) is
+	// its PGTable.
+	if snap.Schema != "" {
+		for i := range pg.Plan.Tables {
+			if t := &pg.Plan.Tables[i]; t.SourceName == snap.Name && t.SourceSchema == snap.Schema {
+				return t
+			}
+		}
+	}
 	for i := range pg.Plan.Tables {
 		t := &pg.Plan.Tables[i]
 		if snap.Schema != "" {

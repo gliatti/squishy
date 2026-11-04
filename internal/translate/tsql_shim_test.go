@@ -230,6 +230,11 @@ func TestTSQLShim_PG(t *testing.T) {
 		{`tsql.str_to_timestamp_mdy('02/03/2004')`, "2004-02-03 00:00:00"},
 		{`tsql.str_to_timestamp_dmy('02/03/2004')`, "2004-03-02 00:00:00"},
 		{`tsql.str_to_timestamp_mdy('2004-02-21')`, "2004-02-21 00:00:00"},
+		// A product past precision 38 cast to the reduced scale rounds half
+		// away from zero, like SQL Server (computed-column proof).
+		{`CAST((CAST(0.0005 AS numeric(19,4)) * CAST(0.0010 AS numeric(20,4))) AS numeric(38,6))`, "0.000001"},
+		{`CAST((CAST(-0.0005 AS numeric(19,4)) * CAST(0.0010 AS numeric(20,4))) AS numeric(38,6))`, "-0.000001"},
+		{`CAST((CAST(0.0004 AS numeric(19,4)) * CAST(0.0010 AS numeric(20,4))) AS numeric(38,6))`, "0.000000"},
 	}
 	for _, c := range shim {
 		check(t, c.expr, c.want)
@@ -293,6 +298,14 @@ func TestTSQLShim_PG(t *testing.T) {
 		{`CAST('<r><a b="x"/></r>' AS xml).exist('/r/c')`, "false"},
 		// value() truncates to the declared length, as SQL Server does.
 		{`CAST('<a>abcdef</a>' AS xml).value('(/a)[1]', 'nvarchar(3)')`, "abc"},
+		// ROUND on a float rounds as numeric (PG has no round(float, n)).
+		{"ROUND(CAST(2.567 AS float), 1)", "2.6"},
+		{"ROUND(CAST(2.567 AS real), 2, 1)", "2.56"},
+		// CONVERT to binary with a hex style decodes the digits.
+		{"CONVERT(varbinary(4), '0x4142', 1)", `\x4142`},
+		{"CONVERT(varbinary(4), '4142', 2)", `\x4142`},
+		// ~ on a bit flips it.
+		{"~CAST(1 AS bit)", "false"},
 	}
 	for _, c := range exprs {
 		e, errs := tsqldialect.ParseExpr(c.tsql)
@@ -300,4 +313,49 @@ func TestTSQLShim_PG(t *testing.T) {
 		out, _ := rewriteTSQLExpr(e, nil)
 		check(t, pgast.WriteExpr(out), c.want)
 	}
+
+	// UPDATE(col) marks are per consuming trigger: two translated
+	// triggers of one table testing UPDATE(status) both see it.
+	for _, q := range []string{
+		`CREATE TEMP TABLE upd_t (id integer, status text)`,
+		`CREATE TEMP TABLE upd_log (trg text)`,
+		`INSERT INTO upd_t VALUES (1, 'a')`,
+		`CREATE FUNCTION pg_temp.upd_consume() RETURNS trigger LANGUAGE plpgsql AS $f$
+		 BEGIN
+		     IF tsql.take_column_updated(TG_RELID, TG_NAME, 'status') THEN
+		         INSERT INTO upd_log VALUES (TG_NAME);
+		     END IF;
+		     RETURN NULL;
+		 END $f$`,
+		`CREATE TRIGGER "0_audit_upd_1" AFTER UPDATE OF status ON upd_t FOR EACH STATEMENT EXECUTE FUNCTION tsql.mark_column_updated('audit', 'status')`,
+		`CREATE TRIGGER "0_notify_upd_1" AFTER UPDATE OF status ON upd_t FOR EACH STATEMENT EXECUTE FUNCTION tsql.mark_column_updated('notify', 'status')`,
+		`CREATE TRIGGER audit AFTER UPDATE ON upd_t FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.upd_consume()`,
+		`CREATE TRIGGER notify AFTER UPDATE ON upd_t FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.upd_consume()`,
+		`UPDATE upd_t SET id = id + 1`,
+		`UPDATE upd_t SET status = 'b'`,
+	} {
+		_, err := tx.Exec(ctx, q)
+		require.NoError(t, err, q)
+	}
+	check(t, `(SELECT string_agg(trg, ',' ORDER BY trg) FROM upd_log)`, "audit,notify")
+
+	// An INSTEAD OF trigger on a table whose body writes its own table
+	// (the usual validation pattern): the nested INSERT goes through
+	// instead of firing the emulating BEFORE trigger again.
+	res := tsqlRoutinesTranslate(t, `CREATE TABLE zz_guard.t (a int NOT NULL, b varchar(20) NULL);
+GO
+CREATE TRIGGER zz_guard.t_ins ON zz_guard.t INSTEAD OF INSERT AS
+    INSERT INTO zz_guard.t (a, b) SELECT a, UPPER(b) FROM inserted;
+GO`)
+	for _, q := range []string{
+		`CREATE SCHEMA zz_guard`,
+		`CREATE TABLE zz_guard.t (a integer NOT NULL, b varchar(20))`,
+		tsqlRoutineDDL(t, res, "trigger", "zz_guard", "t_ins"),
+		`INSERT INTO zz_guard.t VALUES (1, 'x'), (2, 'y')`,
+		`INSERT INTO zz_guard.t VALUES (3, 'z')`,
+	} {
+		_, err := tx.Conn().PgConn().Exec(ctx, q).ReadAll()
+		require.NoError(t, err, q)
+	}
+	check(t, `(SELECT string_agg(a || b, ',' ORDER BY a) FROM zz_guard.t)`, "1X,2Y,3Z")
 }

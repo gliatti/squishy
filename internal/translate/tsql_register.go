@@ -35,14 +35,13 @@ func tsqlExprHook(e ast.Expr, ctx *ExprCtx) ast.Expr {
 }
 
 // tsqlSelectHook is the SQL Server SelectRewriter. The labels it returns
-// become the query's blocking warning; FOR XML and TOP … PERCENT are
-// left to the translator's own residue report.
+// become the query's blocking warning; they include FOR XML / JSON and
+// TOP … PERCENT at any depth of the query (the residual walk).
 func tsqlSelectHook(s *ast.SelectStmt, ctx *ExprCtx) (*ast.SelectStmt, []string) {
 	if s == nil {
 		return nil, nil
 	}
 	rw := newTSQLRW(ctx)
-	rw.core = true
 	rw.prepare(s)
 	out, ok := ast.Rewrite(s, rw.chain()).(*ast.SelectStmt)
 	if !ok || out == nil {
@@ -81,3 +80,8 @@ func reportTSQLRewrite(ctx *ExprCtx, res tsqlRewriteResult, labelKind string) {
 		ctx.Run.Warn(ctx.Object, tsqlWarnNote, n, SeverityInfo)
 	}
 }
+
+// tsqlWarnFoldCollision: two source objects (tables, columns of one
+// table) whose names fold to the same PG name — they differ by case in a
+// case-sensitive database, or only past the 63 bytes PG keeps.
+const tsqlWarnFoldCollision = "name.fold_collision"

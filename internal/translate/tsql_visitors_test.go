@@ -79,7 +79,8 @@ func hasNote(res tsqlRewriteResult, sub string) bool {
 }
 
 func TestTSQLVisitors_Expressions(t *testing.T) {
-	typed := map[string]string{"name": "varchar(50)", "flag": "boolean", "d": "timestamp(3)", "qty": "integer", "code": "char(4)"}
+	typed := map[string]string{"name": "varchar(50)", "flag": "boolean", "d": "timestamp(3)", "qty": "integer", "code": "char(4)",
+		"m": "numeric(19,4)", "f": "double precision", "hx": "varchar(20)", "bin": "bytea"}
 	cases := []struct {
 		name, src, want string
 		cols            map[string]string
@@ -132,7 +133,7 @@ func TestTSQLVisitors_Expressions(t *testing.T) {
 		{name: "plus unproven", src: "a + b", want: `"a" + "b"`, label: "could not be proven text"},
 		{name: "datetime plus days", src: "GETDATE() + 1", want: `now() + 1 * INTERVAL '1 day'`},
 		{name: "xor", src: "a ^ b", want: `"a" # "b"`},
-		{name: "bit not", src: "~a", want: `-"a" - 1`},
+		{name: "bit not", src: "~a", want: `-"a" - 1`, label: "bitwise NOT"},
 		{name: "hex in bitwise", src: "flags & 0x0F", want: `"flags" & 15`},
 		{name: "hex binary", src: "0xFF00", want: `CAST('\xFF00' AS bytea)`},
 		{name: "bit compare", src: "flag = 1", cols: typed, want: `"flag" = true`},
@@ -176,8 +177,11 @@ func TestTSQLVisitors_Expressions(t *testing.T) {
 			want: `CAST(date_trunc('month', "d") + ("n" + 1) * INTERVAL '1 month' + INTERVAL '1 month - 1 day' AS date)`},
 		{name: "datefromparts", src: "DATEFROMPARTS(2024, 1, 31)", want: `make_date(2024, 1, 31)`},
 		{name: "square", src: "SQUARE(x)", want: `power("x", 2)`},
-		{name: "round truncate", src: "ROUND(x, 2, 1)", want: `trunc("x", 2)`, note: "trunc"},
-		{name: "round", src: "ROUND(x, 2)", want: `round("x", 2)`},
+		{name: "round truncate", src: "ROUND(x, 2, 1)", want: `trunc(CAST("x" AS numeric), 2)`, note: "trunc"},
+		{name: "round", src: "ROUND(x, 2)", want: `round(CAST("x" AS numeric), 2)`},
+		{name: "round numeric column", src: "ROUND(m, 2)", cols: typed, want: `round("m", 2)`},
+		{name: "round float column", src: "ROUND(f, 1)", cols: typed, want: `CAST(round(CAST("f" AS numeric), 1) AS double precision)`},
+		{name: "round float avg", src: "ROUND(AVG(CAST(s AS float)), 2)", want: `CAST(round(CAST(avg(CAST("s" AS double precision)) AS numeric), 2) AS double precision)`},
 		{name: "rand", src: "RAND()", want: `random()`},
 		{name: "log", src: "LOG(x)", want: `ln("x")`},
 		{name: "log base", src: "LOG(x, 2)", want: `log(2, "x")`},
@@ -208,6 +212,17 @@ func TestTSQLVisitors_Expressions(t *testing.T) {
 		{name: "precedence after rewrite", src: "a & b + c", want: `("a" & "b") + "c"`, label: "could not be proven text"},
 		{name: "precedence typed", src: "qty & 3 + qty", cols: typed, want: `("qty" & 3) + "qty"`},
 		{name: "kept trigger function", src: "UPDATE(Qty)", want: `UPDATE("qty")`},
+		// ~ on a bit (boolean) is NOT; on an integer -x - 1.
+		{name: "bitwise not bit", src: "~flag", cols: typed, want: `(NOT "flag")`},
+		{name: "bitwise not int", src: "~qty", cols: typed, want: `-"qty" - 1`},
+		{name: "bitwise not unknown", src: "~x", want: `-"x" - 1`, label: "bitwise NOT"},
+		// CONVERT to binary: styles 1 and 2 decode hex digits.
+		{name: "convert binary style 1", src: "CONVERT(varbinary(10), hx, 1)", cols: typed, want: `decode(substr("hx", 3), 'hex')`},
+		{name: "convert binary style 2", src: "CONVERT(varbinary(10), hx, 2)", cols: typed, want: `decode("hx", 'hex')`},
+		{name: "convert binary style 0", src: "CONVERT(varbinary(10), hx, 0)", cols: typed, want: `CAST("hx" AS bytea)`},
+		{name: "convert binary from binary", src: "CONVERT(varbinary(10), bin, 1)", cols: typed, want: `CAST("bin" AS bytea)`},
+		{name: "convert binary other style", src: "CONVERT(varbinary(10), hx, 3)", cols: typed, label: "style 3"},
+		{name: "convert binary unknown source", src: "CONVERT(varbinary(10), x, 1)", label: "type is unknown"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -448,10 +463,33 @@ func TestTSQLResidualIdioms(t *testing.T) {
 	require.Contains(t, labels, "@@ERROR system variable")
 	require.Contains(t, labels, "FOR XML clause")
 
-	// The select hook leaves FOR XML to the translator's residue report.
-	s, _ = tsqldialect.ParseSelect("SELECT a FROM t FOR XML PATH('')")
+	// The select hook reports FOR XML and TOP … PERCENT at every depth:
+	// the PG writer drops them from a subquery as well.
+	for _, src := range []string{
+		"SELECT a FROM t FOR XML PATH('')",
+		"SELECT g.grp, STUFF((SELECT ',' + x.name FROM dbo.t x WHERE x.grp = g.grp FOR XML PATH('')), 1, 1, '') AS names FROM dbo.t g",
+	} {
+		s, errs = tsqldialect.ParseSelect(src)
+		require.Empty(t, errs)
+		_, hookLabels := tsqlSelectHook(s, tsqlTestCtx(nil))
+		require.Equal(t, []string{"FOR XML clause"}, hookLabels, src)
+	}
+	s, errs = tsqldialect.ParseSelect("SELECT a.id FROM (SELECT TOP 10 PERCENT id FROM dbo.t ORDER BY id) a")
+	require.Empty(t, errs)
 	_, hookLabels := tsqlSelectHook(s, tsqlTestCtx(nil))
-	require.Empty(t, hookLabels)
+	require.Equal(t, []string{"TOP … PERCENT"}, hookLabels)
+}
+
+// A view with a nested FOR XML gets one blocking warning naming it (the
+// translator does not repeat the hook's label).
+func TestTSQLView_NestedForXMLReported(t *testing.T) {
+	res := tsqlRoutinesTranslate(t, `CREATE TABLE dbo.t (grp int NOT NULL, name varchar(20) NOT NULL);
+GO
+CREATE VIEW dbo.v_list AS SELECT g.grp, STUFF((SELECT ',' + x.name FROM dbo.t x WHERE x.grp = g.grp FOR XML PATH('')), 1, 1, '') AS names FROM dbo.t g
+GO`)
+	msgs := tsqlObjectWarnings(res, "view.dbo.v_list", "view.functions")
+	require.Len(t, msgs, 1)
+	require.Equal(t, 1, strings.Count(msgs[0], "FOR XML clause"), msgs[0])
 }
 
 // End to end through Translate: the hooks fold DDL expressions and the

@@ -6567,7 +6567,14 @@ func rewriteOracleCompositeConstructors(body string, types map[string]UserTypeRe
 // `salesorderheader` name the same object; folding keeps PG names
 // unquoted-friendly. It must stay identical to dataxfer.FoldSQLServerIdent
 // and worker.pgNormalizeIdent (the copy targets the same names).
-func normalizeTSQLIdent(s string) string { return strings.ToLower(s) }
+//
+// The folded name is cut to PostgreSQL's 63 bytes on a rune boundary,
+// which is what PG does to a longer identifier in DDL (SQL Server allows
+// 128 characters, and non-ASCII names pass 63 bytes sooner in UTF-8):
+// every name the plan, the copy and the worker use is then the one PG
+// stored. Two names that only differ past that point collide; the
+// translator reports it (name.fold_collision).
+func normalizeTSQLIdent(s string) string { return clipUTF8(strings.ToLower(s), pgMaxIdentLen) }
 
 // tsqlParamName is the PG name of a T-SQL parameter or local variable:
 // `@CustomerID` → `customerid`.
@@ -6944,7 +6951,18 @@ func (t *translator) translateTSQLTable(s *ast.CreateTable) {
 	schema := t.useSchema(srcSchema)
 	name := normalizeTSQLIdent(s.Name)
 	key := t.tableKey(schema, name)
-	if _, dup := st.tables[key]; dup {
+	if prev, dup := st.tables[key]; dup {
+		first := t.res.Plan.Tables[prev]
+		if first.SourceSchema != srcSchema || first.SourceName != s.Name {
+			// Two source tables fold to one PG name: they differ by case
+			// (a case-sensitive _CS_ / _BIN2 database) or only past the
+			// 63 bytes PG keeps. Migrating one silently would drop the
+			// other, and both copies would target the same PG table.
+			t.warnSev("table."+schema+"."+name, tsqlWarnFoldCollision,
+				"source tables "+first.SourceSchema+"."+first.SourceName+" and "+srcSchema+"."+s.Name+" both become the PostgreSQL table "+schema+"."+name+
+					" (identifiers are folded to lower case and cut to 63 bytes): only the first is created. Rename one of them on the source (or migrate it separately) before the migration", SeverityBlocking)
+			return
+		}
 		t.warnSev("table."+schema+"."+name, "table.duplicate",
 			"table "+schema+"."+name+" is created twice by the source script; only the first definition is migrated", SeverityInfo)
 		return
@@ -6955,6 +6973,7 @@ func (t *translator) translateTSQLTable(s *ast.CreateTable) {
 	classes := map[string]tsqlClass{}
 
 	// Pass 1: column shapes (types, nullability, identity).
+	s = t.tsqlDropFoldedColumnDups(s, schema, name, srcSchema)
 	for _, c := range s.Columns {
 		col := t.tsqlColumnShape(idx, &tbl, c)
 		srcCols[col.Name] = c.Name
@@ -7569,9 +7588,17 @@ func (t *translator) tsqlComputedColumn(tbl *PGTable, i int, s *ast.CreateTable,
 	}
 	// The source half of the proof runs first: rewriters work in place
 	// (ast.Rewrite), the source tree is not intact afterwards.
-	p := &tsqlComputedProof{t: t, classes: classes}
+	p := &tsqlComputedProof{t: t, classes: classes, types: map[string]ast.DataType{}}
+	for _, sc := range s.Columns {
+		if sc.Type != nil {
+			p.types[normalizeTSQLIdent(sc.Name)] = sc.Type
+		}
+	}
 	expr := tsqlStripParens(c.Generated.Expr)
 	_, reason := p.source(expr)
+	if reason == "" {
+		expr = p.applyRounding(expr)
+	}
 	rewritten := tsqlStripParens(t.tsqlDDLExpr(expr, ctx))
 	if reason == "" && p.concat {
 		rewritten = tsqlImmutableConcat(rewritten)
@@ -7756,6 +7783,13 @@ type tsqlComputedProof struct {
 	// function of the script: the column is then computed by a trigger
 	// (tsql_computed_trigger.go) instead of a generated column.
 	userFuncs bool
+	// types maps a folded column name of the table to its T-SQL data
+	// type: the decimal(p, s) rules of tsql_computed_decimal.go need the
+	// precision and scale the class does not carry.
+	types map[string]ast.DataType
+	// roundAt maps the products of the source tree SQL Server rounds to a
+	// reduced scale (past precision 38) to that scale (applyRounding).
+	roundAt map[*ast.BinaryExpr]int
 }
 
 // source proves e on the T-SQL side and returns its class.
@@ -7815,7 +7849,15 @@ func (p *tsqlComputedProof) source(e ast.Expr) (tsqlClass, string) {
 			fallthrough
 		case "-", "*", "/", "%":
 			if (tsqlNumericClass(l) || l == tsqlClassNull) && (tsqlNumericClass(r) || r == tsqlClassNull) {
-				return tsqlArithClass(l, r), ""
+				res := tsqlArithClass(l, r)
+				if res == tsqlClassNumeric {
+					// Exact non-integer arithmetic: SQL Server types the result
+					// decimal(p, s) and may round it (tsql_computed_decimal.go).
+					if why := p.tsqlDecimalReason(x); why != "" {
+						return tsqlClassUnknown, why
+					}
+				}
+				return res, ""
 			}
 			return tsqlClassUnknown, "operator " + x.Op + " on non-numeric operands"
 		case "<", ">", "<=", ">=":
@@ -7890,6 +7932,11 @@ func (p *tsqlComputedProof) source(e ast.Expr) (tsqlClass, string) {
 		}
 		switch strings.ToUpper(x.Name) {
 		case "ISNULL", "COALESCE", "NULLIF":
+			if strings.EqualFold(x.Name, "ISNULL") && len(x.Args) == 2 {
+				if why := p.isnullFits(x.Args[0], x.Args[1]); why != "" {
+					return tsqlClassUnknown, why
+				}
+			}
 			res := tsqlClassUnknown
 			for _, c := range args {
 				switch {
@@ -8202,18 +8249,14 @@ func (t *translator) translateTSQLView(s *ast.CreateView) {
 }
 
 // tsqlSelectResidue lists the T-SQL-only clauses still present on a
-// rewritten query (a rewriter that translates or reports them clears
-// them): the PG writer would drop them silently.
+// rewritten query that the select hook does not report itself: the PG
+// writer would drop them silently. FOR XML / JSON and TOP … PERCENT are
+// reported by the hook's residual walk at every depth of the query
+// (tsqlResidualVisitor), so they are not repeated here.
 func tsqlSelectResidue(sel *ast.SelectStmt) []string {
 	var out []string
 	if sel == nil {
 		return nil
-	}
-	if sel.ForXML != "" {
-		out = append(out, "FOR "+sel.ForXMLKind+" clause")
-	}
-	if sel.TopPercent {
-		out = append(out, "TOP … PERCENT")
 	}
 	if sel.OptionClause != "" {
 		out = append(out, "OPTION (…) query hints")
@@ -8901,9 +8944,9 @@ func (t *translator) translateTSQLTrigger(s *ast.CreateTrigger) {
 	case instead:
 		trigs = append(trigs, pgTrig{name, name + "_fn", &TriggerInfo{
 			Timing: "BEFORE", Events: events, ForEach: "ROW",
-			Schema: relSchema, Table: relName, ReturnRow: "NULL",
+			Schema: relSchema, Table: relName, ReturnRow: "NULL", InsteadGuard: true,
 		}})
-		msg := "INSTEAD OF trigger " + name + " on table " + relSchema + "." + relName + " is emulated by a BEFORE … FOR EACH ROW trigger returning NULL (PostgreSQL only has INSTEAD OF triggers on views): the body runs once per row with inserted / deleted holding that single row, and the row operation is skipped. Review set-based logic (counts, aggregates over inserted / deleted)"
+		msg := "INSTEAD OF trigger " + name + " on table " + relSchema + "." + relName + " is emulated by a BEFORE … FOR EACH ROW trigger returning NULL (PostgreSQL only has INSTEAD OF triggers on views): the body runs once per row with inserted / deleted holding that single row, and the row operation is skipped. The DML the body runs on " + relSchema + "." + relName + " itself goes through as a plain row operation (a guard setting), since SQL Server does not fire the INSTEAD OF trigger again for it. Review set-based logic (counts, aggregates over inserted / deleted)"
 		t.res.Explanations = append(t.res.Explanations, Explanation{
 			Object: obj, Source: "INSTEAD OF " + strings.Join(events, ", ") + " ON table", Target: "BEFORE … FOR EACH ROW … RETURN NULL",
 			Reason: msg, Level: "warn",
@@ -8960,7 +9003,7 @@ func (t *translator) translateTSQLTrigger(s *ast.CreateTrigger) {
 			stmts = append(stmts, &pgast.CreateTrigger{
 				Name: mark, Timing: "AFTER", Events: []string{"UPDATE"}, UpdateOf: []string{col},
 				Schema: relSchema, Table: relName, ForEach: "STATEMENT",
-				FnSchema: "tsql", FnName: "mark_column_updated", FnArgs: []string{col},
+				FnSchema: "tsql", FnName: "mark_column_updated", FnArgs: []string{tg.name, col},
 			})
 			t.res.Explanations = append(t.res.Explanations, Explanation{
 				Object: obj, Source: "UPDATE(" + col + ")", Target: "trigger " + mark + " AFTER UPDATE OF " + pgQuote(col) + " + tsql.take_column_updated()",
@@ -9250,4 +9293,33 @@ func (t *translator) tsqlConstraintTarget(idx int, name string) (string, string)
 		}
 	}
 	return "", ""
+}
+
+// tsqlDropFoldedColumnDups returns s without the columns whose folded
+// name (normalizeTSQLIdent) repeats an earlier column's — [ID] and [id]
+// of a case-sensitive database, or two names equal over their first 63
+// bytes — each reported as a blocking collision: PG cannot hold both
+// under one name, and keeping the second would make CREATE TABLE fail.
+// The passes over s.Columns index tbl.Columns in step, so the duplicates
+// are dropped before them.
+func (t *translator) tsqlDropFoldedColumnDups(s *ast.CreateTable, schema, name, srcSchema string) *ast.CreateTable {
+	seen := map[string]string{}
+	var keep []*ast.ColumnDef
+	for _, c := range s.Columns {
+		f := normalizeTSQLIdent(c.Name)
+		if prev, dup := seen[f]; dup {
+			t.warnSev("table."+schema+"."+name+"."+f, tsqlWarnFoldCollision,
+				"columns "+prev+" and "+c.Name+" of "+srcSchema+"."+s.Name+" both become the PostgreSQL column "+f+
+					" (identifiers are folded to lower case and cut to 63 bytes): only the first is created and copied. Rename one of them on the source before the migration", SeverityBlocking)
+			continue
+		}
+		seen[f] = c.Name
+		keep = append(keep, c)
+	}
+	if len(keep) == len(s.Columns) {
+		return s
+	}
+	cp := *s
+	cp.Columns = keep
+	return &cp
 }

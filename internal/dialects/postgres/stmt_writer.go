@@ -301,6 +301,7 @@ func writeInsert(s *ast.InsertStmt) string {
 		return ""
 	}
 	var b strings.Builder
+	writeDMLWith(&b, s.With)
 	b.WriteString("INSERT INTO ")
 	b.WriteString(qualifiedTableName(s.Table.Schema, s.Table.Name))
 	if len(s.Cols) > 0 {
@@ -313,6 +314,9 @@ func writeInsert(s *ast.InsertStmt) string {
 		b.WriteString(")")
 	}
 	switch {
+	case s.DefaultValues:
+		// T-SQL `INSERT … DEFAULT VALUES`: PG spells it the same way.
+		b.WriteString(" DEFAULT VALUES")
 	case s.Select != nil:
 		b.WriteByte(' ')
 		b.WriteString(writeSelect(s.Select))
@@ -380,6 +384,7 @@ func writeUpdate(s *ast.UpdateStmt) string {
 		return ""
 	}
 	var b strings.Builder
+	writeDMLWith(&b, s.With)
 	b.WriteString("UPDATE ")
 	if s.Table.Name != "" {
 		b.WriteString(qualifiedTableName(s.Table.Schema, s.Table.Name))
@@ -441,6 +446,7 @@ func writeDelete(s *ast.DeleteStmt) string {
 		return ""
 	}
 	var b strings.Builder
+	writeDMLWith(&b, s.With)
 	b.WriteString("DELETE FROM ")
 	if s.Table.Name != "" {
 		b.WriteString(qualifiedTableName(s.Table.Schema, s.Table.Name))
@@ -481,12 +487,14 @@ func writeDelete(s *ast.DeleteStmt) string {
 	return b.String()
 }
 
-// writeMerge renders a MERGE statement (PG 15+).
+// writeMerge renders a MERGE statement (PG 15+; WHEN NOT MATCHED BY
+// SOURCE branches need PG 17).
 func writeMerge(s *ast.MergeStmt) string {
 	if s == nil {
 		return ""
 	}
 	var b strings.Builder
+	writeDMLWith(&b, s.With)
 	b.WriteString("MERGE INTO ")
 	b.WriteString(qualifiedTableName(s.Target.Schema, s.Target.Name))
 	if s.TargetAlias != "" {
@@ -515,7 +523,30 @@ func writeMerge(s *ast.MergeStmt) string {
 		b.WriteString(" THEN ")
 		b.WriteString(writeMergeAction(m))
 	}
+	// T-SQL's BY SOURCE branches act on the target rows the source does
+	// not match (UPDATE / DELETE): dropping them would silently keep the
+	// rows the source MERGE deletes.
+	for _, m := range s.WhenNotMatchedBySource {
+		b.WriteString(" WHEN NOT MATCHED BY SOURCE")
+		if m.Cond != nil {
+			b.WriteString(" AND ")
+			b.WriteString(WriteExpr(m.Cond))
+		}
+		b.WriteString(" THEN ")
+		b.WriteString(writeMergeAction(m))
+	}
 	return b.String()
+}
+
+// writeDMLWith writes the `WITH … ` CTE prelude of an INSERT / UPDATE /
+// DELETE / MERGE. Only the T-SQL parser keeps one on these statements;
+// PG accepts it in front of every data-modifying statement.
+func writeDMLWith(b *strings.Builder, w *ast.WithClause) {
+	if w == nil || len(w.CTEs) == 0 {
+		return
+	}
+	b.WriteString(writeWith(w))
+	b.WriteByte(' ')
 }
 
 // writeMergeAction renders the action body of a MERGE branch.

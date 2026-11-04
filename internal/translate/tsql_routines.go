@@ -141,6 +141,9 @@ type tsqlBody struct {
 	// errCtx are the locals holding the error context the enclosing
 	// CATCH blocks replaced (innermost last), see catchHandler.
 	errCtx []*tsqlVar
+	// dynVarTypes maps a folded variable / parameter name to its PG type,
+	// for the arguments of inlined dynamic SQL (tsql_dynamic.go).
+	dynVarTypes map[string]string
 }
 
 // translateTSQLRoutineBody is the SQL Server RoutineBodyTranslator: it
@@ -154,7 +157,7 @@ func translateTSQLRoutineBody(ctx *RoutineCtx) (string, []string, []string) {
 	if len(stmts) == 0 {
 		b.warn("the body could not be parsed: the routine is created with a body that raises an error until it is written by hand")
 		blk := &pgast.PLBlock{Body: []pgast.PLStmt{&pgast.PLRaise{
-			Level: "EXCEPTION", Msg: "routine " + ctx.Schema + "." + ctx.Name + " was not translated from T-SQL",
+			Level: "EXCEPTION", Msg: tsqlRaiseText("routine " + ctx.Schema + "." + ctx.Name + " was not translated from T-SQL"),
 		}}}
 		if ctx.Trigger != nil {
 			blk.Body = append(blk.Body, &pgast.PLReturn{Expr: ctx.Trigger.ReturnRow})
@@ -451,9 +454,16 @@ func (b *tsqlBody) localName(base string) string {
 }
 
 // tempTableName names the temporary table of a table variable after the
-// routine and the variable, so two routines' `@t` never share a table.
+// routine's schema, the routine and the variable, so two routines' `@t`
+// never share a table — same-named routines of two schemas included: a
+// callee would TRUNCATE (or, for a TVF, DROP) its caller's rows. A name
+// past 63 bytes is cut with a hash of the whole (pgIdentWithSuffix), so
+// two long names sharing a prefix stay apart. (A routine calling itself
+// still shares its own table, as the session-wide temp table is the
+// emulation.)
 func (b *tsqlBody) tempTableName(src string) string {
-	base := tsqlTruncIdent(normalizeTSQLIdent(b.ctx.Name) + "_" + tsqlParamName(src))
+	full := b.ctx.Schema + "_" + normalizeTSQLIdent(b.ctx.Name) + "_" + tsqlParamName(src)
+	base := pgIdentWithSuffix(full, "")
 	n := base
 	for i := 1; b.tempNames[n]; i++ {
 		n = tsqlTruncIdent(base + "_" + strconv.Itoa(i))
@@ -798,6 +808,7 @@ func (b *tsqlBody) updatedMark(col string, p ast.Position) ast.Expr {
 	}
 	init := pgast.WriteExpr(&ast.FuncCall{Name: "tsql.take_column_updated", Args: []ast.Expr{
 		&ast.Ident{Parts: []string{"TG_RELID"}},
+		&ast.Ident{Parts: []string{"TG_NAME"}},
 		&ast.Literal{Kind: "string", Text: col},
 	}})
 	v := b.addLocal("_updated_"+col, "boolean", init)
@@ -948,6 +959,7 @@ func (b *tsqlBody) emptyRelation(alias string, p ast.Position) ast.FromItem {
 
 func (b *tsqlBody) render(stmts []ast.PLStmt) string {
 	var body []pgast.PLStmt
+	body = append(body, b.insteadEnter()...)
 	for _, tv := range b.tableOrder {
 		if len(tv.cols) == 0 {
 			b.warn("table variable " + tv.src + " has no column the translation could read")
@@ -964,6 +976,7 @@ func (b *tsqlBody) render(stmts []ast.PLStmt) string {
 	switch {
 	case b.ctx.Trigger != nil:
 		if _, ok := tsqlLastPL(body).(*pgast.PLReturn); !ok {
+			body = append(body, b.insteadLeave()...)
 			body = append(body, &pgast.PLReturn{Expr: b.ctx.Trigger.ReturnRow})
 		}
 	case b.ctx.Kind == RoutineMultiTVF:
@@ -1046,6 +1059,9 @@ func (b *tsqlBody) stmt(n ast.PLStmt, next ast.PLStmt) []pgast.PLStmt {
 		if !x.TryCatch {
 			// T-SQL BEGIN … END only groups statements (no scope).
 			return b.stmts(x.Stmts)
+		}
+		if x.Except != nil && b.ctx.Trigger == nil && tsqlTryPartialRollback(x.Stmts) {
+			b.warn("BEGIN TRY runs several data modifications outside an explicit transaction: when a later statement fails, SQL Server keeps the earlier ones (each statement commits on its own), while the PL/pgSQL EXCEPTION block rolls back everything the TRY did. Wrap the TRY in BEGIN TRAN … COMMIT on the source semantics you want, or split it")
 		}
 		b.inTry++
 		try := b.stmts(x.Stmts)
@@ -1292,7 +1308,7 @@ func (b *tsqlBody) dmlStmt(n ast.PLStmt) []pgast.PLStmt {
 func (b *tsqlBody) returnStmt(x *ast.ReturnStmt) []pgast.PLStmt {
 	switch {
 	case b.ctx.Trigger != nil:
-		return append(b.leaveErrorContext(), &pgast.PLReturn{Expr: b.ctx.Trigger.ReturnRow})
+		return append(append(b.leaveErrorContext(), b.insteadLeave()...), &pgast.PLReturn{Expr: b.ctx.Trigger.ReturnRow})
 	case b.ctx.Kind == RoutineMultiTVF:
 		return b.tvfReturn()
 	case b.ctx.Kind == RoutineScalarFunction:
@@ -1673,4 +1689,144 @@ func (b *tsqlBody) embeddedDDL(x *ast.EmbeddedDDL) []pgast.PLStmt {
 	}
 	b.warn("DDL statement inside the routine body not translated (only CREATE / DROP of #temp tables is)")
 	return nil
+}
+
+// insteadEnter opens the recursion guard of an INSTEAD OF trigger on a
+// table, emulated by a BEFORE … FOR EACH ROW trigger returning NULL
+// (TriggerInfo.InsteadGuard). SQL Server does not fire an INSTEAD OF
+// trigger again for the DML its own body runs against its table — the
+// usual `INSTEAD OF INSERT AS INSERT INTO T SELECT … FROM inserted`
+// performs the insert — while PG fires the BEFORE trigger for it, which
+// would recurse until the stack depth limit. While the body runs, a
+// transaction-local setting marks the trigger as active; the nested DML
+// finds it and proceeds as a plain row operation (RETURN NEW / OLD).
+// The setting is cleared before every RETURN of the body, and an error
+// rolls it back with the (sub)transaction that set it.
+func (b *tsqlBody) insteadEnter() []pgast.PLStmt {
+	key := b.insteadKey()
+	if key == "" {
+		return nil
+	}
+	return []pgast.PLStmt{
+		&pgast.PLIf{Branches: []pgast.PLIfBranch{{
+			Cond: "coalesce(current_setting(" + key + ", true), '') = 'on'",
+			Body: []pgast.PLStmt{
+				&pgast.PLIf{Branches: []pgast.PLIfBranch{{Cond: "TG_OP = 'DELETE'", Body: []pgast.PLStmt{&pgast.PLReturn{Expr: "OLD"}}}}},
+				&pgast.PLReturn{Expr: "NEW"},
+			},
+		}}},
+		&pgast.PLPerform{Expr: "set_config(" + key + ", 'on', true)"},
+	}
+}
+
+// insteadLeave clears the guard insteadEnter set (nil without one).
+func (b *tsqlBody) insteadLeave() []pgast.PLStmt {
+	key := b.insteadKey()
+	if key == "" {
+		return nil
+	}
+	return []pgast.PLStmt{&pgast.PLPerform{Expr: "set_config(" + key + ", '', true)"}}
+}
+
+// insteadKey is the PG expression naming the guard setting of the
+// trigger: per relation (TG_RELID) and trigger. A custom setting name is
+// made of simple identifiers, so the trigger part keeps only
+// [a-z0-9_] of the folded trigger name.
+func (b *tsqlBody) insteadKey() string {
+	if b.ctx.Trigger == nil || !b.ctx.Trigger.InsteadGuard {
+		return ""
+	}
+	name := []byte(b.ctx.Name)
+	for i, c := range name {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+			name[i] = '_'
+		}
+	}
+	return "'tsql.instead_' || TG_RELID::text || '_" + string(name) + "'"
+}
+
+// tsqlTryPartialRollback reports whether a TRY block runs two or more
+// data modifications (DML, EXEC of a procedure, dynamic SQL) before any
+// BEGIN TRAN of its own. Without an explicit transaction SQL Server
+// commits each statement (XACT_ABORT only aborts the failing one): an
+// error in the second leaves the first in place, while the PL/pgSQL
+// block the TRY becomes rolls both back. With the usual BEGIN TRAN at
+// the top of the TRY (and ROLLBACK in the CATCH) both sides undo
+// everything. Triggers are not checked: they run inside the triggering
+// statement's transaction with XACT_ABORT on.
+func tsqlTryPartialRollback(stmts []ast.PLStmt) bool {
+	mods := 0
+	var walk func([]ast.PLStmt) bool
+	walk = func(list []ast.PLStmt) bool {
+		for _, s := range list {
+			switch x := s.(type) {
+			case *ast.TransactionStmt:
+				if x.Kind == "BEGIN" {
+					return true
+				}
+			case *ast.InsertStmt, *ast.UpdateStmt, *ast.DeleteStmt, *ast.MergeStmt,
+				*ast.TruncateTable, *ast.CallStmt, *ast.ExecuteImmediateStmt:
+				mods++
+			case *ast.Block:
+				if !x.TryCatch && walk(x.Stmts) {
+					return true
+				}
+			case *ast.IfStmt:
+				// One branch runs: count the busiest.
+				base, best := mods, mods
+				bodies := [][]ast.PLStmt{x.Else}
+				for _, br := range x.Branches {
+					bodies = append(bodies, br.Body)
+				}
+				for _, body := range bodies {
+					mods = base
+					if walk(body) {
+						return true
+					}
+					best = max(best, mods)
+				}
+				mods = best
+			case *ast.WhileStmt:
+				// A loop body runs any number of times.
+				before := mods
+				if walk(x.Body) {
+					return true
+				}
+				if mods > before {
+					mods++
+				}
+			}
+			if mods >= 2 {
+				return true
+			}
+		}
+		return false
+	}
+	walk(stmts)
+	return mods >= 2
+}
+
+// tsqlRaiseText makes a fixed message safe as the format string of a
+// PL/pgSQL RAISE: object names may hold a % (legal inside T-SQL
+// brackets), which RAISE would read as a placeholder — PL/pgSQL then
+// rejects the function at CREATE time ("too few parameters specified
+// for RAISE"). %% prints one %.
+func tsqlRaiseText(msg string) string {
+	var b []byte
+	for i := 0; i < len(msg); i++ {
+		if msg[i] == '%' {
+			if b == nil {
+				b = append(b, msg[:i]...)
+			}
+			b = append(b, '%', '%')
+			continue
+		}
+		if b != nil {
+			b = append(b, msg[i])
+		}
+	}
+	if b == nil {
+		return msg
+	}
+	return string(b)
 }
