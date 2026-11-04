@@ -6,22 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 squishy is a web UI + Go API for piloting **MySQL/MariaDB/Oracle/IBM DB2/Microsoft SQL Server → PostgreSQL** migrations. It parses source DDL with hand-rolled per-dialect parsers (no ANTLR runtime — `.g4` grammars live in `reference/` as spec), translates to Postgres, and runs the data copy via a Postgres-hosted job queue with a goroutine worker pool.
 
-## Code map — always use graphify
-
-Always go through **graphify** to find your way in this codebase, before
-reading or changing code and in every agent of a workflow:
-
-- Read `graphify-out/GRAPH_REPORT.md` first (communities, god nodes such as
-  `Translate()` / `Parser` / `planTable()`, surprising cross-file edges) to
-  locate the files a change touches, instead of grepping blindly.
-- For a precise question use the skill: `/graphify query "<question>"`,
-  `/graphify path "<A>" "<B>"`, `/graphify explain "<node>"`.
-- After a change that adds or moves files, functions or packages, refresh the
-  map with `/graphify . --update` (incremental) so the next session sees it.
-
-`graphify-out/` is a local artifact (not committed); `.graphifyignore`
-excludes `dumps/`, `.claude/` and `graphify-out/` itself.
-
 ## Common commands
 
 Development is fully dockerized — no local Go or Node toolchain is required.
